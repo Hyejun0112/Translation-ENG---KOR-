@@ -56,7 +56,7 @@ try:
 except SystemExit as e:
     line(False, "한글 폰트", str(e))
 
-line(bool(os.environ.get("ANTHROPIC_API_KEY")), "ANTHROPIC_API_KEY",
-     "설정됨" if os.environ.get("ANTHROPIC_API_KEY") else "미설정 → setx ANTHROPIC_API_KEY \"sk-ant-...\" 후 VS Code 재시작")
+print(f"[--] {'ANTHROPIC_API_KEY':<22} " + ("설정됨 (API 자동 번역 사용 가능)" if os.environ.get("ANTHROPIC_API_KEY")
+      else "미설정 (선택 사항 - Copilot 번역에는 필요 없음)"))
 
 print("\n모두 정상입니다." if ok_all else "\n'!!' 항목을 확인하세요. (README 1장 참고)")

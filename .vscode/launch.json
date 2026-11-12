@@ -1,10 +1,8 @@
 {
-  // F5(실행 및 디버그)에서 선택해서 실행합니다.
-  // 입력 PDF는 실행할 때 물어봅니다. OM_EN 폴더에 원본 PDF를 넣어 두면 편합니다.
+  // F5(실행 및 디버그)에서 선택해서 실행합니다. 보통은 맨 위 "OM 번역기 (GUI)"만 쓰면 됩니다.
   "version": "0.2.0",
   "inputs": [
     { "id": "pdf", "type": "promptString", "description": "원본 PDF 파일 또는 폴더 경로", "default": "OM_EN" },
-    { "id": "pages", "type": "promptString", "description": "샘플 페이지 (예: 1-5,12)", "default": "1-5" },
     { "id": "page", "type": "promptString", "description": "OCR 확인할 페이지 번호", "default": "1" }
   ],
   "configurations": [
@@ -14,43 +12,34 @@
       "program": "${workspaceFolder}/om_gui.py"
     },
     {
-      "name": "1) 분량 추정 + 페이지 진단 (API 없음)",
+      "name": "분량 추정 + 페이지 진단",
       "type": "debugpy", "request": "launch", "console": "integratedTerminal",
       "program": "${workspaceFolder}/om_translate.py",
       "args": ["estimate", "${input:pdf}", "--glossary", "glossary.csv"]
     },
     {
-      "name": "2) 용어 후보 추출 (OCR 포함)",
-      "type": "debugpy", "request": "launch", "console": "integratedTerminal",
-      "program": "${workspaceFolder}/om_translate.py",
-      "args": ["terms", "${input:pdf}", "-o", "terms_candidates.csv", "--glossary", "glossary.csv"]
-    },
-    {
-      "name": "3) OCR 결과 확인 (한 페이지, 디버그 PNG)",
+      "name": "OCR 결과 확인 (한 페이지)",
       "type": "debugpy", "request": "launch", "console": "integratedTerminal",
       "program": "${workspaceFolder}/om_ocr.py",
       "args": ["${input:pdf}", "--page", "${input:page}", "--debug"]
     },
     {
-      "name": "4) 레이아웃 테스트 (mock, API 없음)",
+      "name": "Copilot 프롬프트 만들기 (export)",
       "type": "debugpy", "request": "launch", "console": "integratedTerminal",
       "program": "${workspaceFolder}/om_translate.py",
-      "args": ["translate", "${input:pdf}", "-o", "OM_SAMPLE", "--backend", "mock",
-               "--pages", "${input:pages}", "--compare", "--force"]
+      "args": ["export", "${input:pdf}", "-o", "OM_KO", "--glossary", "glossary.csv", "--keep-patterns", "keep_patterns.txt"]
     },
     {
-      "name": "5) 샘플 번역 (실제 API)",
+      "name": "Copilot 답변 반영 (import)",
       "type": "debugpy", "request": "launch", "console": "integratedTerminal",
       "program": "${workspaceFolder}/om_translate.py",
-      "args": ["translate", "${input:pdf}", "-o", "OM_SAMPLE", "--glossary", "glossary.csv",
-               "--keep-patterns", "keep_patterns.txt", "--pages", "${input:pages}", "--compare", "--force"]
+      "args": ["import", "-o", "OM_KO", "--glossary", "glossary.csv", "--keep-patterns", "keep_patterns.txt"]
     },
     {
-      "name": "6) 전체 번역 (실제 API)",
+      "name": "한국어 PDF 만들기 (translate)",
       "type": "debugpy", "request": "launch", "console": "integratedTerminal",
       "program": "${workspaceFolder}/om_translate.py",
-      "args": ["translate", "${input:pdf}", "-o", "OM_KO", "--glossary", "glossary.csv",
-               "--keep-patterns", "keep_patterns.txt", "--overrides", "overrides.csv"]
+      "args": ["translate", "${input:pdf}", "-o", "OM_KO", "--glossary", "glossary.csv", "--keep-patterns", "keep_patterns.txt", "--force"]
     }
   ]
 }
