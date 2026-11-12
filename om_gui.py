@@ -82,6 +82,7 @@ class App(_BaseTk):
         self.files: list[str] = []
         self.started = 0.0
         self.last_outdir: Path | None = None
+        self._logf = None
 
         self._style()
         self._build()
@@ -486,6 +487,12 @@ class App(_BaseTk):
         self.pbar.start(12)
         env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1", OM_BOOTSTRAPPED="1",
                    ANTHROPIC_API_KEY=self.v_key.get().strip(), PYTHONUNBUFFERED="1")
+        try:  # 실행 로그를 파일로도 저장 (문제 생기면 이 파일을 보내 주세요)
+            logp = Path(self.v_out.get().strip() or ROOT / "OM_KO") / "last_run.log"
+            self._logf = open(logp, "w", encoding="utf-8")
+            self._logf.write(time.strftime("%Y-%m-%d %H:%M:%S") + f"  python={sys.executable}\n")
+        except Exception:  # noqa: BLE001
+            self._logf = None
         threading.Thread(target=self._worker, args=(cmds, env), daemon=True).start()
 
     def _worker(self, cmds, env):
@@ -495,6 +502,7 @@ class App(_BaseTk):
                 break
             shown = " ".join(f'"{c}"' if " " in c else c for c in cmd[2:])
             self.q.put(("cmd", f"[{i}/{len(cmds)}] python {shown}\n"))
+            self._logfile_write(f"[{i}/{len(cmds)}] {' '.join(cmd)}\n")
             flags = 0x08000000 if IS_WIN else 0  # CREATE_NO_WINDOW
             try:
                 self.proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE,
@@ -505,28 +513,51 @@ class App(_BaseTk):
                 rc_all = 1
                 break
             buf = b""
+            pending_cr = False  # Windows 줄바꿈(\r\n)과 진행률 표시(\r) 구분
             assert self.proc.stdout is not None
+
+            def emit_line(raw: bytes):
+                line = raw.decode("utf-8", "replace")
+                low = line.lstrip()
+                tag = "err" if (low.startswith(("!", "Traceback", "Error", "  File")) or "Error:" in line) else "out"
+                self.q.put((tag, line + "\n"))
+                self._logfile_write(line + "\n")
+
             while True:
                 ch = self.proc.stdout.read(1)
                 if not ch:
                     break
-                if ch in (b"\n", b"\r"):
-                    line = buf.decode("utf-8", "replace")
+                if pending_cr:
+                    pending_cr = False
+                    if ch == b"\n":  # \r\n = 일반 줄바꿈
+                        emit_line(buf)
+                        buf = b""
+                        continue
+                    # 단독 \r = 진행률 줄 (같은 줄 덮어쓰기)
+                    if buf.strip():
+                        self.q.put(("status", buf.decode("utf-8", "replace").strip()))
                     buf = b""
-                    if ch == b"\r":
-                        if line.strip():
-                            self.q.put(("status", line.strip()))
-                    else:
-                        tag = "err" if line.lstrip().startswith(("!", "Traceback", "Error")) else "out"
-                        self.q.put((tag, line + "\n"))
+                if ch == b"\r":
+                    pending_cr = True
+                elif ch == b"\n":
+                    emit_line(buf)
+                    buf = b""
                 else:
                     buf += ch
-            if buf:
-                self.q.put(("out", buf.decode("utf-8", "replace") + "\n"))
+            if buf.strip():
+                emit_line(buf)
             rc = self.proc.wait()
             rc_all = rc_all or rc
             self.proc = None
         self.q.put(("done", rc_all))
+
+    def _logfile_write(self, text: str):
+        try:
+            if self._logf is not None:
+                self._logf.write(text)
+                self._logf.flush()
+        except Exception:  # noqa: BLE001
+            pass
 
     def stop(self):
         self.stop_flag = True
@@ -558,6 +589,13 @@ class App(_BaseTk):
         self.after(100, self._poll)
 
     def _finished(self, rc):
+        if self._logf is not None:
+            try:
+                self._logf.write(f"\n종료 코드: {rc}\n")
+                self._logf.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._logf = None
         self.pbar.stop()
         self.btn_run.configure(state="normal")
         self.btn_stop.configure(state="disabled")
@@ -572,7 +610,8 @@ class App(_BaseTk):
                 if pngs:
                     open_path(pngs[-1])
         else:
-            self._append("err", f"\n✘ 오류로 종료 (코드 {rc}). 위 로그의 빨간 줄을 확인하세요.\n")
+            self._append("err", f"\n✘ 오류로 종료 (코드 {rc}). 위 로그의 빨간 줄을 확인하세요.\n"
+                                f"   전체 로그: {Path(self.v_out.get().strip() or ROOT / 'OM_KO') / 'last_run.log'}\n")
             self.v_status.set("오류")
 
     # ------------------------------------------------------------------ 로그/열기

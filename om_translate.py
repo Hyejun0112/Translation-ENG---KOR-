@@ -1684,7 +1684,9 @@ def cmd_translate(args):
             cfg.pages = parse_pages(args.pages, n) if args.pages else None
             summary.append(process_pdf(src, dst, cfg, backend, gloss, protector, cache, overrides, ocr))
         except Exception as e:  # noqa: BLE001
-            print(f"  ! 실패: {e}", file=sys.stderr)
+            import traceback
+            print(f"  ! 실패: {type(e).__name__}: {e}", file=sys.stderr)
+            traceback.print_exc()
             summary.append({"file": src.name, "error": str(e)})
     if summary:
         with open(outdir / "summary.csv", "w", newline="", encoding="utf-8-sig") as f:
@@ -1697,6 +1699,10 @@ def cmd_translate(args):
     if hasattr(backend, "in_tokens") and backend.in_tokens:
         print(f"\nAPI 사용량: 입력 {backend.in_tokens:,} / 출력 {backend.out_tokens:,} 토큰")
     print(f"결과 폴더: {outdir.resolve()}  (summary.csv, *.review.csv 확인)")
+    errs = [s for s in summary if s.get("error")]
+    if errs:
+        print(f"! 실패한 파일 {len(errs)}개: " + ", ".join(e["file"] for e in errs), file=sys.stderr)
+        sys.exit(1)
 
 
 def _ask(prompt: str, default: str = "") -> str:
