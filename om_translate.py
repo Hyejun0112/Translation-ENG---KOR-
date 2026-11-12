@@ -69,6 +69,10 @@ except Exception:
 
 DEFAULT_MODEL = os.environ.get("OM_MODEL", "claude-sonnet-5-5")
 
+import logging  # noqa: E402
+
+logging.getLogger("fontTools").setLevel(logging.ERROR)  # "MERG NOT subset" 같은 무해한 경고 숨김
+
 # ----------------------------------------------------------------------------
 # 1. 영어 유지(보호) 패턴
 # ----------------------------------------------------------------------------
@@ -1426,6 +1430,42 @@ def make_compare(src: Path, dst: Path, pages: list[int], out: Path):
     c.close()
 
 
+def select_pages_safe(doc, pages: list[int]):
+    """지정 페이지만 남긴다. 구조(태그/StructTree)가 비정상인 PDF에서 select()가 실패하면
+    새 문서에 페이지를 복사하는 방식으로 대체한다."""
+    try:
+        doc.select(pages)
+        return doc
+    except Exception as e:  # noqa: BLE001
+        print(f"  (페이지 선택 대체 방식 사용: {type(e).__name__})", file=sys.stderr)
+    new = fitz.open()
+    for p in pages:
+        new.insert_pdf(doc, from_page=p, to_page=p, links=True, annots=True)
+    return new
+
+
+def save_pdf_safe(doc, dst: Path):
+    """저장 최적화(garbage/deflate)가 비정상 PDF에서 실패하면 단계적으로 옵션을 낮춰 저장."""
+    attempts = [dict(garbage=3, deflate=True), dict(garbage=1, deflate=True), dict()]
+    last = None
+    for kw in attempts:
+        try:
+            doc.save(str(dst), **kw)
+            return
+        except Exception as e:  # noqa: BLE001
+            last = e
+            print(f"  (저장 옵션 {kw or '기본'} 실패 → 재시도: {type(e).__name__})", file=sys.stderr)
+    # 마지막 수단: 새 문서로 페이지 복사 후 저장
+    new = fitz.open()
+    new.insert_pdf(doc)
+    try:
+        new.save(str(dst), garbage=3, deflate=True)
+    except Exception:  # noqa: BLE001
+        raise RuntimeError(f"PDF 저장 실패: {last}")
+    finally:
+        new.close()
+
+
 def process_pdf(src: Path, dst: Path, cfg: Config, backend, gloss: Glossary,
                 protector: Protector, cache: Cache, overrides: dict[str, str], ocr=None) -> dict:
     t0 = time.time()
@@ -1502,11 +1542,15 @@ def process_pdf(src: Path, dst: Path, cfg: Config, backend, gloss: Glossary,
             doc.set_toc([[lvl, (tu.ko or title), pg] for (lvl, title, pg), tu in zip(toc, toc_units)])
         except Exception as e:  # noqa: BLE001
             print(f"  ! 북마크 번역 반영 실패: {e}", file=sys.stderr)
-    if cfg.pages is not None:
-        doc.select(cfg.pages)
-        translated_pages = {pages.index(p) for p in translated_pages}
     dst.parent.mkdir(parents=True, exist_ok=True)
-    doc.save(str(dst), garbage=3, deflate=True)
+    if cfg.pages is not None:
+        out_doc = select_pages_safe(doc, cfg.pages)
+        translated_pages = {pages.index(p) for p in translated_pages}
+    else:
+        out_doc = doc
+    save_pdf_safe(out_doc, dst)
+    if out_doc is not doc:
+        out_doc.close()
     doc.close()
 
     warns = verify_output(dst, len(pages), translated_pages)
