@@ -22,8 +22,12 @@ Word 원본이 없어도 되고, 스캔 PDF / 글자가 깨져 복사되는 PDF�
    cd Translation-ENG---KOR-
    code .
    ```
-2. **Tesseract OCR** 설치 (스캔/글자깨짐 페이지, 목차 등에 필요)
-   https://github.com/UB-Mannheim/tesseract/wiki → `tesseract-ocr-w64-setup-xxx.exe` → 기본 경로 `C:\Program Files\Tesseract-OCR`에 설치
+2. **Tesseract OCR** 설치 (스캔/글자깨짐 페이지, 목차 등에 필요) — **GUI의 [Tesseract 설치] 버튼**을 누르면 자동 설치됩니다.
+   (또는 `py install_tesseract.py`)
+   - 최신 Windows 설치 파일을 받아 **관리자 권한 없이** `%LOCALAPPDATA%\Programs\Tesseract-OCR`에 설치합니다.
+   - 설치 파일이 관리자 권한을 요구하면 'Windows 권한 확인' 창이 뜹니다 → [예] (`C:\Program Files\Tesseract-OCR`에 설치)
+   - 다운로드가 막힌 회사망이면 winget(`UB-Mannheim.TesseractOCR`)으로 설치를 시도합니다.
+   - 모두 안 되면 https://github.com/UB-Mannheim/tesseract/wiki 에서 직접 설치하거나 IT팀에 요청하세요.
 3. 파이썬 패키지는 처음 실행할 때 프로젝트 폴더의 `.venv`에 **자동 설치**됩니다(1~3분).
 
 한글 폰트는 `C:\Windows\Fonts\malgun.ttf`(맑은 고딕)를 자동 사용합니다.

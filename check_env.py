@@ -44,7 +44,7 @@ try:
         import pytesseract
         line(True, "Tesseract", f"{pytesseract.get_tesseract_version()}  ({eng.cmd})")
     else:
-        line(False, "Tesseract", eng.reason)
+        line(False, "Tesseract", eng.reason + "\n" + " " * 28 + "→ GUI의 [Tesseract 설치] 버튼 또는: py install_tesseract.py")
 except Exception as e:  # noqa: BLE001
     line(False, "Tesseract", str(e))
 

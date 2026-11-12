@@ -95,6 +95,7 @@ class App(_BaseTk):
         self.after(100, self._poll)
         self.after(200, self._bring_to_front)
         self.after(400, self.cp_reload)
+        self.after(600, lambda: self._tesseract_ok() and self.btn_tess.configure(text="Tesseract 설치됨 ✔"))
 
     def _bring_to_front(self):
         """VS Code/콘솔에서 실행하면 창이 뒤에 숨는 경우가 있어 맨 앞으로 올린다."""
@@ -151,6 +152,8 @@ class App(_BaseTk):
         ttk.Button(fb, text="번역 로그(Excel)", command=self.open_review).pack(side="right", padx=6)
         ttk.Button(fb, text="한국어 PDF 열기", command=self.open_result).pack(side="right")
         ttk.Button(fb, text="환경 점검", command=self.check_env).pack(side="right", padx=6)
+        self.btn_tess = ttk.Button(fb, text="Tesseract 설치", command=self.install_tesseract)
+        self.btn_tess.pack(side="right")
         self.v_status = tk.StringVar(value="대기 중")
         ttk.Label(top, textvariable=self.v_status, style="Hint.TLabel").grid(row=4, column=0, sticky="w", padx=8)
         self.pbar = ttk.Progressbar(top, mode="indeterminate")
@@ -522,12 +525,16 @@ class App(_BaseTk):
             messagebox.showwarning("API 키 필요", "API 자동 번역에는 Anthropic API 키가 필요합니다.\n"
                                                "API 없이 번역하려면 '2. Copilot 번역' 탭을 사용하세요.")
             return
-        if mode in ("build", "export", "api") and self.v_ocr.get() != "off" and not self._tesseract_ok():
-            if not messagebox.askyesno(
-                    "Tesseract 없음",
-                    "Tesseract OCR이 설치되어 있지 않습니다.\n"
-                    "스캔 페이지 / 글자가 깨진 페이지(목차 등)는 번역되지 않고 영어로 남습니다.\n\n"
-                    "설치: https://github.com/UB-Mannheim/tesseract/wiki\n\n그래도 계속할까요?"):
+        if mode in ("build", "export", "api", "estimate") and self.v_ocr.get() != "off" and not self._tesseract_ok():
+            ans = messagebox.askyesnocancel(
+                "Tesseract 없음",
+                "Tesseract OCR이 설치되어 있지 않습니다.\n"
+                "스캔 페이지 / 글자가 깨진 페이지(목차 등)는 번역되지 않고 영어로 남습니다.\n\n"
+                "[예] 지금 자동 설치 (권장)\n[아니오] 설치하지 않고 계속\n[취소] 중단")
+            if ans is None:
+                return
+            if ans:
+                self.install_tesseract()
                 return
         try:
             self._outdir().mkdir(parents=True, exist_ok=True)
@@ -680,6 +687,8 @@ class App(_BaseTk):
             if mode == "build":
                 self._append("ok", "한국어 PDF가 만들어졌습니다. [한국어 PDF 열기]로 확인하세요.\n")
         else:
+            if mode == "install":
+                self._append("err", "\nTesseract 자동 설치를 끝내지 못했습니다. 위 메시지를 확인하세요.\n")
             self._append("err", f"\n✘ 오류로 종료 (코드 {rc}). 위 로그의 빨간 줄을 확인하세요.\n"
                                 f"   전체 로그: {self._outdir() / 'last_run.log'}\n")
             self.v_status.set("오류")
@@ -842,6 +851,32 @@ class App(_BaseTk):
             open_path(f)
         else:
             messagebox.showinfo("결과 없음", "아직 만들어진 번역 로그가 없습니다.")
+
+    def install_tesseract(self):
+        """install_tesseract.py 실행: 다운로드 → (권한 없이) 사용자 폴더 설치 → 필요 시 관리자 설치 → winget."""
+        if self.proc is not None or self.btn_stop.instate(["!disabled"]):
+            return
+        if self._tesseract_ok() and not messagebox.askyesno("Tesseract", "이미 설치되어 있습니다. 설치 상태를 확인할까요?"):
+            return
+        self._clear_log()
+        self.nb.select(self.tab_log)
+        self._append("cmd", "Tesseract OCR 설치를 시작합니다. 'Windows 권한 확인' 창이 뜨면 [예]를 누르세요.\n")
+        self.started = time.time()
+        self.cur_mode = "install"
+        self.btn_run.configure(state="disabled")
+        self.btn_stop.configure(state="normal")
+        self.pbar.start(12)
+
+        def done():
+            if self._tesseract_ok():
+                self.btn_tess.configure(text="Tesseract 설치됨 ✔")
+                messagebox.showinfo("Tesseract", "Tesseract OCR 설치가 완료되었습니다.\n"
+                                                  "이제 스캔/글자깨짐 페이지(목차 등)도 번역됩니다.")
+        self._on_done = done
+        env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1", PYTHONUNBUFFERED="1")
+        threading.Thread(target=self._worker,
+                         args=([([sys.executable, "-u", str(ROOT / "install_tesseract.py")], str(ROOT))], env),
+                         daemon=True).start()
 
     def check_env(self):
         if self.proc is not None or self.btn_stop.instate(["!disabled"]):
