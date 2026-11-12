@@ -112,8 +112,7 @@ def ensure() -> None:
     if python == sys.executable:
         _say("[환경 준비] 완료. 다시 실행합니다.\n")
     else:
-        _say("[환경 준비] 완료. .venv 파이썬으로 다시 실행합니다.\n"
-             "  (VS Code 오른쪽 아래 인터프리터를 '.venv'로 바꾸면 다음부터 바로 실행됩니다)\n")
+        _say("[환경 준비] 완료. 프로젝트 전용 파이썬(.venv)으로 실행합니다.\n")
     env = dict(os.environ, OM_BOOTSTRAPPED="1", PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
     script = os.path.abspath(sys.argv[0])
     rc = subprocess.call([python, script, *sys.argv[1:]], env=env)

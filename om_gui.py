@@ -88,6 +88,18 @@ class App(_BaseTk):
         self._load_settings()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._poll)
+        self.after(200, self._bring_to_front)
+
+    def _bring_to_front(self):
+        """VS Code/콘솔에서 실행하면 창이 뒤에 숨는 경우가 있어 맨 앞으로 올린다."""
+        try:
+            self.deiconify()
+            self.lift()
+            self.attributes("-topmost", True)
+            self.focus_force()
+            self.after(800, lambda: self.attributes("-topmost", False))
+        except Exception:  # noqa: BLE001
+            pass
 
     # ------------------------------------------------------------------ UI
     def _style(self):
@@ -638,6 +650,7 @@ def main():
             ctypes.windll.shcore.SetProcessDpiAwareness(1)  # type: ignore[attr-defined]
         except Exception:  # noqa: BLE001
             pass
+    print("OM 번역기 창을 열었습니다. (창이 안 보이면 작업표시줄의 Python 아이콘을 클릭하세요)", flush=True)
     App().mainloop()
 
 
