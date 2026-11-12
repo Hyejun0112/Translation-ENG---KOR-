@@ -104,6 +104,10 @@ DEFAULT_KEEP_PATTERNS = [
     r"\b(?=[A-Z0-9\-_/.]*\d)(?=[A-Z0-9\-_/.]*[A-Z])[A-Z0-9][A-Z0-9\-_/.]*[A-Z0-9]\b",
     # 수치 + 단위
     _UNIT_RX,
+    # 보팅 로직 / 계기 로직: 2oo3, 1oo2D
+    r"\b\d\s?oo\s?\d[A-Z]?\b",
+    # 화학식/단위 첨자: H2O, CO2, NOx, SO2, O2 (단독 사용)
+    r"\b(?:H2O|CO2|CO|NOx|NO2|SO2|SOx|O2|N2|NH3|CaCO3|HCl)\b",
     # 날짜
     r"\b\d{4}[-./]\d{1,2}[-./]\d{1,2}\b",
     r"\b\d{1,2}[- ](?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[-, ]+\d{2,4}\b",
@@ -808,7 +812,7 @@ def _nospace(t: str) -> str:
 def missing_protected(protector: "Protector", text: str, ko: str) -> list[str]:
     """원문에서 보호해야 하는 문자열(Tag/숫자/단위/규격 등)이 번역문에 그대로 있는지 검사.
     빠진 항목 목록을 돌려준다(공백 차이는 허용)."""
-    _, toks = protector.protect(text, tokenize_numbers=len(text) <= 80)
+    _, toks = protector.protect(text, tokenize_numbers=True)  # 번역 검사는 문장 길이와 관계없이 모든 숫자 확인
     need = Counter(_nospace(t) for t in toks if _nospace(t))
     ko_ns = _nospace(ko)
     miss = []
@@ -1433,16 +1437,33 @@ def load_scope_keywords(path: Optional[str] = None):
 
 
 def page_title_text(page, units: list[Unit]) -> str:
-    """페이지 제목 후보: 위쪽 35% 영역에서 본문보다 큰 글자/굵은 글자, 없으면 첫 3개 블록."""
+    """페이지 제목 후보: 위쪽 35% 영역의 '제목처럼 보이는' 글자(본문보다 크거나 굵고 짧은 줄)만.
+    제목이 없으면 빈 문자열 (본문 첫 줄을 제목으로 쓰지 않는다)."""
     if not units:
         return ""
     sizes = sorted(u.size for u in units if u.size)
     med = sizes[len(sizes) // 2] if sizes else 10
     top = page.rect.y0 + page.rect.height * 0.35
-    cands = [u for u in units if u.rect.y0 < top and (u.size >= med * 1.12 or u.bold) and len(u.text) < 120]
-    if not cands:
-        cands = sorted(units, key=lambda u: (u.rect.y0, u.rect.x0))[:3]
+    cands = [u for u in units
+             if u.rect.y0 < top and (u.size >= med * 1.12 or u.bold) and len(u.text) <= 90
+             and not re.match(r"^\s*[•●▪■◦○‣·*\-–—]\s", u.text) and u.cell is None]
     return " | ".join(u.text for u in cands)
+
+
+# "P&ID No. 0061", "Drawing No. xxx", "refer to Datasheet ..." 같은 참조 표현은 제목 판단에서 제외
+REFERENCE_RE = re.compile(
+    r"(?:P\s*&\s*I\s*D|PFD|drawing|document|doc\.?|data\s*sheet|datasheet|diagram)\s*(?:no\.?|number|nr\.?|#)\s*[:\w./-]*"
+    r"|(?:refer(?:red)?\s+to|see|according\s+to|as\s+per|per)\s+(?:the\s+)?[^|]{0,60}",
+    re.I)
+
+
+def is_prose_page(units: list[Unit]) -> bool:
+    """문장(8단어 이상) 위주의 페이지 = O&M 설명/절차 페이지."""
+    body = [u for u in units if u.kind == "text" and u.cell is None]
+    if len(body) < 3:
+        return False
+    prose = [u for u in body if len(u.text.split()) >= 8]
+    return len(prose) >= 3 and len(prose) / len(body) >= 0.3
 
 
 def page_scope(page, units: list[Unit], drawings_count: int) -> tuple[bool, str]:
@@ -1450,11 +1471,13 @@ def page_scope(page, units: list[Unit], drawings_count: int) -> tuple[bool, str]
     area = abs(page.rect)
     if area > A4_AREA * 1.6:
         return False, "대형 페이지(A3 이상) → 도면으로 판단"
-    title = page_title_text(page, units)
+    title = REFERENCE_RE.sub(" ", page_title_text(page, units))
     m = EXCLUDE_TITLE_RE.search(title)
     if m and not re.search(r"contents|목차", title, re.I):
+        if is_prose_page(units):
+            return True, f"제목에 '{m.group(0)}'가 있으나 문장 위주 페이지라 번역"
         return False, f"제외 문서 제목 '{m.group(0)}'"
-    if units and drawings_count > 1500:
+    if units and drawings_count > 1500 and not is_prose_page(units):
         avg = sum(len(u.text) for u in units) / len(units)
         if avg < 14:
             return False, "도면/다이어그램으로 판단(선 많고 짧은 라벨 위주)"

@@ -521,6 +521,8 @@ class App(_BaseTk):
             messagebox.showwarning("첨부 파일 없음", "'1. 설정' 탭에서 원본 PDF 파일(또는 폴더)을 먼저 추가하세요.")
             self.nb.select(self.tab_set)
             return
+        if mode == "build" and not self._cp_ready_check():
+            return
         if mode == "api" and not self.v_key.get().strip():
             messagebox.showwarning("API 키 필요", "API 자동 번역에는 Anthropic API 키가 필요합니다.\n"
                                                "API 없이 번역하려면 '2. Copilot 번역' 탭을 사용하세요.")
@@ -799,12 +801,36 @@ class App(_BaseTk):
             messagebox.showwarning("저장된 번역 없음",
                                    msg + "\n\n답변 형식이 '[0001] 번역문' 인지, 올바른 배치를 선택했는지 확인하세요.")
 
-    def cp_build(self):
+    def _cp_ready_check(self) -> bool:
+        """한국어 PDF 만들기 전에 Copilot 번역이 되어 있는지 확인. 계속하면 True."""
+        try:
+            import om_copilot
+            man = om_copilot.load_manifest(self._outdir())
+        except Exception:  # noqa: BLE001
+            man = None
+        if man is None:
+            go = messagebox.askyesno(
+                "Copilot 번역 전",
+                "아직 '2. Copilot 번역' 탭에서 번역을 하지 않았습니다.\n"
+                "지금 PDF를 만들면 번역 없이 영어 원문 그대로 나옵니다.\n\n"
+                "[예] Copilot 번역 탭으로 이동 (권장)\n[아니오] 그래도 만들기")
+            if go:
+                self.nb.select(self.tab_cp)
+                return False
+            return True
+        self.cp_reload()
         if self.cp_batches and any(b["done"] < b["total"] for b in self.cp_batches):
             left = sum(b["total"] - b["done"] for b in self.cp_batches)
-            if not messagebox.askyesno("번역 미완료", f"아직 번역되지 않은 문구가 {left}개 있습니다.\n"
-                                                    "그 문구는 영어 원문 그대로 남습니다. 계속할까요?"):
-                return
+            done = sum(b["done"] for b in self.cp_batches)
+            if not messagebox.askyesno(
+                    "번역 미완료",
+                    f"번역된 문구 {done}개 / 아직 Copilot 답변이 없는 문구 {left}개.\n"
+                    "답변이 없는 문구는 영어 원문 그대로 남습니다. 계속할까요?"):
+                self.nb.select(self.tab_cp)
+                return False
+        return True
+
+    def cp_build(self):
         self.run("build")
 
     def cp_open_folder(self):
