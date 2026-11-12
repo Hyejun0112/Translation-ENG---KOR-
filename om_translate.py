@@ -3,22 +3,25 @@
 """
 OM(Operating & Maintenance Manual) 영→한 번역 도구
 =====================================================
-- 원본 PDF의 레이아웃(그림, 표 선, 배경, 링크)은 그대로 두고 '텍스트만' 한글로 교체합니다.
+- 원본 PDF의 레이아웃(그림, 표 선, 배경, 링크, 북마크)은 그대로 두고 '텍스트만' 한글로 교체합니다.
+- 텍스트 레이어가 없는 스캔 페이지 / 글자가 깨져서 추출되는 페이지 / 그림 속 글자는
+  OCR(Tesseract)로 인식한 뒤, 원본 배경색으로 덮고 한글을 그 자리에 씁니다.
+- 표는 셀 경계를 인식해서(네이티브: PyMuPDF find_tables, 스캔: 괘선 검출) 번역문이 셀 밖으로
+  넘치지 않게 배치합니다.
 - 영어로 남겨야 하는 것(규격, 모델명, Tag No., 도면번호, Rev., 수치+단위, 약어, 브랜드 등)은
   자동으로 보호(토큰화)하여 번역기가 건드리지 못하게 합니다.
 - 용어집(glossary)을 강제 적용하고, 번역 후 용어집 준수 여부를 검사해 리포트에 표시합니다.
-- 번역 결과는 SQLite 캐시에 저장되어 재실행/중단 후 재개 시 API 비용이 들지 않습니다.
-- 동일 문구(머리글/바닥글/반복 표 헤더 등)는 한 번만 번역합니다.
+- 번역/OCR 결과는 SQLite 캐시에 저장되어 재실행/중단 후 재개 시 다시 계산하지 않습니다.
 
 서브커맨드
-    estimate   번역 전 분량/토큰 추정 (API 호출 없음)
+    estimate   번역 전 분량/토큰 추정, 페이지 종류(네이티브/스캔/깨짐) 진단 (API 호출 없음)
     terms      PDF에서 자주 나오는 용어 후보 추출 (용어집 작성용, API 호출 없음)
     translate  번역 실행
 
 사용 예 (Windows PowerShell)
     py om_translate.py estimate  .\\OM_EN
     py om_translate.py terms     .\\OM_EN -o terms_candidates.csv
-    py om_translate.py translate .\\OM_EN\\P-101_OM.pdf -o .\\OM_KO --glossary glossary.csv --pages 1-5
+    py om_translate.py translate .\\OM_EN\\P-101_OM.pdf -o .\\OM_KO --glossary glossary.csv --pages 1-5 --compare
     py om_translate.py translate .\\OM_EN -o .\\OM_KO --glossary glossary.csv
 
 환경변수
@@ -39,7 +42,7 @@ import sys
 import threading
 import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -101,8 +104,17 @@ BULLET_RE = re.compile(
 LIGATURES = {"ﬁ": "fi", "ﬂ": "fl", "ﬀ": "ff", "ﬃ": "ffi", "ﬄ": "ffl", "\u00ad": ""}
 
 
+def optional_path(path: Optional[str], what: str) -> Optional[str]:
+    """선택 입력 파일이 없으면 경고만 하고 None (없이 진행)."""
+    if path and not Path(path).exists():
+        print(f"! {what} 파일이 없어 건너뜁니다: {path}", file=sys.stderr)
+        return None
+    return path
+
+
 def load_keep_patterns(path: Optional[str]) -> list[re.Pattern]:
     pats = list(DEFAULT_KEEP_PATTERNS)
+    path = optional_path(path, "영어유지 패턴")
     if path:
         for line in read_text_auto(Path(path)).splitlines():
             line = line.strip()
@@ -134,7 +146,7 @@ class Glossary:
         for en, ko, note in entries:
             en = re.sub(r"\s+", " ", en.strip())
             ko = ko.strip()
-            if not en or (not ko and en not in ("",) and ko == ""):
+            if not en or not ko:
                 continue  # ko가 비어 있는 행(예: terms 후보 중 아직 안 채운 것)은 무시
             if ko in KEEP_MARKERS:
                 self.keep.append(en)
@@ -170,6 +182,7 @@ class Glossary:
 
     @classmethod
     def load(cls, path: Optional[str]) -> "Glossary":
+        path = optional_path(path, "용어집")
         if not path:
             return cls([])
         p = Path(path)
@@ -185,7 +198,8 @@ class Glossary:
                     rows.append([("" if c is None else str(c)) for c in r])
         else:
             text = read_text_auto(p)
-            dialect = csv.excel_tab if "\t" in text.splitlines()[0] else csv.excel
+            first = text.splitlines()[0] if text.strip() else ""
+            dialect = csv.excel_tab if "\t" in first else csv.excel
             rows = list(csv.reader(text.splitlines(), dialect))
         entries = []
         for i, r in enumerate(rows):
@@ -279,7 +293,7 @@ def needs_translation(ptxt: str) -> bool:
 
 
 # ----------------------------------------------------------------------------
-# 4. PDF 텍스트 단위 추출
+# 4. PDF 페이지 진단 / 텍스트 단위 추출
 # ----------------------------------------------------------------------------
 TEXT_FLAGS = (
     getattr(fitz, "TEXTFLAGS_TEXT", 0)
@@ -302,6 +316,11 @@ class Unit:
     rotated: bool = False
     kind: str = "text"  # text | toc
     ocr: bool = False
+    source: str = "native"  # native | ocr-page | ocr-figure | toc
+    conf: float = 100.0
+    cell: Optional["fitz.Rect"] = None  # 표 셀 경계(번역문이 넘지 않을 한계)
+    fg: Optional[tuple] = None  # OCR: 글자색 (0~1 RGB)
+    bg: Optional[tuple] = None  # OCR: 배경색 (0~1 RGB) → 원문을 덮는 패치 색
     ptxt: str = ""
     tokens: list = field(default_factory=list)
     status: str = ""
@@ -310,13 +329,51 @@ class Unit:
     used_size: float = 0.0
 
 
+PUNCT = set("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
+PAGE_CLASS_KO = {
+    "native": "네이티브", "scanned": "스캔(이미지)", "garbled": "글자깨짐",
+    "invisible": "스캔+숨은OCR층", "empty": "빈 페이지", "forced": "강제OCR",
+}
+
+
+def classify_page(page) -> str:
+    """native | scanned | garbled | invisible | empty"""
+    raw = page.get_text("text")
+    s = "".join(raw.split())
+    try:
+        imgs = page.get_image_info()
+    except Exception:  # noqa: BLE001
+        imgs = []
+    area = max(1.0, abs(page.rect))
+    cov = 0.0
+    for im in imgs:
+        cov = max(cov, abs(fitz.Rect(im["bbox"]) & page.rect) / area)
+    if len(s) < 5:
+        return "scanned" if imgs else "empty"
+    bad = sum(1 for c in s if c == "\ufffd" or 0xE000 <= ord(c) <= 0xF8FF or ord(c) < 32)
+    punct = sum(1 for c in s if c in PUNCT)
+    letters = sum(1 for c in s if c.isalpha())
+    if bad / len(s) > 0.10 or (len(s) > 40 and punct / len(s) > 0.40 and letters / len(s) < 0.4):
+        return "garbled"
+    if cov > 0.6:
+        try:
+            tr = page.get_texttrace()
+            tot = sum(len(t["chars"]) for t in tr)
+            inv = sum(len(t["chars"]) for t in tr if t.get("type") == 3 or t.get("opacity", 1) == 0)
+            if tot and inv / tot > 0.8:
+                return "invisible"
+        except Exception:  # noqa: BLE001
+            pass
+    return "native"
+
+
 def clean_text(s: str) -> str:
     for a, b in LIGATURES.items():
         s = s.replace(a, b)
     return re.sub(r"\s+", " ", s).strip()
 
 
-def split_line_segments(ln: dict, ocr: bool = False) -> list[dict]:
+def split_line_segments(ln: dict) -> list[dict]:
     """한 줄 안에서 열 간격이 크게 벌어진 텍스트(표의 셀 등)를 별도 세그먼트로 분리."""
     spans = [s for s in ln["spans"] if s["text"].strip()]
     segs, cur = [], []
@@ -334,9 +391,7 @@ def split_line_segments(ln: dict, ocr: bool = False) -> list[dict]:
         r = fitz.Rect(sg[0]["bbox"])
         for s in sg[1:]:
             r |= fitz.Rect(s["bbox"])
-        # OCR 결과는 단어 단위 span이라 공백이 없다 → 공백으로 이어 붙인다
-        text = (" ".join(s["text"].strip() for s in sg) if ocr
-                else "".join(s["text"] for s in sg)).strip()
+        text = "".join(s["text"] for s in sg).strip()
         if text:
             out.append({"bbox": tuple(r), "spans": sg, "dir": ln["dir"], "_text": text})
     return out
@@ -360,7 +415,7 @@ def is_tabular(lines: list[dict]) -> bool:
 
 
 def column_merge(segs: list[dict]) -> list[list[dict]]:
-    """표 블록: 같은 열에서 바로 아래 이어지는 줄만 하나의 셀(문단)로 합친다."""
+    """괘선 없는 표 블록: 같은 열에서 바로 아래 이어지는 줄만 하나의 셀(문단)로 합친다."""
     segs = sorted(segs, key=lambda s: (s["bbox"][1], s["bbox"][0]))
     groups: list[list[dict]] = []
     for s in segs:
@@ -381,32 +436,132 @@ def column_merge(segs: list[dict]) -> list[list[dict]]:
     return groups
 
 
-def extract_units(page, ocr: bool = False) -> list[Unit]:
-    kw = {"flags": TEXT_FLAGS}
-    if ocr:
-        kw["textpage"] = page.get_textpage_ocr(language="eng", dpi=300, full=True)
-    d = page.get_text("dict", **kw)
+def cell_merge(segs: list[dict]) -> list[list[dict]]:
+    """표 셀 안의 줄: 글머리표가 아니면 위에서 아래로 이어 붙인다(같은 행은 같은 그룹)."""
+    segs = sorted(segs, key=lambda s: (round(s["bbox"][1], 1), s["bbox"][0]))
+    groups: list[list[dict]] = []
+    for s in segs:
+        if groups and not BULLET_RE.match(s["_text"]):
+            last = groups[-1][-1]
+            size = last["spans"][0]["size"]
+            gap = s["bbox"][1] - last["bbox"][3]
+            if gap < 1.2 * size:
+                groups[-1].append(s)
+                continue
+        groups.append([s])
+    return groups
+
+
+def find_table_cells(page) -> list["fitz.Rect"]:
+    """괘선 표(2x2 이상)의 셀 사각형 목록 (PyMuPDF find_tables)."""
+    if not hasattr(page, "find_tables"):
+        return []
+    try:
+        tf = page.find_tables()
+    except Exception:  # noqa: BLE001
+        return []
+    cells = []
+    for t in getattr(tf, "tables", []):
+        if t.row_count < 2 or t.col_count < 2:
+            continue
+        for c in t.cells:
+            if c:
+                r = fitz.Rect(c)
+                if r.width > 3 and r.height > 3:
+                    cells.append(r)
+    return cells
+
+
+def _group_to_unit(page, g: list[dict], cell=None) -> Optional[Unit]:
+    rect = fitz.Rect(g[0]["bbox"])
+    for ln in g[1:]:
+        rect |= fitz.Rect(ln["bbox"])
+    text = clean_text(" ".join(ln["_text"] for ln in g))
+    if not text:
+        return None
+    w = Counter()
+    for ln in g:
+        for s in ln["spans"]:
+            if s["text"].strip():
+                bold = bool(s["flags"] & 16) or "bold" in s["font"].lower()
+                w[(round(s["size"], 1), s["color"], bold)] += len(s["text"].strip())
+    (size, color, bold), _ = w.most_common(1)[0]
+    first = g[0]["spans"][0]
+    rotated = any(abs(ln["dir"][0]) < 0.99 for ln in g)
+    align = "left"
+    if len(g) > 1:
+        L = [ln["bbox"][0] for ln in g]
+        R = [ln["bbox"][2] for ln in g]
+        C = [(ln["bbox"][0] + ln["bbox"][2]) / 2 for ln in g]
+        if max(L) - min(L) < 1.5:
+            align = "left"
+        elif max(C) - min(C) < 1.5:
+            align = "center"
+        elif max(R) - min(R) < 1.5:
+            align = "right"
+    elif cell is not None:  # 한 줄짜리 셀: 셀 안에서 가운데 정렬인지 확인
+        lm, rm = rect.x0 - cell.x0, cell.x1 - rect.x1
+        if lm > 4 and rm > 4 and abs(lm - rm) < max(2.0, 0.15 * (lm + rm)):
+            align = "center"
+        elif lm > 3 * max(rm, 1) and rm < 6:
+            align = "right"
+    return Unit(page=page.number, idx=0, rect=rect, text=text, size=size, color=color,
+                bold=bold, origin_y=first["origin"][1], align=align, rotated=rotated,
+                cell=fitz.Rect(cell) if cell is not None else None)
+
+
+def extract_units(page, table_cells: Optional[list] = None) -> list[Unit]:
+    """네이티브(텍스트 레이어가 있는) 페이지에서 번역 단위를 추출."""
+    d = page.get_text("dict", flags=TEXT_FLAGS)
+    cells = find_table_cells(page) if table_cells is None else table_cells
     units: list[Unit] = []
     seen = set()
+    cell_lines: dict[int, list[dict]] = {}
+
+    def add(u: Optional[Unit]):
+        if u is None:
+            return
+        key = (round(u.rect.x0), round(u.rect.y0), round(u.rect.x1), round(u.rect.y1), u.text)
+        if key in seen:  # 겹쳐 그린 중복 텍스트(가짜 볼드 등) 제거
+            return
+        seen.add(key)
+        u.idx = len(units)
+        units.append(u)
+
     for b in d.get("blocks", []):
         if b.get("type") != 0:
             continue
         seg_lines: list[dict] = []
         tabular = False
         for ln in b.get("lines", []):
-            segs = split_line_segments(ln, ocr)
+            segs = split_line_segments(ln)
             if len(segs) > 1:
                 tabular = True
             seg_lines += segs
-        if not seg_lines:
+        # 괘선 표 셀 안에 있는 줄은 셀 단위로 따로 모은다
+        rest = []
+        for sl in seg_lines:
+            bb = sl["bbox"]
+            cx, cy = (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2
+            hit, best = None, None
+            for i, c in enumerate(cells):
+                if c.x0 <= cx <= c.x1 and c.y0 <= cy <= c.y1:
+                    a = abs(c)
+                    if best is None or a < best:
+                        hit, best = i, a
+            if hit is None:
+                rest.append(sl)
+            else:
+                cell_lines.setdefault(hit, []).append(sl)
+        if not rest:
             continue
         if not tabular:
-            tabular = is_tabular(seg_lines)
+            tabular = is_tabular(rest)
         if tabular:
-            groups = column_merge(seg_lines)
+            groups = column_merge(rest)
         else:
             groups, cur = [], []
-            for ln in seg_lines:
+            for ln in rest:
                 if cur and BULLET_RE.match(ln["_text"]):
                     groups.append(cur)
                     cur = []
@@ -414,45 +569,40 @@ def extract_units(page, ocr: bool = False) -> list[Unit]:
             if cur:
                 groups.append(cur)
         for g in groups:
-            rect = fitz.Rect(g[0]["bbox"])
-            for ln in g[1:]:
-                rect |= fitz.Rect(ln["bbox"])
-            text = clean_text(" ".join(ln["_text"] for ln in g))
-            if not text:
-                continue
-            w = Counter()
-            for ln in g:
-                for s in ln["spans"]:
-                    if s["text"].strip():
-                        bold = bool(s["flags"] & 16) or "bold" in s["font"].lower()
-                        w[(round(s["size"], 1), s["color"], bold)] += len(s["text"].strip())
-            (size, color, bold), _ = w.most_common(1)[0]
-            if ocr:  # OCR 글자 크기는 부정확 → 박스 높이로 추정
-                size = max(5.0, (rect.height / len(g)) / 1.25)
-            first = g[0]["spans"][0]
-            origin_y = first["origin"][1]
-            rotated = any(abs(ln["dir"][0]) < 0.99 for ln in g)
-            align = "left"
-            if len(g) > 1:
-                L = [ln["bbox"][0] for ln in g]
-                R = [ln["bbox"][2] for ln in g]
-                C = [(ln["bbox"][0] + ln["bbox"][2]) / 2 for ln in g]
-                if max(L) - min(L) < 1.5:
-                    align = "left"
-                elif max(C) - min(C) < 1.5:
-                    align = "center"
-                elif max(R) - min(R) < 1.5:
-                    align = "right"
-            key = (round(rect.x0), round(rect.y0), round(rect.x1), round(rect.y1), text)
-            if key in seen:  # 겹쳐 그린 중복 텍스트(가짜 볼드 등) 제거
-                continue
-            seen.add(key)
-            units.append(
-                Unit(page=page.number, idx=len(units), rect=rect, text=text, size=size,
-                     color=color, bold=bold, origin_y=origin_y, align=align,
-                     rotated=rotated, ocr=ocr)
-            )
+            add(_group_to_unit(page, g))
+
+    for ci, lines in cell_lines.items():
+        for g in cell_merge(lines):
+            add(_group_to_unit(page, g, cells[ci]))
     return units
+
+
+def figure_regions(page, min_w: float = 40, min_h: float = 20) -> list["fitz.Rect"]:
+    """페이지에 배치된 래스터 이미지(그림/사진/스캔 도면) 영역. 겹치면 합친다."""
+    try:
+        infos = page.get_image_info()
+    except Exception:  # noqa: BLE001
+        return []
+    rects = []
+    for im in infos:
+        r = fitz.Rect(im["bbox"]) & page.rect
+        if r.is_empty or r.width < min_w or r.height < min_h:
+            continue
+        rects.append(r)
+    changed = True
+    while changed:
+        changed = False
+        out: list = []
+        for r in rects:
+            for o in out:
+                if r.intersects(o):
+                    o |= r
+                    changed = True
+                    break
+            else:
+                out.append(fitz.Rect(r))
+        rects = out
+    return rects
 
 
 # ----------------------------------------------------------------------------
@@ -480,10 +630,13 @@ your own preference. For terms not in the glossary, use standard Korean power-pl
 / electrical / instrumentation engineering terminology (한국전력/발전 현장에서 쓰는 용어).
 5. Preserve list markers and numbering at the start of an item (e.g. "1.", "a)", "•", "NOTE:"). \
 Safety headings: WARNING → 경고, CAUTION → 주의, DANGER → 위험, NOTE → 참고 (unless the glossary says otherwise).
-6. Items are labels, table cells, headings or paragraphs. Keep short items short; do not add \
-explanations, notes or extra punctuation. Do not merge or split items.
-7. {tone}
-8. Output ONLY valid JSON: {{"translations":[{{"id":"<same id>","ko":"<Korean text>"}}]}}"""
+6. Items are labels, table cells, headings, figure callouts or paragraphs. Keep short items short; \
+do not add explanations, notes or extra punctuation. Do not merge or split items.
+7. Some items come from OCR of scanned pages and may contain recognition errors \
+(e.g. "rn"↔"m", "0"↔"O", "l"↔"1", broken hyphenation, stray characters). Silently infer the \
+intended English wording and translate that. Never "fix" protected tokens.
+8. {tone}
+9. Output ONLY valid JSON: {{"translations":[{{"id":"<same id>","ko":"<Korean text>"}}]}}"""
 
 
 def parse_json_loose(text: str) -> dict:
@@ -554,10 +707,11 @@ class AnthropicBackend:
 
 
 # ----------------------------------------------------------------------------
-# 6. 캐시
+# 6. 캐시 (번역 + OCR 결과)
 # ----------------------------------------------------------------------------
 class Cache:
     def __init__(self, path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(str(path), check_same_thread=False)
         self.db.execute("CREATE TABLE IF NOT EXISTS t (k TEXT PRIMARY KEY, v TEXT)")
         self.lock = threading.Lock()
@@ -573,8 +727,16 @@ class Cache:
             self.db.commit()
 
 
+def file_sha(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()[:20]
+
+
 # ----------------------------------------------------------------------------
-# 7. 번역 파이프라인
+# 7. 설정 / 번역 파이프라인
 # ----------------------------------------------------------------------------
 @dataclass
 class Config:
@@ -586,12 +748,15 @@ class Config:
     max_chunk_items: int = 40
     min_scale: float = 0.6
     min_size: float = 5.0
-    ocr: bool = False
+    ocr_mode: str = "auto"      # auto | off | force
+    ocr_figures: bool = True    # 그림(래스터 이미지) 속 글자도 OCR
+    ocr_workers: int = 2
     whiteout: bool = False
     font: str = ""
     font_bold: str = ""
     pages: Optional[list[int]] = None
     force: bool = False
+    compare: bool = False
 
 
 def cache_key(cfg: Config, gloss: Glossary, ptxt: str) -> str:
@@ -666,7 +831,91 @@ def translate_texts(texts: list[str], backend, gloss: Glossary, cache: Cache, cf
 
 
 # ----------------------------------------------------------------------------
-# 8. 폰트 / 레이아웃
+# 8. OCR 실행 (om_ocr.py)
+# ----------------------------------------------------------------------------
+def build_ocr_engine(args):
+    """--ocr off 이면 None. 엔진을 못 쓰면 available=False 인 엔진을 돌려준다."""
+    if getattr(args, "ocr", "auto") == "off":
+        return None
+    try:
+        from om_ocr import OcrEngine
+    except ImportError as e:
+        print(f"! om_ocr 로드 실패: {e} (om_ocr.py 가 om_translate.py 와 같은 폴더에 있어야 합니다)",
+              file=sys.stderr)
+        return None
+    eng = OcrEngine(lang=args.ocr_lang, dpi=args.ocr_dpi, min_conf=args.ocr_min_conf,
+                    fig_min_conf=args.ocr_fig_min_conf, tesseract_cmd=args.tesseract,
+                    deskew=not args.no_deskew, bullet_re=BULLET_RE)
+    if not eng.available:
+        print(f"! OCR 사용 불가: {eng.reason}", file=sys.stderr)
+    return eng
+
+
+def run_ocr_jobs(doc, jobs: list, ocr, cache: Cache, fhash: str, cfg: Config, label: str = "") -> dict:
+    """jobs: [(pno, mode, clip Rect, exclude rects)] → {job index: [OcrBlock]}"""
+    from om_ocr import OcrBlock
+    results: dict[int, list] = {}
+    pending = []
+    for i, (pno, mode, clip, excl) in enumerate(jobs):
+        sig = json.dumps([fhash, pno, mode, [round(v, 1) for v in clip],
+                          sorted([round(v, 1) for v in r] for r in excl), ocr.signature()])
+        key = "ocr|" + hashlib.sha256(sig.encode()).hexdigest()
+        hit = cache.get(key)
+        if hit is not None:
+            results[i] = [OcrBlock.from_json(x) for x in json.loads(hit)]
+        else:
+            pending.append((i, key))
+    if not pending:
+        return results
+    t0 = time.time()
+    n_done = 0
+    with ThreadPoolExecutor(max_workers=max(1, cfg.ocr_workers)) as ex:
+        live = {}
+
+        def collect(fs):
+            nonlocal n_done
+            for f in fs:
+                i, key = live.pop(f)
+                try:
+                    blocks = f.result()
+                except Exception as e:  # noqa: BLE001
+                    print(f"\n  ! OCR 실패 p.{jobs[i][0] + 1}: {e}", file=sys.stderr)
+                    blocks = []
+                results[i] = blocks
+                cache.put(key, json.dumps([b.to_json() for b in blocks], ensure_ascii=False))
+                n_done += 1
+                print(f"  [{label}] OCR {n_done}/{len(pending)} ({time.time() - t0:.0f}s)",
+                      end="\r", flush=True)
+
+        for i, key in pending:
+            pno, mode, clip, excl = jobs[i]
+            page = doc[pno]
+            dpi = ocr.dpi if mode == "page" else min(600, int(ocr.dpi * 1.25))
+            rgb = ocr.render(page, clip=clip, dpi=dpi)  # 렌더링은 메인 스레드에서만
+            f = ex.submit(ocr.ocr_image, rgb, (clip.x0, clip.y0), dpi / 72.0, mode,
+                          [tuple(r) for r in excl])
+            live[f] = (i, key)
+            del rgb
+            while len(live) >= max(2, cfg.ocr_workers * 2):
+                done, _ = wait(list(live), return_when=FIRST_COMPLETED)
+                collect(done)
+        collect(list(as_completed(list(live))))
+    print(" " * 70, end="\r")
+    return results
+
+
+def block_to_unit(pno: int, b) -> Unit:
+    u = Unit(page=pno, idx=0, rect=fitz.Rect(b.rect), text=clean_text(b.text), size=b.size,
+             color=0, bold=b.bold, origin_y=b.origin_y, align=b.align, ocr=True,
+             source=b.source, conf=b.conf, cell=fitz.Rect(b.cell) if b.cell else None,
+             fg=tuple(b.fg), bg=tuple(b.bg))
+    if b.conf < 80:
+        u.notes.append(f"OCR_LOW_CONF({b.conf:.0f}) 원문 확인")
+    return u
+
+
+# ----------------------------------------------------------------------------
+# 9. 폰트 / 레이아웃
 # ----------------------------------------------------------------------------
 FONT_CANDIDATES = {
     "regular": [
@@ -760,7 +1009,7 @@ def subset_font_bytes(path: str, chars: set[str]) -> Optional[bytes]:
     return None
 
 
-def build_fonts(cfg: Config, units: list["Unit"]) -> dict:
+def build_fonts(cfg: Config, units: list[Unit]) -> dict:
     reg = find_font(cfg.font, "regular")
     if not reg:
         sys.exit("한글 폰트를 찾지 못했습니다. --font 로 TTF/TTC 경로를 지정하세요. "
@@ -811,7 +1060,8 @@ def wrap_text(text: str, font, size: float, width: float) -> list[str]:
                     if font.text_length(piece + ch, fontsize=size) <= width:
                         piece += ch
                     else:
-                        lines.append(piece)
+                        if piece:
+                            lines.append(piece)
                         piece = ch
                 cur = piece
         lines.append(cur)
@@ -828,51 +1078,56 @@ def _shrink_fit(text, font, width, height, start, lo, tol=0.35):
         size = max(lo, size - 0.25)
 
 
-def fit_text(text, font, rect, box_w, orig_size, cfg: Config):
-    """1) 원래 폭에서 글자 크기를 85%까지만 줄여 시도 → 2) 확장 폭(이웃/테두리 직전까지)에서 시도
-    → 3) 확장 폭에서 하한(min_scale/min_size)까지 축소. 반환: (크기, 줄 목록, 맞음여부, 사용폭)"""
+def fit_text(text, font, w0, h0, box_w, box_h, orig_size, cfg: Config):
+    """원래 박스 → 폭 확장 → 폭+높이 확장(셀 바닥/다음 글자 직전까지) 순서로 92%, 85%까지 축소해 시도,
+    그래도 안 되면 확장 박스에서 하한(min_scale/min_size)까지 축소.
+    반환: (크기, 줄 목록, 맞음여부, 사용폭)"""
     lo = min(orig_size, max(cfg.min_size, orig_size * cfg.min_scale))
-    mid = max(lo, orig_size * 0.85)
-    s, ls, ok = _shrink_fit(text, font, rect.width, rect.height, orig_size, mid)
-    if ok:
-        return s, ls, ok, rect.width
-    if box_w > rect.width + 0.5:
-        s, ls, ok = _shrink_fit(text, font, box_w, rect.height, orig_size, mid)
-        if ok:
-            return s, ls, ok, box_w
-    w = max(box_w, rect.width)
-    s, ls, ok = _shrink_fit(text, font, w, rect.height, orig_size, lo)
-    return s, ls, ok, w
+    W, H = max(box_w, w0), max(box_h, h0)
+    for tier in (0.92, 0.85):  # 약간 축소 → 폭/높이 확장 → 조금 더 축소 순
+        mid = max(lo, orig_size * tier)
+        for w, h in ((w0, h0), (W, h0), (W, H)):
+            s, ls, ok = _shrink_fit(text, font, w, h, orig_size, mid)
+            if ok:
+                return s, ls, ok, w
+    s, ls, ok = _shrink_fit(text, font, W, H, orig_size, lo)
+    return s, ls, ok, W
 
 
-def page_edges(page) -> list[tuple[float, float, float]]:
-    """표 테두리/박스의 세로 경계선 (x, y0, y1). 글자가 셀 밖으로 넘치지 않게 하는 데 사용."""
-    edges: list[tuple[float, float, float]] = []
+def page_edges(page) -> tuple[list, list]:
+    """표 테두리/박스 경계선. 세로선 (x, y0, y1), 가로선 (y, x0, x1)."""
+    vedges: list[tuple[float, float, float]] = []
+    hedges: list[tuple[float, float, float]] = []
     try:
         drawings = page.get_drawings()
     except Exception:  # noqa: BLE001
-        return edges
-    if len(drawings) > 6000:  # 매우 복잡한 도면: 속도를 위해 생략
-        return edges
+        return vedges, hedges
+    if len(drawings) > 8000:  # 매우 복잡한 도면: 속도를 위해 생략
+        return vedges, hedges
     for d in drawings:
         for it in d["items"]:
             if it[0] == "l":
                 p1, p2 = it[1], it[2]
                 if abs(p1.x - p2.x) < 0.8 and abs(p1.y - p2.y) >= 5:
-                    edges.append((p1.x, min(p1.y, p2.y), max(p1.y, p2.y)))
+                    vedges.append((p1.x, min(p1.y, p2.y), max(p1.y, p2.y)))
+                elif abs(p1.y - p2.y) < 0.8 and abs(p1.x - p2.x) >= 5:
+                    hedges.append((p1.y, min(p1.x, p2.x), max(p1.x, p2.x)))
             elif it[0] == "re":
                 r = it[1]
                 if r.height >= 5:
-                    edges.append((r.x0, r.y0, r.y1))
-                    edges.append((r.x1, r.y0, r.y1))
-    return edges
+                    vedges.append((r.x0, r.y0, r.y1))
+                    vedges.append((r.x1, r.y0, r.y1))
+                if r.width >= 5:
+                    hedges.append((r.y0, r.x0, r.x1))
+                    hedges.append((r.y1, r.x0, r.x1))
+    return vedges, hedges
 
 
-def free_span(u: "Unit", units: list["Unit"], edges, page_rect) -> tuple[float, float]:
+def free_span(u: Unit, units: list[Unit], vedges, page_rect) -> tuple[float, float]:
     """유닛이 가로로 사용할 수 있는 한계 (left, right)."""
     cy = (u.rect.y0 + u.rect.y1) / 2
     left, right = page_rect.x0 + 12, page_rect.x1 - 12
-    for x, y0, y1 in edges:
+    for x, y0, y1 in vedges:
         if y0 + 0.5 < cy < y1 - 0.5:
             if x >= u.rect.x1 - 0.5:
                 right = min(right, x - 2)
@@ -887,7 +1142,28 @@ def free_span(u: "Unit", units: list["Unit"], edges, page_rect) -> tuple[float, 
                 right = min(right, o.rect.x0 - 3)
             elif o.rect.x1 <= u.rect.x0 + 0.5:
                 left = max(left, o.rect.x1 + 3)
+    if u.cell is not None:
+        left = max(left, u.cell.x0 + 1.5)
+        right = min(right, u.cell.x1 - 1.5)
     return min(left, u.rect.x0), max(right, u.rect.x1)
+
+
+def free_bottom(u: Unit, units: list[Unit], hedges, page_rect, left: float, right: float) -> float:
+    """유닛이 아래로 늘어날 수 있는 한계 y. 셀 안이면 셀 바닥까지, 아니면 최대 1줄."""
+    bottom = page_rect.y1 - 10
+    if u.cell is not None:
+        bottom = min(bottom, u.cell.y1 - 1.5)
+    for o in units:
+        if o is u:
+            continue
+        if o.rect.y0 >= u.rect.y1 - 0.5 and o.rect.x1 > left and o.rect.x0 < right:
+            bottom = min(bottom, o.rect.y0 - 1)
+    for y, xa, xb in hedges:
+        if y >= u.rect.y1 - 0.3 and xb > left and xa < right:
+            bottom = min(bottom, y - 1.5)
+    if u.cell is None:
+        bottom = min(bottom, u.rect.y1 + u.size * LINE_H * 1.05)
+    return max(bottom, u.rect.y1)
 
 
 def apply_redactions(page, whiteout: bool):
@@ -910,32 +1186,16 @@ def render_page(page, units: list[Unit], fonts, cfg: Config):
     todo = [u for u in units if u.ko]
     if not todo:
         return
-    edges = page_edges(page)  # 리댁션 전에 계산(원본 도형 기준)
-    whiteout = cfg.whiteout or any(u.ocr for u in todo)
-    links = [{k: l[k] for k in LINK_KEYS if k in l} for l in page.get_links()]
-    for u in todo:
-        r = fitz.Rect(u.rect)
-        r = fitz.Rect(r.x0 + 0.3, r.y0 + 0.3, r.x1 - 0.3, r.y1 - 0.3)
-        if whiteout:
-            page.add_redact_annot(r, fill=(1, 1, 1))
-        else:
-            page.add_redact_annot(r, fill=False)
-    apply_redactions(page, whiteout)
-    for l in page.get_links():  # 링크 복원
-        page.delete_link(l)
-    for l in links:
-        try:
-            page.insert_link(l)
-        except Exception:  # noqa: BLE001
-            pass
-    insert_font(page, "OMKO", fonts["regular"])
-    if fonts["bold"]["font"]:
-        insert_font(page, "OMKOB", fonts["bold"])
+    vedges, hedges = page_edges(page)  # 리댁션 전에 계산(원본 도형 기준)
+    has_text_layer = bool(page.get_text("text").strip())
+
+    # 1) 배치 계산 (원본 위치/폭/높이 기준)
+    plans = []
     for u in todo:
         use_bold = bool(u.bold and fonts["bold"]["font"])
         font = fonts["bold"]["font"] if use_bold else fonts["regular"]["font"]
         fname = "OMKOB" if use_bold else "OMKO"
-        left, right = free_span(u, units, edges, page.rect)
+        left, right = free_span(u, units, vedges, page.rect)
         if u.align == "center":
             cx = (u.rect.x0 + u.rect.x1) / 2
             box_w = 2 * min(cx - left, right - cx)
@@ -943,14 +1203,21 @@ def render_page(page, units: list[Unit], fonts, cfg: Config):
             box_w = u.rect.x1 - left
         else:
             box_w = right - u.rect.x0
-        size, lines, ok, _w = fit_text(u.ko, font, u.rect, box_w, u.size, cfg)
+        bottom = free_bottom(u, units, hedges, page.rect, left, right)
+        if u.source == "ocr-figure":
+            # 그림 속 라벨: 래스터 그림의 선/기호를 덮지 않도록 원래 자리에서 거의 넓히지 않고 축소로 맞춘다
+            box_w = min(box_w, u.rect.width * 1.12 + 2)
+            bottom = u.rect.y1 + 0.15 * u.size
+        size, lines, ok, _w = fit_text(u.ko, font, u.rect.width, u.rect.height, box_w,
+                                       bottom - u.rect.y0, u.size, cfg)
         u.used_size = size
         if not ok:
             u.notes.append("OVERFLOW(박스 초과, 글자 축소 한계)")
         asc = (u.origin_y - u.rect.y0) / u.size if u.size else 0.85
         asc = min(max(asc, 0.7), 1.0)
         y = u.rect.y0 + asc * size
-        color = fitz.sRGB_to_pdf(u.color) if hasattr(fitz, "sRGB_to_pdf") else (0, 0, 0)
+        placed = []
+        area = fitz.Rect(u.rect)
         for ln in lines:
             tw = font.text_length(ln, fontsize=size)
             if u.align == "center":
@@ -960,12 +1227,59 @@ def render_page(page, units: list[Unit], fonts, cfg: Config):
             else:
                 x = u.rect.x0
             if ln:
-                page.insert_text(fitz.Point(x, y), ln, fontname=fname, fontsize=size, color=color)
+                placed.append((x, y, ln))
+                area |= fitz.Rect(x, y - asc * size, x + tw, y + 0.28 * size)
             y += size * LINE_H
+        if u.ocr:
+            color = tuple(u.fg) if u.fg else (0, 0, 0)
+        else:
+            color = fitz.sRGB_to_pdf(u.color) if hasattr(fitz, "sRGB_to_pdf") else (0, 0, 0)
+        plans.append((u, fname, size, placed, area, color))
+
+    # 2) 원문 제거: 네이티브 텍스트는 리댁션(그림/선은 보존), OCR 영역의 숨은/깨진 텍스트층도 제거
+    links = [{k: l[k] for k in LINK_KEYS if k in l} for l in page.get_links()]
+    n_redact = 0
+    any_ocr = any(u.ocr for u in todo)
+    for u in todo:
+        if not u.ocr:
+            r = fitz.Rect(u.rect.x0 + 0.3, u.rect.y0 + 0.3, u.rect.x1 - 0.3, u.rect.y1 - 0.3)
+            page.add_redact_annot(r, fill=(1, 1, 1) if cfg.whiteout else False)
+            n_redact += 1
+        elif has_text_layer and u.source == "ocr-page":
+            page.add_redact_annot(fitz.Rect(u.rect) + (-1, -1, 1, 1), fill=False)
+            n_redact += 1
+    if n_redact:
+        apply_redactions(page, cfg.whiteout and not any_ocr)
+        for l in page.get_links():  # 링크 복원
+            page.delete_link(l)
+        for l in links:
+            try:
+                page.insert_link(l)
+            except Exception:  # noqa: BLE001
+                pass
+
+    # 3) OCR 영역: 원본 배경색으로 영어를 덮는 패치 (표 셀이면 괘선을 침범하지 않게 셀 안쪽으로 제한)
+    for u, fname, size, placed, area, color in plans:
+        if not u.ocr:
+            continue
+        patch = (fitz.Rect(u.rect) + (-1.2, -1.2, 1.2, 1.2)) | (area + (-0.6, -0.6, 0.6, 0.6))
+        if u.cell is not None:
+            patch &= (u.cell + (1.5, 1.5, -1.5, -1.5))
+        if patch.is_empty:
+            continue
+        page.draw_rect(patch, color=None, fill=tuple(u.bg) if u.bg else (1, 1, 1), width=0, overlay=True)
+
+    # 4) 한글 쓰기
+    insert_font(page, "OMKO", fonts["regular"])
+    if fonts["bold"]["font"]:
+        insert_font(page, "OMKOB", fonts["bold"])
+    for u, fname, size, placed, area, color in plans:
+        for x, y, ln in placed:
+            page.insert_text(fitz.Point(x, y), ln, fontname=fname, fontsize=size, color=color)
 
 
 # ----------------------------------------------------------------------------
-# 9. 문서 단위 처리
+# 10. 문서 단위 처리
 # ----------------------------------------------------------------------------
 def parse_pages(spec: str, n: int) -> list[int]:
     out: list[int] = []
@@ -983,28 +1297,49 @@ def parse_pages(spec: str, n: int) -> list[int]:
     return sorted({p for p in out if 0 <= p < n})
 
 
-def prepare_units(doc, cfg: Config, protector: Protector, overrides: dict[str, str]):
+def prepare_units(doc, cfg: Config, protector: Protector, overrides: dict[str, str],
+                  ocr=None, cache: Optional[Cache] = None, fhash: str = "", label: str = ""):
+    """페이지 진단 → 네이티브 추출 + (필요 시) OCR → 번역 단위 목록.
+    반환: (units, {pno: page_class}, n_figure_regions)"""
     pages = cfg.pages if cfg.pages is not None else list(range(len(doc)))
-    all_units: list[Unit] = []
-    scanned = []
+    ocr_ok = bool(ocr is not None and ocr.available and cfg.ocr_mode != "off" and cache is not None)
+    per_page: dict[int, list[Unit]] = {}
+    classes: dict[int, str] = {}
+    jobs = []
     for pno in pages:
         page = doc[pno]
-        has_text = len(page.get_text("text").strip()) >= 5
-        use_ocr = False
-        if not has_text and page.get_images():
-            scanned.append(pno + 1)
-            use_ocr = cfg.ocr
-        if not has_text and not use_ocr:
+        cls = "forced" if (cfg.ocr_mode == "force" and ocr_ok) else classify_page(page)
+        classes[pno] = cls
+        if cls == "empty":
+            continue
+        if cls in ("scanned", "garbled", "invisible", "forced"):
+            if ocr_ok:
+                jobs.append((pno, "page", fitz.Rect(page.rect), []))
             continue
         try:
-            units = extract_units(page, ocr=use_ocr)
+            units = extract_units(page)
         except Exception as e:  # noqa: BLE001
-            print(f"  ! p.{pno + 1} 추출 실패(OCR 미설치?): {e}", file=sys.stderr)
-            continue
-        all_units += units
+            print(f"  ! p.{pno + 1} 추출 실패: {e}", file=sys.stderr)
+            units = []
+        per_page[pno] = units
+        if ocr_ok and cfg.ocr_figures:
+            for r in figure_regions(page):
+                excl = [tuple(u.rect) for u in units if u.rect.intersects(r)]
+                jobs.append((pno, "figure", r, excl))
+    n_fig = sum(1 for j in jobs if j[1] == "figure")
+    if jobs:
+        res = run_ocr_jobs(doc, jobs, ocr, cache, fhash, cfg, label=label)
+        for i, (pno, mode, clip, excl) in enumerate(jobs):
+            for b in res.get(i, []):
+                per_page.setdefault(pno, []).append(block_to_unit(pno, b))
+    all_units: list[Unit] = []
+    for pno in pages:
+        for i, u in enumerate(per_page.get(pno, [])):
+            u.idx = i
+            all_units.append(u)
     for u in all_units:
         classify_unit(u, protector, overrides)
-    return all_units, scanned
+    return all_units, classes, n_fig
 
 
 def classify_unit(u: Unit, protector: Protector, overrides: dict[str, str]):
@@ -1023,6 +1358,7 @@ def classify_unit(u: Unit, protector: Protector, overrides: dict[str, str]):
 
 
 def load_overrides(path: Optional[str]) -> dict[str, str]:
+    path = optional_path(path, "overrides")
     if not path:
         return {}
     d = {}
@@ -1032,27 +1368,91 @@ def load_overrides(path: Optional[str]) -> dict[str, str]:
     return d
 
 
+def describe_classes(classes: dict[int, str]) -> str:
+    c = Counter(classes.values())
+    return ", ".join(f"{PAGE_CLASS_KO.get(k, k)} {v}p" for k, v in c.most_common())
+
+
+def verify_output(dst: Path, expect_pages: int, translated_pages: set[int]) -> list[str]:
+    """출력 PDF를 다시 열어 페이지 수/한글 추출/깨진 글자 여부를 확인."""
+    warn = []
+    try:
+        d = fitz.open(dst)
+    except Exception as e:  # noqa: BLE001
+        return [f"출력 PDF를 열 수 없음: {e}"]
+    if len(d) != expect_pages:
+        warn.append(f"페이지 수 불일치: {len(d)} != {expect_pages}")
+    bad_pages = []
+    for i in sorted(translated_pages):
+        if i >= len(d):
+            continue
+        t = d[i].get_text("text")
+        if not re.search(r"[가-힣]", t) or t.count("\ufffd") > 3:
+            bad_pages.append(i + 1)
+    if bad_pages:
+        warn.append(f"한글 추출 불가/깨짐 의심 페이지: {bad_pages[:20]}")
+    d.close()
+    return warn
+
+
+def make_compare(src: Path, dst: Path, pages: list[int], out: Path):
+    """원본(왼쪽) | 번역본(오른쪽) 나란히 보기 PDF. Bluebeam Overlay/Compare 전 빠른 검수용."""
+    a = fitz.open(src)
+    b = fitz.open(dst)
+    c = fitz.open()
+    for i, pno in enumerate(pages):
+        if i >= len(b):
+            break
+        ra, rb = a[pno].rect, b[i].rect
+        gap = 12
+        pg = c.new_page(width=ra.width + rb.width + gap, height=max(ra.height, rb.height) + 18)
+        pg.show_pdf_page(fitz.Rect(0, 18, ra.width, 18 + ra.height), a, pno)
+        pg.show_pdf_page(fitz.Rect(ra.width + gap, 18, ra.width + gap + rb.width, 18 + rb.height), b, i)
+        pg.draw_line((ra.width + gap / 2, 0), (ra.width + gap / 2, pg.rect.height), color=(0.6, 0.6, 0.6), width=0.5)
+        pg.insert_text((6, 12), f"ORIGINAL  p.{pno + 1}", fontsize=8, color=(0.4, 0.4, 0.4))
+        pg.insert_text((ra.width + gap + 6, 12), f"KO  p.{pno + 1}", fontsize=8, color=(0.4, 0.4, 0.4))
+    c.save(str(out), garbage=3, deflate=True)
+    a.close()
+    b.close()
+    c.close()
+
+
 def process_pdf(src: Path, dst: Path, cfg: Config, backend, gloss: Glossary,
-                protector: Protector, cache: Cache, overrides: dict[str, str]) -> dict:
+                protector: Protector, cache: Cache, overrides: dict[str, str], ocr=None) -> dict:
     t0 = time.time()
     doc = fitz.open(src)
     if doc.needs_pass:
         raise RuntimeError("암호가 걸린 PDF입니다. 암호를 해제한 뒤 다시 실행하세요.")
     n_pages = len(doc)
-    units, scanned = prepare_units(doc, cfg, protector, overrides)
+    pages = cfg.pages if cfg.pages is not None else list(range(n_pages))
+    # 회전 페이지는 보이는 모습 그대로 회전값만 0으로 정규화 (좌표계 통일 → 한글이 똑바로 들어감)
+    for pno in pages:
+        pg = doc[pno]
+        if pg.rotation and hasattr(pg, "remove_rotation"):
+            pg.remove_rotation()
+
+    fhash = file_sha(src)
+    units, classes, n_fig = prepare_units(doc, cfg, protector, overrides, ocr, cache, fhash,
+                                          label=src.stem[:20])
+    need_ocr = [p for p, c in classes.items() if c in ("scanned", "garbled", "invisible")]
+    ocr_ok = bool(ocr is not None and ocr.available and cfg.ocr_mode != "off")
+    if need_ocr and not ocr_ok:
+        print(f"  ! OCR이 필요한 페이지 {len(need_ocr)}개를 번역하지 못했습니다 "
+              f"(예: p.{', '.join(str(p + 1) for p in need_ocr[:10])}). Tesseract 설치/--tesseract 경로 확인")
 
     # 목차(북마크) 번역
     toc = doc.get_toc(simple=True) if cfg.pages is None else []
     toc_units = []
     for lvl, title, pg in toc:
         tu = Unit(page=pg - 1, idx=-1, rect=fitz.Rect(), text=clean_text(title), size=0, color=0,
-                  bold=False, origin_y=0, kind="toc")
+                  bold=False, origin_y=0, kind="toc", source="toc")
         classify_unit(tu, protector, overrides)
         toc_units.append(tu)
 
     pending = list(dict.fromkeys(u.ptxt for u in units + toc_units if u.status == "PENDING"))
-    print(f"  페이지 {n_pages} | 텍스트블록 {len(units)} | 번역대상(중복제거) {len(pending)}"
-          + (f" | 스캔의심 {len(scanned)}p" if scanned else ""))
+    n_ocr_units = sum(1 for u in units if u.ocr)
+    print(f"  페이지 {n_pages} ({describe_classes(classes)}) | 텍스트블록 {len(units)}"
+          f" (OCR {n_ocr_units}, 그림영역 {n_fig}) | 번역대상(중복제거) {len(pending)}")
     res = translate_texts(pending, backend, gloss, cache, cfg, label=src.stem[:20])
 
     for u in units + toc_units:
@@ -1072,20 +1472,41 @@ def process_pdf(src: Path, dst: Path, cfg: Config, backend, gloss: Glossary,
                 u.notes.append("번역 실패/토큰 불일치: 원문 영어 유지")
 
     # 렌더링
+    translated_pages: set[int] = set()
     if any(u.ko for u in units):
         fonts = build_fonts(cfg, units)
         by_page: dict[int, list[Unit]] = {}
         for u in units:
             by_page.setdefault(u.page, []).append(u)
         for pno, us in by_page.items():
-            render_page(doc[pno], us, fonts, cfg)
+            try:
+                render_page(doc[pno], us, fonts, cfg)
+                if any(u.ko for u in us):
+                    translated_pages.add(pno)
+            except Exception as e:  # noqa: BLE001
+                print(f"  ! p.{pno + 1} 렌더링 실패(원본 유지): {e}", file=sys.stderr)
+                for u in us:
+                    if u.ko:
+                        u.notes.append(f"RENDER_FAILED: {e}")
     if toc_units and any(t.ko for t in toc_units):
-        doc.set_toc([[lvl, (tu.ko or title), pg] for (lvl, title, pg), tu in zip(toc, toc_units)])
+        try:
+            doc.set_toc([[lvl, (tu.ko or title), pg] for (lvl, title, pg), tu in zip(toc, toc_units)])
+        except Exception as e:  # noqa: BLE001
+            print(f"  ! 북마크 번역 반영 실패: {e}", file=sys.stderr)
     if cfg.pages is not None:
         doc.select(cfg.pages)
+        translated_pages = {pages.index(p) for p in translated_pages}
     dst.parent.mkdir(parents=True, exist_ok=True)
     doc.save(str(dst), garbage=3, deflate=True)
     doc.close()
+
+    warns = verify_output(dst, len(pages), translated_pages)
+    for w in warns:
+        print(f"  ! 검증: {w}", file=sys.stderr)
+    if cfg.compare:
+        cmp_path = dst.with_name(dst.stem + "_compare.pdf")
+        make_compare(src, dst, pages, cmp_path)
+        print(f"  비교본: {cmp_path.name}")
 
     write_report(dst.with_suffix(".review.csv"), src.name, units + toc_units)
     cnt = Counter(u.status for u in units + toc_units)
@@ -1093,31 +1514,36 @@ def process_pdf(src: Path, dst: Path, cfg: Config, backend, gloss: Glossary,
     print(f"  완료 {time.time() - t0:.0f}s | 번역 {cnt['TRANSLATED']} | 유지 {cnt['KEEP']} | "
           f"실패 {cnt['FAILED']} | 검토필요 {flagged} → {dst.name}")
     return {"file": src.name, "pages": n_pages, "translated": cnt["TRANSLATED"],
-            "failed": cnt["FAILED"], "flagged": flagged, "scanned_pages": len(scanned)}
+            "failed": cnt["FAILED"], "flagged": flagged,
+            "scanned_pages": len(need_ocr), "ocr_blocks": n_ocr_units,
+            "warnings": " / ".join(warns)}
 
 
 def write_report(path: Path, src_name: str, units: list[Unit]):
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
-        w.writerow(["file", "page", "idx", "x0", "y0", "x1", "y1", "status", "orig_size",
-                    "used_size", "original", "translation", "notes"])
+        w.writerow(["file", "page", "idx", "source", "ocr_conf", "x0", "y0", "x1", "y1", "status",
+                    "orig_size", "used_size", "original", "translation", "notes"])
         for u in units:
             if u.status == "KEEP":
                 continue
-            w.writerow([src_name, u.page + 1, u.idx, round(u.rect.x0, 1), round(u.rect.y0, 1),
-                        round(u.rect.x1, 1), round(u.rect.y1, 1), u.status, round(u.size, 1),
-                        round(u.used_size, 1), u.text, u.ko or "", "; ".join(u.notes)])
+            w.writerow([src_name, u.page + 1, u.idx, u.source, round(u.conf, 1) if u.ocr else "",
+                        round(u.rect.x0, 1), round(u.rect.y0, 1), round(u.rect.x1, 1),
+                        round(u.rect.y1, 1), u.status, round(u.size, 1), round(u.used_size, 1),
+                        u.text, u.ko or "", "; ".join(u.notes)])
 
 
 # ----------------------------------------------------------------------------
-# 10. 서브커맨드
+# 11. 서브커맨드
 # ----------------------------------------------------------------------------
 def list_pdfs(p: str) -> list[Path]:
     path = Path(p)
     if path.is_file():
         return [path]
+    if not path.exists():
+        sys.exit(f"입력 경로가 없습니다: {p}")
     return sorted(x for x in path.rglob("*")
-                  if x.suffix.lower() == ".pdf" and not x.stem.endswith("_KO"))
+                  if x.suffix.lower() == ".pdf" and not x.stem.endswith(("_KO", "_KO_compare")))
 
 
 def build_ctx(args):
@@ -1127,24 +1553,37 @@ def build_ctx(args):
     return gloss, protector, overrides
 
 
+def base_config(args) -> Config:
+    return Config(ocr_mode=args.ocr, ocr_figures=not args.no_ocr_figures,
+                  ocr_workers=args.ocr_workers)
+
+
 def cmd_estimate(args):
     gloss, protector, overrides = build_ctx(args)
-    cfg = Config(pages=None)
+    cfg = base_config(args)
+    ocr = build_ocr_engine(args) if args.with_ocr else None
+    cache = Cache(Path(args.cache)) if args.with_ocr else None
+    if not args.with_ocr:
+        cfg.ocr_mode = "off"
     tot = Counter()
     uniq: dict[str, None] = {}
     for src in list_pdfs(args.input):
         doc = fitz.open(src)
         cfg.pages = parse_pages(args.pages, len(doc)) if args.pages else None
-        units, scanned = prepare_units(doc, cfg, protector, overrides)
+        units, classes, n_fig = prepare_units(doc, cfg, protector, overrides, ocr, cache,
+                                              file_sha(src) if cache else "", label=src.stem[:20])
         pend = [u for u in units if u.status == "PENDING"]
         for u in pend:
             uniq[u.ptxt] = None
+        need = sum(1 for c in classes.values() if c in ("scanned", "garbled", "invisible"))
         tot["files"] += 1
         tot["pages"] += len(doc)
         tot["blocks"] += len(units)
         tot["pending"] += len(pend)
-        tot["scanned"] += len(scanned)
-        print(f"{src.name}: {len(doc)}p, 번역대상 {len(pend)}블록, 스캔의심 {len(scanned)}p")
+        tot["ocr_pages"] += need
+        tot["figs"] += len([1 for p in classes if classes[p] == "native"
+                            for _ in figure_regions(doc[p])])
+        print(f"{src.name}: {len(doc)}p [{describe_classes(classes)}], 번역대상 {len(pend)}블록")
         doc.close()
     chars = sum(len(t) for t in uniq)
     in_tok = int(chars / 3.5 + len(uniq) * 12 + 900 * max(1, tot["pending"] // 40))
@@ -1153,8 +1592,11 @@ def cmd_estimate(args):
     print(f"파일 {tot['files']}개 / {tot['pages']}페이지 / 텍스트블록 {tot['blocks']}")
     print(f"번역 대상(전체) {tot['pending']}블록 → 중복 제거 후 {len(uniq)}블록, {chars:,}자")
     print(f"대략 입력 {in_tok:,} 토큰 / 출력 {out_tok:,} 토큰 (프롬프트·용어집 포함 대략치)")
-    if tot["scanned"]:
-        print(f"! 텍스트 레이어가 없는 스캔 의심 페이지 {tot['scanned']}p → --ocr 옵션(Tesseract 필요) 검토")
+    if tot["ocr_pages"]:
+        msg = "포함됨" if args.with_ocr else "미포함 → --with-ocr 로 포함 가능(시간 소요)"
+        print(f"OCR 필요 페이지(스캔/글자깨짐) {tot['ocr_pages']}p — 위 수치에 {msg}")
+    if tot["figs"]:
+        print(f"그림(래스터 이미지) 영역 {tot['figs']}개 — translate 시 그림 속 글자도 OCR (끄려면 --no-ocr-figures)")
 
 
 STOP = set("the a an of and or to in on for with by from at as is are be this that these those it its "
@@ -1163,25 +1605,30 @@ STOP = set("the a an of and or to in on for with by from at as is are be this th
 
 
 def cmd_terms(args):
-    gloss = Glossary.load(args.glossary)
+    gloss, protector, overrides = build_ctx(args)
+    cfg = base_config(args)
+    ocr = build_ocr_engine(args)
+    cache = Cache(Path(args.cache))
     cnt: Counter = Counter()
     example: dict[str, str] = {}
     for src in list_pdfs(args.input):
         doc = fitz.open(src)
-        for page in doc:
-            for u in extract_units(page):
-                words = re.findall(r"[A-Za-z][A-Za-z\-/&]+", u.text)
-                low = [w.lower() for w in words]
-                for n in (1, 2, 3):
-                    for i in range(len(low) - n + 1):
-                        g = low[i:i + n]
-                        if g[0] in STOP or g[-1] in STOP or any(len(x) < 3 for x in g):
-                            continue
-                        k = " ".join(g)
-                        cnt[k] += 1
-                        example.setdefault(k, u.text[:80])
+        cfg.pages = parse_pages(args.pages, len(doc)) if args.pages else None
+        units, classes, _ = prepare_units(doc, cfg, protector, overrides, ocr, cache, file_sha(src),
+                                          label=src.stem[:20])
+        for u in units:
+            words = re.findall(r"[A-Za-z][A-Za-z\-/&]+", u.text)
+            low = [w.lower() for w in words]
+            for n in (1, 2, 3):
+                for i in range(len(low) - n + 1):
+                    g = low[i:i + n]
+                    if g[0] in STOP or g[-1] in STOP or any(len(x) < 3 for x in g):
+                        continue
+                    k = " ".join(g)
+                    cnt[k] += 1
+                    example.setdefault(k, u.text[:80])
         doc.close()
-        print(f"스캔: {src.name}")
+        print(f"스캔: {src.name} [{describe_classes(classes)}]")
     known = set(gloss.trans) | {k.lower() for k in gloss.keep}
     rows = [(k, c) for k, c in cnt.most_common() if k not in known and c >= args.min_count]
     with open(args.output, "w", newline="", encoding="utf-8-sig") as f:
@@ -1194,21 +1641,26 @@ def cmd_terms(args):
 
 def cmd_translate(args):
     gloss, protector, overrides = build_ctx(args)
-    cfg = Config(backend=args.backend, model=args.model, tone=args.tone, workers=args.workers,
-                 min_scale=args.min_scale, min_size=args.min_size, ocr=args.ocr,
-                 whiteout=args.whiteout, font=args.font or "", font_bold=args.font_bold or "",
-                 force=args.force)
+    cfg = base_config(args)
+    cfg.backend, cfg.model, cfg.tone, cfg.workers = args.backend, args.model, args.tone, args.workers
+    cfg.min_scale, cfg.min_size = args.min_scale, args.min_size
+    cfg.whiteout, cfg.font, cfg.font_bold = args.whiteout, args.font or "", args.font_bold or ""
+    cfg.force, cfg.compare = args.force, args.compare
     if args.backend == "mock":
         cfg.model = "mock"  # 캐시 키 분리: mock 결과가 실제 번역 캐시에 섞이지 않게 함
     backend = MockBackend() if args.backend == "mock" else AnthropicBackend(args.model)
+    ocr = build_ocr_engine(args)
     outdir = Path(args.output)
     outdir.mkdir(parents=True, exist_ok=True)
-    cache = Cache(outdir / "translation_cache.sqlite")
+    cache = Cache(Path(args.cache) if args.cache else outdir / "translation_cache.sqlite")
     pdfs = list_pdfs(args.input)
     if not pdfs:
         sys.exit("PDF 파일을 찾지 못했습니다.")
-    print(f"모델={cfg.model if args.backend != 'mock' else 'mock'} | 용어집 {len(gloss.trans)}개 "
-          f"(영어유지 {len(gloss.keep)}개) | 파일 {len(pdfs)}개")
+    ocr_desc = "꺼짐" if ocr is None else (
+        f"{cfg.ocr_mode} (lang={ocr.lang}, {ocr.dpi}dpi, 그림OCR={'on' if cfg.ocr_figures else 'off'})"
+        if ocr.available else "사용 불가")
+    print(f"모델={cfg.model} | 용어집 {len(gloss.trans)}개 (영어유지 {len(gloss.keep)}개) | "
+          f"OCR {ocr_desc} | 파일 {len(pdfs)}개")
     summary = []
     for i, src in enumerate(pdfs, 1):
         dst = outdir / f"{src.stem}_KO.pdf"
@@ -1221,13 +1673,14 @@ def cmd_translate(args):
             n = len(doc)
             doc.close()
             cfg.pages = parse_pages(args.pages, n) if args.pages else None
-            summary.append(process_pdf(src, dst, cfg, backend, gloss, protector, cache, overrides))
+            summary.append(process_pdf(src, dst, cfg, backend, gloss, protector, cache, overrides, ocr))
         except Exception as e:  # noqa: BLE001
             print(f"  ! 실패: {e}", file=sys.stderr)
             summary.append({"file": src.name, "error": str(e)})
     if summary:
         with open(outdir / "summary.csv", "w", newline="", encoding="utf-8-sig") as f:
-            keys = ["file", "pages", "translated", "failed", "flagged", "scanned_pages", "error"]
+            keys = ["file", "pages", "translated", "failed", "flagged", "scanned_pages",
+                    "ocr_blocks", "warnings", "error"]
             w = csv.DictWriter(f, fieldnames=keys)
             w.writeheader()
             for s in summary:
@@ -1238,41 +1691,56 @@ def cmd_translate(args):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="OM 영→한 번역 도구 (PDF 레이아웃 유지)")
+    ap = argparse.ArgumentParser(description="OM 영→한 번역 도구 (PDF 레이아웃 유지 + OCR)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def common(p):
         p.add_argument("input", help="PDF 파일 또는 폴더")
-        p.add_argument("--glossary", help="용어집 CSV/XLSX (en, ko, note). ko가 비었거나 KEEP이면 영어 유지")
+        p.add_argument("--glossary", help="용어집 CSV/XLSX (en, ko, note). ko가 KEEP이면 영어 유지")
         p.add_argument("--keep-patterns", help="추가 영어 유지 정규식 파일(한 줄에 하나)")
         p.add_argument("--overrides", help="문구 통째 교체용 CSV (원문,번역)")
         p.add_argument("--pages", help="예: 1-5,8  (translate 시 해당 페이지만 출력 = 샘플용)")
+        g = p.add_argument_group("OCR")
+        g.add_argument("--ocr", choices=["auto", "off", "force"], default="auto",
+                       help="auto: 스캔/글자깨짐 페이지만 OCR(기본) | force: 모든 페이지 OCR | off")
+        g.add_argument("--no-ocr-figures", action="store_true", help="그림(래스터 이미지) 속 글자 OCR 끄기")
+        g.add_argument("--ocr-lang", default="eng", help="Tesseract 언어 (기본 eng)")
+        g.add_argument("--ocr-dpi", type=int, default=400, help="OCR 렌더링 해상도 (기본 400)")
+        g.add_argument("--ocr-min-conf", type=float, default=50, help="페이지 OCR 최소 신뢰도(기본 50)")
+        g.add_argument("--ocr-fig-min-conf", type=float, default=70, help="그림 OCR 최소 신뢰도(기본 70)")
+        g.add_argument("--ocr-workers", type=int, default=max(1, (os.cpu_count() or 2) // 2),
+                       help="OCR 동시 처리 수")
+        g.add_argument("--tesseract", help="tesseract.exe 경로 (자동 탐색 실패 시)")
+        g.add_argument("--no-deskew", action="store_true", help="스캔 기울기 보정 끄기")
 
-    p = sub.add_parser("estimate", help="분량/토큰 추정")
+    p = sub.add_parser("estimate", help="분량/토큰 추정, 페이지 진단")
     common(p)
+    p.add_argument("--with-ocr", action="store_true", help="OCR까지 실행해 스캔 페이지 분량도 포함")
+    p.add_argument("--cache", default="translation_cache.sqlite")
     p.set_defaults(fn=cmd_estimate)
 
     p = sub.add_parser("terms", help="용어 후보 추출")
-    p.add_argument("input")
-    p.add_argument("--glossary")
+    common(p)
     p.add_argument("-o", "--output", default="terms_candidates.csv")
     p.add_argument("--top", type=int, default=800)
     p.add_argument("--min-count", type=int, default=3)
+    p.add_argument("--cache", default="translation_cache.sqlite")
     p.set_defaults(fn=cmd_terms)
 
     p = sub.add_parser("translate", help="번역 실행")
     common(p)
     p.add_argument("-o", "--output", required=True, help="출력 폴더")
+    p.add_argument("--cache", help="캐시 파일 (기본: 출력폴더/translation_cache.sqlite)")
     p.add_argument("--backend", choices=["anthropic", "mock"], default="anthropic")
     p.add_argument("--model", default=DEFAULT_MODEL)
     p.add_argument("--tone", choices=list(TONES), default="formal")
-    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--workers", type=int, default=4, help="동시 API 호출 수")
     p.add_argument("--font", help="한글 폰트(TTF/TTC). 기본: 맑은 고딕/나눔고딕/Noto 자동탐색")
     p.add_argument("--font-bold", help="볼드 한글 폰트")
     p.add_argument("--min-scale", type=float, default=0.6, help="글자 축소 하한 비율(기본 0.6)")
     p.add_argument("--min-size", type=float, default=5.0, help="글자 크기 하한 pt(기본 5)")
-    p.add_argument("--ocr", action="store_true", help="텍스트 없는 스캔 페이지 OCR(Tesseract 필요, 실험적)")
-    p.add_argument("--whiteout", action="store_true", help="번역 영역을 흰색으로 덮고 이미지 픽셀도 지움")
+    p.add_argument("--whiteout", action="store_true", help="네이티브 번역 영역을 흰색으로 덮음(원문이 비칠 때)")
+    p.add_argument("--compare", action="store_true", help="원본|번역본 나란히 보기 PDF 추가 생성")
     p.add_argument("--force", action="store_true", help="기존 출력 덮어쓰기")
     p.set_defaults(fn=cmd_translate)
 
