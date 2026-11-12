@@ -48,9 +48,9 @@ MODES = [
     ("estimate", "1. 분량 추정 + 페이지 진단  (무료, API 사용 안 함)"),
     ("terms", "2. 용어 후보 추출 → terms_candidates.csv  (무료)"),
     ("ocr", "3. OCR 결과 확인  (PDF 1개, 한 페이지, 인식 박스 PNG)"),
-    ("mock", "4. 레이아웃 테스트  (무료, 번역 대신 '[번역]' 표시)"),
-    ("sample", "5. 샘플 번역  (지정 페이지만, 실제 API)"),
-    ("full", "6. 전체 번역  (실제 API)"),
+    ("mock", "4. 레이아웃 테스트  (무료 · 실제 번역 안 함 · 글자 앞에 '[번역]' 표시 · 납품용 아님)"),
+    ("sample", "5. 샘플 번역  (지정 페이지만 · 실제 한국어 번역 · API 키 필요)"),
+    ("full", "6. 전체 번역  (문서 전체 · 실제 한국어 번역 · API 키 필요)"),
 ]
 MODE_LABELS = [m[1] for m in MODES]
 MODE_KEYS = {m[1]: m[0] for m in MODES}
@@ -356,7 +356,7 @@ class App(_BaseTk):
         if not self.v_keep.get() and (ROOT / "keep_patterns.txt").exists():
             self.v_keep.set(str(ROOT / "keep_patterns.txt"))
         if self.v_mode.get() not in MODE_LABELS:
-            self.v_mode.set(MODE_LABELS[3])
+            self.v_mode.set(MODE_LABELS[4] if self.v_key.get().strip() else MODE_LABELS[3])
         self._mode_changed()
 
     def _vars(self):
@@ -471,6 +471,13 @@ class App(_BaseTk):
                 "전체 번역", "첨부한 모든 PDF를 전체 번역합니다. API 비용이 발생합니다.\n"
                             "먼저 '1. 분량 추정'으로 분량을 확인하셨나요?\n\n계속할까요?"):
             return
+        if mode in ("sample", "full") and self.v_ocr.get() != "off" and not self._tesseract_ok():
+            if not messagebox.askyesno(
+                    "Tesseract 없음",
+                    "Tesseract OCR이 설치되어 있지 않습니다.\n"
+                    "스캔 페이지 / 글자가 깨진 페이지(목차 등) / 그림 속 글자는 번역되지 않고 영어로 남습니다.\n\n"
+                    "설치: https://github.com/UB-Mannheim/tesseract/wiki\n\n그래도 계속할까요?"):
+                return
         try:
             Path(self.v_out.get().strip() or ROOT / "OM_KO").mkdir(parents=True, exist_ok=True)
             cmds = self.build_commands()
@@ -551,6 +558,13 @@ class App(_BaseTk):
             self.proc = None
         self.q.put(("done", rc_all))
 
+    def _tesseract_ok(self) -> bool:
+        try:
+            from om_ocr import OcrEngine
+            return bool(OcrEngine.find_tesseract(None))
+        except Exception:  # noqa: BLE001
+            return False
+
     def _logfile_write(self, text: str):
         try:
             if self._logf is not None:
@@ -604,6 +618,9 @@ class App(_BaseTk):
             self.v_status.set("중지됨")
         elif rc == 0:
             self._append("ok", f"\n✔ 완료 ({el // 60}분 {el % 60}초)\n")
+            if MODE_KEYS[self.v_mode.get()] == "mock":
+                self._append("cmd", "※ 레이아웃 테스트 결과라 글자 앞에 '[번역]'이 붙어 있습니다 (실제 번역 아님).\n"
+                                    "   한국어 OM은 '5. 샘플 번역' 또는 '6. 전체 번역'(API 키 필요)으로 만드세요.\n")
             self.v_status.set(f"완료 — 결과 폴더: {self.last_outdir}")
             if MODE_KEYS[self.v_mode.get()] == "ocr" and self.last_outdir:
                 pngs = sorted(self.last_outdir.glob("ocr_debug_p*.png"), key=lambda p: p.stat().st_mtime)
