@@ -47,10 +47,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+if __name__ == "__main__":
+    import bootstrap  # 필요한 패키지가 없으면 .venv를 만들어 설치 후 다시 실행
+
+    bootstrap.ensure()
+
 try:
     import pymupdf as fitz  # PyMuPDF >= 1.24.3
 except ImportError:  # pragma: no cover
-    import fitz  # type: ignore
+    try:
+        import fitz  # type: ignore
+    except ImportError:
+        sys.exit("PyMuPDF가 설치되어 있지 않습니다: pip install -r requirements.txt")
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
@@ -1690,7 +1699,78 @@ def cmd_translate(args):
     print(f"결과 폴더: {outdir.resolve()}  (summary.csv, *.review.csv 확인)")
 
 
+def _ask(prompt: str, default: str = "") -> str:
+    try:
+        v = input(f"{prompt}" + (f" [{default}]" if default else "") + ": ")
+    except EOFError:
+        v = ""
+    v = v.strip().strip('"').strip("'")
+    return v or default
+
+
+def interactive_argv() -> Optional[list[str]]:
+    """인자 없이 실행(VS Code ▶ 버튼, 더블클릭)했을 때 번호 메뉴로 명령을 만든다."""
+    root = Path(__file__).resolve().parent
+    os.chdir(root)  # 상대경로(OM_EN, glossary.csv 등)를 프로젝트 폴더 기준으로
+    print("=" * 64)
+    print(" OM 영→한 번역 도구 - 메뉴   (명령줄 사용법: py om_translate.py -h)")
+    print("=" * 64)
+    print(" 1) 분량 추정 + 페이지 진단 (API 사용 안 함)")
+    print(" 2) 용어 후보 추출 → terms_candidates.csv")
+    print(" 3) OCR 결과 확인 (한 페이지, 디버그 PNG)")
+    print(" 4) 레이아웃 테스트 (API 사용 안 함, '[번역]' 접두)")
+    print(" 5) 샘플 번역 (일부 페이지, 실제 API)")
+    print(" 6) 전체 번역 (실제 API)")
+    print(" 0) 종료")
+    choice = _ask("번호 선택", "1")
+    if choice not in {"1", "2", "3", "4", "5", "6"}:
+        return None
+    default_in = "OM_EN" if (root / "OM_EN").exists() else ""
+    src = _ask("원본 PDF 파일 또는 폴더 경로 (탐색기에서 파일을 끌어다 놓아도 됨)", default_in)
+    if not src:
+        print("경로를 입력하지 않았습니다.")
+        return None
+    if not Path(src).exists():
+        print(f"경로가 없습니다: {src}")
+        return None
+    gloss = next((g for g in ("glossary.csv", "glossary.xlsx", "glossary_sample.csv") if (root / g).exists()), None)
+    common: list[str] = []
+    if gloss:
+        common += ["--glossary", gloss]
+    if (root / "keep_patterns.txt").exists():
+        common += ["--keep-patterns", "keep_patterns.txt"]
+    if choice == "1":
+        return ["estimate", src, *common]
+    if choice == "2":
+        return ["terms", src, "-o", "terms_candidates.csv", *common]
+    if choice == "3":
+        pdf = src if Path(src).is_file() else None
+        if pdf is None:
+            print("OCR 확인은 PDF 파일 하나를 지정해야 합니다.")
+            return None
+        page = _ask("페이지 번호", "1")
+        from om_ocr import _main as ocr_main
+        sys.argv = ["om_ocr.py", pdf, "--page", page, "--debug"]
+        ocr_main()
+        return []
+    if choice in ("4", "5"):
+        pages = _ask("페이지 범위 (예: 1-5,12)", "1-5")
+        out = ["translate", src, "-o", "OM_SAMPLE", "--pages", pages, "--compare", "--force", *common]
+        if choice == "4":
+            out += ["--backend", "mock"]
+        return out
+    out = ["translate", src, "-o", "OM_KO", *common]
+    if (root / "overrides.csv").exists():
+        out += ["--overrides", "overrides.csv"]
+    return out
+
+
 def main(argv=None):
+    if argv is None and len(sys.argv) == 1:
+        argv = interactive_argv()
+        if not argv:
+            return
+        print("\n실행 명령: py om_translate.py " + " ".join(f'"{a}"' if " " in a else a for a in argv) + "\n")
     ap = argparse.ArgumentParser(description="OM 영→한 번역 도구 (PDF 레이아웃 유지 + OCR)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 

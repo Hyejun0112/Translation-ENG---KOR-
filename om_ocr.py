@@ -649,6 +649,10 @@ class OcrEngine:
 # ----------------------------------------------------------------------------
 def _main():
     import argparse
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import bootstrap  # 필요한 패키지가 없으면 .venv를 만들어 설치 후 다시 실행
+
+    bootstrap.ensure()
     try:
         import pymupdf as fitz
     except ImportError:  # pragma: no cover

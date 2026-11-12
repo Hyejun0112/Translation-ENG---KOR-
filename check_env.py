@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""설치 상태 점검: 패키지 / Tesseract / 한글 폰트 / API 키.  실행: py check_env.py"""
+"""설치 상태 점검: 패키지 / Tesseract / 한글 폰트 / API 키.
+실행: py check_env.py          (점검만)
+     py check_env.py --setup  (없으면 .venv 생성 + 패키지 설치 후 점검)"""
 import importlib
 import os
 import sys
@@ -9,6 +11,12 @@ try:
     sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
 except Exception:  # noqa: BLE001
     pass
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+if len(sys.argv) > 1 and sys.argv[1] == "--setup":
+    import bootstrap  # .venv 생성 + 패키지 설치까지 자동 진행
+
+    bootstrap.ensure()
 
 ok_all = True
 
