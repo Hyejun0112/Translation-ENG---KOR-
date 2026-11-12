@@ -1,122 +1,131 @@
-# OM 영→한 번역기 (PDF 양식 유지 · API 없이 Copilot으로 번역)
+# Plant O&M Translator v2.0
 
-발전소 O&M 매뉴얼 PDF를 **원본 양식(그림·표·도면·배경·선·링크) 그대로 두고, O&M 대상 문구만 한국어로 교체한 개별 PDF**로 만듭니다.
+발전플랜트 O&M Manual(Boiler, Steam Turbine, Fuel Handling, Mechanical, Electrical, Instrument) PDF를
+**원본 레이아웃(그림·표·도면·배경·선) 그대로 두고 O&M 대상 문구만 한국어로 바꾼 PDF**로 자동 번역합니다.
 Word 원본이 없어도 되고, 스캔 PDF / 글자가 깨져 복사되는 PDF도 OCR로 처리합니다.
-번역은 **유료 API 없이** 회사 Copilot(또는 다른 챗봇)으로 합니다. 프로그램이 문장을 뽑아 프롬프트를 만들고, 답변을 붙여넣으면 PDF를 만들어 줍니다.
 
-### 결과물 (결과 폴더, 기본 `OM_KO`)
+```
+run.bat 더블클릭  →  input\pdf 폴더에 PDF 넣기  →  output\원본파일명_KR_O&M.pdf 자동 생성
+```
+
+---
+
+## 1. 처음 한 번 준비
+
+| 준비물 | 방법 |
+|---|---|
+| **Python 3.12** | https://www.python.org/downloads/ → 설치 화면에서 **"Add python.exe to PATH" 체크** |
+| **Claude API 키** | https://console.anthropic.com → API Keys → Create Key (`sk-ant-`로 시작). 첫 실행 때 붙여넣으면 저장됨 |
+| **Tesseract OCR** | 첫 실행 때 "자동 설치할까요?" → `Y` (스캔/글자깨짐 페이지, 목차 등에 필요) |
+
+패키지 설치는 `run.bat`이 자동으로 합니다(처음 1~3분).
+
+## 2. 사용 방법
+
+**방법 1: 폴더에 넣기**
+1. `run.bat` 더블클릭 → 검은 창이 뜹니다. (창을 닫지 마세요)
+2. `input\pdf` 폴더에 PDF를 넣습니다. (여러 개 가능, 하위 폴더 가능)
+3. 자동으로 번역되고, 끝나면 `output` 폴더가 열립니다.
+4. 창을 열어 두는 동안 PDF를 더 넣으면 계속 자동 번역합니다. 종료는 창 닫기.
+
+**방법 2: 끌어다 놓기 (Drag & Drop)**
+- PDF 파일(여러 개)이나 폴더를 탐색기에서 `run.bat` 아이콘 위로 끌어다 놓습니다.
+  자동으로 `input\pdf`에 복사되어 번역됩니다.
+
+## 3. 결과물 (`output` 폴더)
 
 | 파일 | 내용 |
 |---|---|
-| `[원본파일명]_KR_O&M.pdf` | 한국어 O&M 문서 (원본과 같은 페이지 수·크기, 한국어만 표시, 텍스트 검색 가능) |
-| `[원본파일명]_Translation_Log.xlsx` | 번역로그(원문/번역/상태/비고) · 페이지(번역/원문유지 사유) · 최종검사 |
-| `Plant_O&M_Glossary.xlsx` | 문서에 적용된 용어집 + 자주 나오는 미등록 용어 후보 |
+| `원본파일명_KR_O&M.pdf` | 한국어 O&M 문서. 원본과 같은 페이지 수·크기·순서, 텍스트 검색 가능 |
+| `원본파일명_Translation_Log.xlsx` | **번역로그**(원문/번역/상태/비고) · **페이지**(번역/원문유지와 사유) · **최종검사** |
+| `Plant_O&M_Glossary.xlsx` | 적용된 용어집 + 자주 나오는 미등록 용어 후보 (누적) |
 
----
+### 번역 수정하기
+1. `원본파일명_Translation_Log.xlsx` → 번역로그 시트의 **`수정 번역(입력)`** 열에 고칠 번역을 씁니다 → 저장
+2. `run.bat` 실행(또는 열려 있으면 그대로) → 해당 PDF만 다시 만들어지고 수정이 반영됩니다.
+   수정한 번역은 번역 메모리에 저장되어 다른 문서에도 똑같이 적용됩니다.
 
-## 1. 설치 (처음 한 번)
-
-1. 저장소 받기 → VS Code로 열기
-   ```powershell
-   git clone https://github.com/Hyejun0112/Translation-ENG---KOR-.git
-   cd Translation-ENG---KOR-
-   code .
-   ```
-2. **Tesseract OCR** 설치 (스캔/글자깨짐 페이지, 목차 등에 필요) — **GUI의 [Tesseract 설치] 버튼**을 누르면 자동 설치됩니다.
-   (또는 `py install_tesseract.py`)
-   - 최신 Windows 설치 파일을 받아 **관리자 권한 없이** `%LOCALAPPDATA%\Programs\Tesseract-OCR`에 설치합니다.
-   - 설치 파일이 관리자 권한을 요구하면 'Windows 권한 확인' 창이 뜹니다 → [예] (`C:\Program Files\Tesseract-OCR`에 설치)
-   - 다운로드가 막힌 회사망이면 winget(`UB-Mannheim.TesseractOCR`)으로 설치를 시도합니다.
-   - 모두 안 되면 https://github.com/UB-Mannheim/tesseract/wiki 에서 직접 설치하거나 IT팀에 요청하세요.
-3. 파이썬 패키지는 처음 실행할 때 프로젝트 폴더의 `.venv`에 **자동 설치**됩니다(1~3분).
-
-한글 폰트는 `C:\Windows\Fonts\malgun.ttf`(맑은 고딕)를 자동 사용합니다.
-
-## 2. 실행
-
-- 탐색기에서 **`OM번역기 실행.bat`** 더블클릭 (바탕화면에 바로가기를 만들어 두면 편합니다)
-- 또는 VS Code에서 `om_gui.py` / `om_translate.py`를 열고 ▶, 또는 F5 → **"OM 번역기 (GUI)"**
-
-## 3. 번역 순서 (GUI)
-
-**① 설정 탭**
-- `PDF 파일 추가…`로 원본 PDF 첨부 (여러 개 가능, 끌어다 놓기 가능)
-- 용어집 `glossary.csv`(기본 선택됨), 결과 저장 폴더 확인
-- `O&M 대상만 번역`은 켜 둔 상태로 둡니다 (데이터시트·부품목록·도면 등은 원문 유지)
-
-**② Copilot 번역 탭**
-1. **[① 번역할 문장 추출]** → 번역이 필요한 문구만 뽑아 배치(묶음)로 나눕니다. (이미 번역된 문구, 숫자/기호만 있는 문구, 번역 범위 밖 문구는 제외)
-2. 왼쪽 목록에서 배치를 고르고 **[📋 프롬프트 복사]**
-3. Copilot 채팅창에 **Ctrl+V → 보내기**
-4. Copilot 답변 전체를 복사 → **[클립보드에서 붙여넣기]** → **[✔ 답변 저장]**
-   - 답변 형식(`[0001] 번역문`)을 자동으로 읽고, **원문의 Tag·숫자·단위가 바뀐 번역은 거부**합니다.
-   - 저장 결과(저장 개수, 빠진 번호, 거부 사유)가 아래에 표시됩니다.
-5. 다음 배치로 자동 이동 → 2~4 반복
-6. 빠지거나 거부된 문구가 있으면 **[① 번역할 문장 추출]**을 다시 누르면 남은 것만 새 배치로 만들어집니다.
-7. **[③ 한국어 PDF 만들기]** → 실행 로그에서 결과 확인 → **[한국어 PDF 열기]**
-
-> Copilot이 "너무 길다"고 하면 `배치 크기(글자)`를 4000 또는 3000으로 줄이고 다시 추출하세요.
-> 한 번 번역한 문구는 `translation_cache.sqlite`(번역 메모리)에 저장되어 다른 문서에서도 재사용됩니다.
-
-**③ 수정·재생성**
-- `[원본파일명]_Translation_Log.xlsx`의 **`수정 번역(입력)`** 열에 고칠 번역을 씁니다.
-- 설정 탭의 **수정 목록**에 그 엑셀 파일을 지정 → 작업 `한국어 PDF 만들기` → ▶ 실행. (수정 내용은 번역 메모리에도 저장됩니다)
-
-### 기타 작업 (설정 탭 → 작업 선택 → ▶ 실행)
-| 작업 | 설명 |
-|---|---|
-| 분량 추정 + 페이지 진단 | 페이지별 종류(네이티브/스캔/글자깨짐), 번역 범위, 번역 문구 수 |
-| OCR 결과 확인 | PDF 1개의 한 페이지를 OCR해서 인식 박스 이미지로 확인 |
-| 레이아웃 테스트 | 번역 없이 `[번역]` 접두를 붙여 배치만 확인 (납품용 아님, `레이아웃_테스트` 폴더) |
-| API 자동 번역 | (선택) Anthropic API 키가 있을 때만. 유료 |
-
----
+### 다시 만들기
+- 결과 PDF를 지우면 다음 확인 때 다시 만듭니다. 같은 문구는 번역 메모리(`cache`)에서 가져오므로 **API 비용이 다시 들지 않습니다.**
 
 ## 4. 번역 규칙
 
-**번역 범위** — `O&M 대상만 번역`(기본):
-- 페이지 제목이 Datasheet, Technical/Performance/Design Data, Equipment/Valve/Line/Instrument/Cable/I/O List, (Spare) Parts List, Bill of Material, Catalog, Brochure, Ordering Information, Material/Fuel Specification, Certificate, Inspection/Test Report, Packing/Shipping List, P&ID, PFD, Logic/Wiring/Single Line/Loop Diagram, GA/Arrangement/Dimensional Drawing, Hook-up, DCS/PLC/HMI Screen 이면 **페이지 전체 원문 유지**
-- A3 이상 대형 페이지, 선이 아주 많고 짧은 라벨 위주인 페이지 → 도면으로 판단해 원문 유지
-- 표 머리글이 Tag / Model / Parameter / Code / Value / Unit / Signal / Part No. 등인 **열은 원문 유지** (머리글 자체는 번역)
-- 그림(래스터 이미지) 내부 문자는 기본적으로 원문 유지 (`그림(사진) 속 글자도 번역`으로 켤 수 있음)
-- 추가 제외 키워드는 `scope_keywords.txt`(한 줄에 하나, 정규식 가능)를 만들어 넣으면 됩니다.
-- 판단 결과는 `Translation_Log.xlsx`의 **페이지** 시트에 사유와 함께 기록됩니다.
+**번역함**: 제목, 소제목, 본문, 글머리표, 절차(Step), WARNING/CAUTION/NOTE, 표 머리글과 지시문, 그림 제목, 북마크
 
-**항상 원문 유지** — 회사/제작사/Vendor/모델명, Tag/Equipment/Instrument/Loop/Part/Drawing/Document/Revision/Serial No., Alarm Code, Signal/Parameter Name, Plant/Project Name, URL, E-mail, 화학식, 수식, 단위, 숫자.
-코드가 자동 인식하는 패턴(규격, Tag, 모델/부품번호, Rev., 수치+단위, 날짜, URL)에 프로젝트 전용 정규식은 `keep_patterns.txt`에 추가합니다.
+**페이지 전체 원문 유지 (Drawing / Datasheet 제외)**: 페이지 제목이 Datasheet, Technical/Performance/Design Data,
+Equipment/Valve/Line/Instrument/Cable/I/O List, (Spare) Parts List, Bill of Material, Catalog, Brochure,
+Ordering Information, Material/Fuel Specification, Certificate, Inspection/Test Report, Packing/Shipping List,
+P&ID, PFD, Logic/Wiring/Single Line/Loop Diagram, GA/Arrangement/Dimensional Drawing, Hook-up, DCS/PLC/HMI Screen인 페이지,
+A3 이상 대형 도면 페이지, 선이 많고 짧은 라벨 위주인 도면 페이지.
+(본문 속 "P&ID No. 0061" 같은 참조는 무시하고, 문장 위주 페이지는 번역합니다. 판단 결과는 로그의 **페이지** 시트에 있습니다.)
 
-**용어집** `glossary.csv` — 고정 용어(operation=운전, maintenance=정비, start-up=기동, trip=트립, forced draft fan=FD Fan …), 경고어(DANGER=위험, WARNING=경고, CAUTION=주의, NOTICE=유의사항, IMPORTANT=중요, NOTE=참고). `ko`에 `KEEP`이면 영어 유지.
-배치마다 그 배치에 나오는 용어만 프롬프트에 넣습니다.
+**표**: 셀 단위로 번역하고 셀 안에서 줄바꿈합니다. 머리글이 Tag / Model / Parameter / Code / Value / Unit / Signal / Part No.인 **열은 원문 유지**.
 
-**Copilot 프롬프트** `copilot_prompt.txt` — 역할, 원문 유지 항목, 경고어, 명령문(Check/Verify → 확인하십시오 …), 문체(~합니다/~하십시오), 품질 기준. 문구를 직접 고칠 수 있습니다(`{glossary}`, `{count}`, `{items}`는 유지).
+**항상 원문 유지 (Tag 보호)**: 회사·제작사·모델명, Tag/Equipment/Instrument/Loop/Part/Drawing/Document/Revision/Serial No.,
+Alarm/Error Code, Signal/Parameter Name, 규격(ASME, API, ISO…), 수치+단위, 2oo3, 화학식, 날짜, URL/E-mail, 약어(PLC, DCS, ESD…).
+번역 결과에서 보호 값이 빠지면 **잘못된 번역을 넣지 않고 원문을 유지**하고, 변경이 의심되면 로그에 표시합니다.
 
-## 5. PDF 편집 방식
+**용어집** `data\glossary.csv` (Excel로 편집 가능, `data\glossary.xlsx`로 저장해도 됨)
+- 열: `en, ko, note`. `ko`가 `KEEP`이면 영어 유지.
+- 고정 용어: operation=운전, maintenance=정비, inspection=점검, commissioning=시운전, start-up=기동, shutdown=정지, trip=트립, alarm=경보, troubleshooting=고장진단, forced draft fan=FD Fan …
+- 경고어: DANGER=위험, WARNING=경고, CAUTION=주의, NOTICE=유의사항, IMPORTANT=중요, NOTE=참고
+- 명령문: Check/Verify → 확인하십시오, Open → 여십시오, Close → 닫으십시오, Do not → 하지 마십시오 …
 
-- 원본 PDF를 직접 편집합니다. Word/PPT 재작성, 페이지 전체 이미지화 없음.
-- 네이티브 텍스트: 영문 글자만 지우고(선·그림·배경 보존) 같은 위치에 한글 삽입
-- 스캔/글자깨짐 페이지: OCR(400 dpi, 기울기 보정, 표 괘선 인식) → 원본 배경색으로 영문 영역만 덮고 한글 삽입
-- 길이 조정: 원래 박스 → 자동 줄바꿈 → 옆/아래 빈 공간(셀 경계·다른 글자 직전까지) → 글자 축소(하한 60%, 5pt)
-- 셀 밖 초과·텍스트 겹침·페이지 밖은 자동 검사해 로그에 `OVERFLOW` / `TEXT_OVERLAP` / `PAGE_OVER`로 표시
-- 페이지 크기·순서 유지, 회전 페이지는 보이는 모습 그대로, 링크·북마크 유지(북마크도 번역)
+**추가 설정 파일**
+- `data\keep_patterns.txt`: 영어로 남길 프로젝트 전용 정규식 (문서번호 체계, 제작사명 등)
+- `data\scope_keywords.txt`: 원문 유지할 페이지 제목 키워드 추가
+- `config.py`: 모델, 동시 호출 수, OCR 해상도, 번역 범위(`TRANSLATE_SCOPE`), 감시 주기 등
 
-## 6. 최종 검사 (`Translation_Log.xlsx` → 최종검사 시트)
+## 5. PDF 처리 방식
 
-PDF 열림, 페이지 누락, 페이지 순서, 페이지 크기/방향, 그림/사진 유지(페이지별 이미지 수), 한글 출력, 텍스트 겹침, 셀/박스 초과, Tag/숫자/단위 유지, 상태별 건수.
-번역로그 시트의 노란색 행(미번역/실패/초과/겹침/Tag 변경/OCR 저신뢰)을 우선 검수하세요.
+- 원본 PDF를 직접 편집합니다. 페이지를 이미지로 바꾸거나 Word로 다시 만들지 않습니다.
+- 텍스트 PDF: 영문 글자만 지우고(선·그림·배경 보존) 같은 위치에 한글(맑은 고딕) 삽입
+- 스캔/글자깨짐 페이지: 400 dpi OCR(기울기 보정, 표 괘선 인식) → 원본 배경색으로 영문만 덮고 한글 삽입
+- 한국어가 길면: 원래 칸 → 자동 줄바꿈 → 옆/아래 빈 공간(셀 경계·다른 글자 직전까지) → 글자 축소(하한 60%, 5pt)
+- 최종 검사: PDF 열림, 페이지 누락/순서/크기, 그림 유지, 한글 출력, 텍스트 겹침, 셀 초과, Tag·숫자·단위 유지, 번역 실패
 
-## 7. 명령줄 사용 (선택)
+## 6. 고급 사용 (명령줄)
 
-```powershell
-py om_translate.py estimate  .\OM_EN                                      # 분량/페이지 진단
-py om_translate.py export    .\OM_EN -o .\OM_KO --glossary glossary.csv   # Copilot 배치 프롬프트 생성
-#   → OM_KO\Copilot_작업\batch_001_프롬프트.txt 를 Copilot에 보내고 답변을 batch_001_답변.txt 로 저장
-py om_translate.py import    -o .\OM_KO --glossary glossary.csv           # 답변 반영(검증 후 번역 메모리 저장)
-py om_translate.py translate .\OM_EN -o .\OM_KO --glossary glossary.csv   # 한국어 PDF 생성 (기본 --backend memory)
-py om_ocr.py .\OM_EN\file.pdf --page 4 --debug                            # OCR 확인
+`run.bat` 뒤에 옵션을 붙이거나, VS Code에서 F5로 실행합니다.
+
+| 명령 | 설명 |
+|---|---|
+| `run.bat --once` | 일괄 처리만 하고 종료 (감시 안 함) |
+| `run.bat --pages 1-5` | 각 PDF의 1~5페이지만 샘플 번역 |
+| `run.bat --force` | 이미 번역된 파일도 다시 생성 |
+| `run.bat --estimate` | 번역 분량 / API 토큰 추정 (번역 안 함) |
+| `run.bat --mock --once` | API 없이 레이아웃만 테스트 (글자 앞에 `[번역]`) |
+| `run.bat --check` | 설치 상태 점검 |
+| `run.bat --set-key` | API 키 다시 입력 |
+| `run.bat --scope all` | 도면/데이터시트 페이지까지 전부 번역 |
+
+## 7. 폴더 구조
+
+```
+Plant O&M Translator v2.0
+├─ run.bat                    실행 (더블클릭 / 끌어다 놓기)
+├─ main.py                    전체 흐름: 준비 → 일괄 처리 → 폴더 감시
+├─ config.py                  설정
+├─ requirements.txt
+├─ engines\
+│   ├─ pdf_engine.py          페이지 진단, 텍스트 추출, 레이아웃 유지 한글 삽입, 폰트
+│   ├─ translation_engine.py  Claude API 번역, 번역 메모리(SQLite)
+│   ├─ glossary_engine.py     용어집, Tag/숫자/단위 보호
+│   ├─ table_engine.py        표 셀 인식, Tag/Value 열 원문 유지
+│   ├─ scope_engine.py        Drawing / Datasheet 제외 판단
+│   ├─ ocr_engine.py          스캔 PDF OCR (Tesseract + OpenCV)
+│   └─ qa_engine.py           최종 검사, Translation Log, Glossary Excel
+├─ data\                      glossary.csv, keep_patterns.txt, scope_keywords.txt
+├─ tools\install_tesseract.py Tesseract 자동 설치
+├─ input\pdf\                 ← 원본 PDF를 넣는 곳
+├─ output\                    ← 결과
+├─ cache\                     번역 메모리 / OCR 캐시 (지우면 다시 번역 = 비용 발생)
+└─ logs\                      실행 로그 (문제 발생 시 이 파일을 확인)
 ```
 
 ## 8. 주의
 
 - **WARNING/CAUTION, 설정값, 인터록, 트립 조건 등 안전·운전 직결 문구는 반드시 사람이 검수**하세요.
-- Copilot에 문서 문구를 붙여넣는 것이 사내 보안 정책·고객/제작사 NDA상 허용되는지 확인하세요. (OCR과 PDF 생성은 PC 안에서만 실행됩니다)
-- 스캔 품질이 나쁘면 OCR 오류가 생깁니다. 로그의 `OCR_LOW_CONF` 행은 원문을 꼭 확인하세요.
+- 문서 텍스트가 Claude API(Anthropic)로 전송됩니다. 고객/제작사 NDA 및 사내 보안 규정상 허용되는지 확인하세요.
+- API 사용량에 따라 요금이 발생합니다. `run.bat --estimate`로 미리 분량을 확인하세요.
+- API 키는 프로젝트 폴더의 `.env` 파일에만 저장됩니다. 이 파일은 다른 사람과 공유하지 마세요.

@@ -1,45 +1,36 @@
 {
-  // F5(실행 및 디버그)에서 선택해서 실행합니다. 보통은 맨 위 "OM 번역기 (GUI)"만 쓰면 됩니다.
+  // F5 로 실행. 보통은 run.bat 더블클릭만 사용하면 됩니다.
   "version": "0.2.0",
-  "inputs": [
-    { "id": "pdf", "type": "promptString", "description": "원본 PDF 파일 또는 폴더 경로", "default": "OM_EN" },
-    { "id": "page", "type": "promptString", "description": "OCR 확인할 페이지 번호", "default": "1" }
-  ],
   "configurations": [
     {
-      "name": "OM 번역기 (GUI)",
+      "name": "Plant O&M Translator (input\\pdf 일괄 + 감시)",
       "type": "debugpy", "request": "launch", "console": "integratedTerminal",
-      "program": "${workspaceFolder}/om_gui.py"
+      "program": "${workspaceFolder}/main.py"
     },
     {
-      "name": "분량 추정 + 페이지 진단",
+      "name": "한 번만 처리 (--once)",
       "type": "debugpy", "request": "launch", "console": "integratedTerminal",
-      "program": "${workspaceFolder}/om_translate.py",
-      "args": ["estimate", "${input:pdf}", "--glossary", "glossary.csv"]
+      "program": "${workspaceFolder}/main.py", "args": ["--once"]
     },
     {
-      "name": "OCR 결과 확인 (한 페이지)",
+      "name": "샘플 1-5페이지 (--pages 1-5 --force)",
       "type": "debugpy", "request": "launch", "console": "integratedTerminal",
-      "program": "${workspaceFolder}/om_ocr.py",
-      "args": ["${input:pdf}", "--page", "${input:page}", "--debug"]
+      "program": "${workspaceFolder}/main.py", "args": ["--pages", "1-5", "--force"]
     },
     {
-      "name": "Copilot 프롬프트 만들기 (export)",
+      "name": "레이아웃 테스트 (--mock, API 없음)",
       "type": "debugpy", "request": "launch", "console": "integratedTerminal",
-      "program": "${workspaceFolder}/om_translate.py",
-      "args": ["export", "${input:pdf}", "-o", "OM_KO", "--glossary", "glossary.csv", "--keep-patterns", "keep_patterns.txt"]
+      "program": "${workspaceFolder}/main.py", "args": ["--mock", "--once", "--force"]
     },
     {
-      "name": "Copilot 답변 반영 (import)",
+      "name": "분량/토큰 추정 (--estimate)",
       "type": "debugpy", "request": "launch", "console": "integratedTerminal",
-      "program": "${workspaceFolder}/om_translate.py",
-      "args": ["import", "-o", "OM_KO", "--glossary", "glossary.csv", "--keep-patterns", "keep_patterns.txt"]
+      "program": "${workspaceFolder}/main.py", "args": ["--estimate"]
     },
     {
-      "name": "한국어 PDF 만들기 (translate)",
+      "name": "설치 점검 (--check)",
       "type": "debugpy", "request": "launch", "console": "integratedTerminal",
-      "program": "${workspaceFolder}/om_translate.py",
-      "args": ["translate", "${input:pdf}", "-o", "OM_KO", "--glossary", "glossary.csv", "--keep-patterns", "keep_patterns.txt", "--force"]
+      "program": "${workspaceFolder}/main.py", "args": ["--check"]
     }
   ]
 }

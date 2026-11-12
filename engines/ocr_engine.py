@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-om_ocr.py - OM 번역용 OCR 엔진 (Tesseract + OpenCV)
-=====================================================
-om_translate.py 에서 사용합니다. 단독 실행 시 OCR 결과를 미리 확인할 수 있습니다.
+ocr_engine.py - 스캔 PDF / 글자깨짐 페이지 OCR (Tesseract + OpenCV)
+======================================================================
+pdf_engine 에서 사용합니다. 단독 실행으로 한 페이지 OCR 결과를 확인할 수 있습니다:
 
-    py om_ocr.py <PDF> --page 3            # 3페이지 OCR 결과를 콘솔에 출력
-    py om_ocr.py <PDF> --page 3 --debug    # 인식 박스/표 셀을 그린 PNG 저장 (ocr_debug_p3.png)
+    .venv\\Scripts\\python.exe -m engines.ocr_engine <PDF> --page 3 --debug
 
 기능
 - 스캔 페이지 전체 OCR: 400 dpi 렌더링 → 기울기 자동 보정(deskew) → Tesseract LSTM
@@ -649,10 +648,6 @@ class OcrEngine:
 # ----------------------------------------------------------------------------
 def _main():
     import argparse
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    import bootstrap  # 필요한 패키지가 없으면 .venv를 만들어 설치 후 다시 실행
-
-    bootstrap.ensure()
     try:
         import pymupdf as fitz
     except ImportError:  # pragma: no cover

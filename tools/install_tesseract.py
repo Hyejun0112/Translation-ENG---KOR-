@@ -3,7 +3,7 @@
 """
 install_tesseract.py - Tesseract OCR 자동 설치 (Windows)
 =========================================================
-실행: py install_tesseract.py        (GUI의 [Tesseract 설치] 버튼도 이 파일을 실행)
+실행: run.bat 첫 실행 때 자동으로 물어봄  /  직접: .venv\\Scripts\\python.exe tools\\install_tesseract.py
 
 설치 순서
  1) 이미 설치되어 있으면 종료
@@ -32,7 +32,7 @@ try:
 except Exception:  # noqa: BLE001
     pass
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent   # 프로젝트 폴더
 sys.path.insert(0, str(ROOT))
 
 RELEASE_API = "https://api.github.com/repos/tesseract-ocr/tesseract/releases?per_page=10"
@@ -49,7 +49,7 @@ def say(msg: str = ""):
 
 def find_tesseract() -> str | None:
     try:
-        from om_ocr import OcrEngine
+        from engines.ocr_engine import OcrEngine
         return OcrEngine.find_tesseract(None)
     except Exception:  # noqa: BLE001
         w = shutil.which("tesseract")
@@ -192,7 +192,7 @@ def run_installer_interactive(exe: Path) -> bool:
     except Exception as e:  # noqa: BLE001
         say(f"  실행 실패: {e}")
         return False
-    say("설치를 마친 뒤 GUI의 [환경 점검]을 눌러 확인하세요.")
+    say("설치를 마친 뒤 run.bat 을 다시 실행하세요.")
     return False
 
 
@@ -229,13 +229,13 @@ def main() -> int:
                 return 1
     cmd = find_tesseract()
     if cmd and check_installed(cmd):
-        say("\n✔ Tesseract 설치 완료 — 이제 스캔/글자깨짐 페이지(목차 등)도 번역됩니다.")
+        say("\n✔ Tesseract 설치 완료 - 이제 스캔/글자깨짐 페이지(목차 등)도 번역됩니다.")
         try:
             exe.unlink()
         except Exception:  # noqa: BLE001
             pass
         return 0
-    say("\n✘ 설치 후에도 tesseract.exe 를 찾지 못했습니다. GUI의 [환경 점검] 결과를 보내 주세요.")
+    say("\n✘ 설치 후에도 tesseract.exe 를 찾지 못했습니다. run.bat --check 결과를 확인하세요.")
     return 1
 
 

@@ -4,14 +4,12 @@ __pycache__/
 venv/
 .env
 
-# 캐시 / 결과물 (고객 문서는 저장소에 올리지 않음)
-translation_cache.sqlite
+# 고객 문서 / 결과물 / 캐시 / 로그는 저장소에 올리지 않음
+input/pdf/*
+!input/pdf/.gitkeep
+output/*
+!output/.gitkeep
+cache/
+logs/
 *.pdf
-*.review.csv
-summary.csv
-terms_candidates.csv
 ocr_debug_*.png
-OM_EN/
-OM_KO/
-OM_SAMPLE/
-om_gui_settings.json
