@@ -83,7 +83,7 @@ STATUS_KO = {
 }
 
 
-SOURCE_KO = {"native": "본문", "ocr-page": "OCR(스캔)", "ocr-figure": "OCR(그림)", "toc": "북마크"}
+SOURCE_KO = {"native": "본문", "native-ocr": "본문(글자깨짐→OCR)", "ocr-page": "OCR(스캔)", "ocr-figure": "OCR(그림)", "toc": "북마크"}
 
 
 def _xlsx_sheet(wb, title, header, rows, widths, wrap_cols=()):

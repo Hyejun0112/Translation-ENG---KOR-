@@ -86,11 +86,22 @@ def is_prose_page(units: list[Unit]) -> bool:
     return len(prose) >= 3 and len(prose) / len(body) >= 0.3
 
 
+TOC_LINE_RE = re.compile(r"(?:[.·…]\s*){4,}\s*\d*\s*$")
+
+
+def is_toc_page(units: list[Unit]) -> bool:
+    """점선(......) 줄이 여러 개 = 목차 페이지 (목차 안의 'DATA', 'DRAWING' 같은 제목으로 제외하지 않도록)."""
+    n = sum(1 for u in units if TOC_LINE_RE.search(u.text))
+    return n >= 4 or (units and n >= 0.3 * len(units) and n >= 2)
+
+
 def page_scope(page, units: list[Unit], drawings_count: int) -> tuple[bool, str]:
     """(번역 여부, 사유)"""
     area = abs(page.rect)
     if area > A4_AREA * 1.6:
         return False, "대형 페이지(A3 이상) → 도면으로 판단"
+    if is_toc_page(units):
+        return True, "목차 페이지"
     title = REFERENCE_RE.sub(" ", page_title_text(page, units))
     m = EXCLUDE_TITLE_RE.search(title)
     if m and not re.search(r"contents|목차", title, re.I):

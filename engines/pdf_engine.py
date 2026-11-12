@@ -72,6 +72,9 @@ class Unit:
     ko: Optional[str] = None
     notes: list = field(default_factory=list)
     used_size: float = 0.0
+    last_x1: float = 0.0     # 마지막 줄의 오른쪽 끝 (문단 이어짐 판단용)
+    leader: bool = False     # 목차 줄: 제목 뒤 점선(......)을 번역 후 다시 채움
+    leader_num: str = ""     # 점선 뒤 쪽번호가 같은 글자 상자에 있으면 보관
 
 
 PUNCT = set("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
@@ -86,6 +89,7 @@ PAGE_CLASS_KO = {
 def classify_page(page) -> str:
     """native | scanned | garbled | invisible | empty"""
     raw = page.get_text("text")
+    raw = re.sub(r"(?:[.·…_-]\s*){3,}", " ", raw)  # 목차 점선/밑줄은 '깨진 글자' 판단에서 제외
     s = "".join(raw.split())
     try:
         imgs = page.get_image_info()
@@ -169,11 +173,57 @@ def _group_to_unit(page, g: list[dict], cell=None) -> Optional[Unit]:
         lm, rm = rect.x0 - cell.x0, cell.x1 - rect.x1
         if lm > 4 and rm > 4 and abs(lm - rm) < max(2.0, 0.15 * (lm + rm)):
             align = "center"
-        elif lm > 3 * max(rm, 1) and rm < 6:
-            align = "right"
+        elif lm > 3 * max(rm, 1) and rm < 6 and not re.search(r"[A-Za-z]{3,}", text):
+            align = "right"  # 오른쪽 정렬은 숫자 위주 칸만 (글자 칸은 왼쪽 정렬로 둔다)
     return Unit(page=page.number, idx=0, rect=rect, text=text, size=size, color=color,
                 bold=bold, origin_y=first["origin"][1], align=align, rotated=rotated,
-                cell=fitz.Rect(cell) if cell is not None else None)
+                cell=fitz.Rect(cell) if cell is not None else None, last_x1=g[-1]["bbox"][2])
+
+
+# 목차 점선: "Purpose of the manual ........" / "Title . . . . ." / "Title ……"
+LEADER_RE = re.compile(r"^(.*?[^.\s·…])\s*(?:[.·…]\s*){4,}(\d{1,4})?\s*$")
+NUMBERING_RE = re.compile(r"^\s*(?:\d+(?:\.\d+)*\.?|[A-Z]\.|\(?[a-z]\))\s+\S")
+
+
+def merge_paragraphs(units: list[Unit]) -> list[Unit]:
+    """줄마다 따로 저장된 문단을 하나의 번역 단위로 합친다.
+    (같은 글꼴/크기, 바로 아래 줄, 같은 왼쪽 시작점, 앞 줄이 꽉 찬 경우만. 글머리표/번호/목차 줄은 합치지 않음)"""
+    out: list[Unit] = []
+    for b in sorted(units, key=lambda u: (round(u.rect.y0, 1), u.rect.x0)):
+        target = None
+        if (b.kind == "text" and b.cell is None and not b.rotated and b.source in ("native", "native-ocr")
+                and re.search(r"[A-Za-z]{2,}", b.text)
+                and not BULLET_RE.match(b.text) and not NUMBERING_RE.match(b.text) and not LEADER_RE.match(b.text)):
+            for a in reversed(out[-8:]):
+                if (a.cell is not None or a.rotated or a.source not in ("native", "native-ocr") or a.kind != "text"
+                        or not re.search(r"[A-Za-z]{2,}", a.text)):
+                    continue
+                size = max(a.size, 1.0)
+                gap = b.rect.y0 - a.rect.y1
+                if not (-2.0 <= gap <= 0.8 * size):
+                    continue
+                if abs(a.size - b.size) > 0.6 or a.bold != b.bold or a.color != b.color:
+                    continue
+                if abs(b.rect.x0 - a.rect.x0) > 0.6 * size:
+                    continue
+                if LEADER_RE.match(a.text) or a.text.rstrip().endswith(":"):
+                    continue
+                if a.last_x1 < max(a.rect.x1, b.rect.x1) - 3.0 * size:
+                    continue  # 앞 줄이 짧게 끝남 = 문단 끝
+                target = a
+                break
+        if target is None:
+            out.append(b)
+            continue
+        t = target.text
+        if t.endswith("-") and len(t) > 2 and t[-2].isalpha() and b.text[:1].islower():
+            target.text = t[:-1] + b.text  # 줄끝 하이픈 연결
+        else:
+            target.text = t + " " + b.text
+        target.rect |= b.rect
+        target.last_x1 = b.last_x1
+        target.align = "left"
+    return out
 
 
 def extract_units(page, table_cells: Optional[list] = None) -> list[Unit]:
@@ -341,6 +391,38 @@ def run_ocr_jobs(doc, jobs: list, ocr, cache: Cache, fhash: str, cfg: Config, la
         collect(list(as_completed(list(live))))
     print(" " * 70, end="\r")
     return results
+
+
+def assign_ocr_words(units: list[Unit], words: list) -> None:
+    """글자깨짐 페이지: OCR 단어를 원본 텍스트 상자(Unit)에 넣어 글자 내용을 교체한다."""
+    rects = [(fitz.Rect(w.rect), w) for w in words]
+    for u in units:
+        box = fitz.Rect(u.rect) + (-1.5, -1.5, 1.5, 1.5)
+        inside = [w for r, w in rects if box.contains(fitz.Point((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2))]
+        if not inside:
+            u.text = ""  # 인식된 글자 없음 → 번역하지 않고 원본 그대로
+            continue
+        inside.sort(key=lambda w: ((w.rect[1] + w.rect[3]) / 2, w.rect[0]))
+        lines: list[list] = []
+        for w in inside:
+            cy = (w.rect[1] + w.rect[3]) / 2
+            h = max(1.0, w.rect[3] - w.rect[1])
+            if lines and abs(cy - (lines[-1][-1].rect[1] + lines[-1][-1].rect[3]) / 2) < 0.5 * h:
+                lines[-1].append(w)
+            else:
+                lines.append([w])
+        text = ""
+        for ln in lines:
+            t = " ".join(w.text for w in sorted(ln, key=lambda w: w.rect[0]))
+            if text.endswith("-") and len(text) > 2 and text[-2].isalpha() and t[:1].islower():
+                text = text[:-1] + t
+            else:
+                text = (text + " " + t).strip()
+        u.text = clean_text(text)
+        u.conf = sum(w.conf for w in inside) / len(inside)
+        u.source = "native-ocr"
+        if u.conf < 80:
+            u.notes.append(f"OCR_LOW_CONF({u.conf:.0f}) 원문 확인")
 
 
 def block_to_unit(pno: int, b) -> Unit:
@@ -527,6 +609,8 @@ def fit_text(text, font, w0, h0, box_w, box_h, orig_size, cfg: Config):
             if ok:
                 return s, ls, ok, w
     s, ls, ok = _shrink_fit(text, font, W, H, orig_size, lo)
+    if not ok:  # 겹쳐 그리는 것보다 작은 글자가 낫다: 원래 크기의 45%(최소 4pt)까지 더 축소
+        s, ls, ok = _shrink_fit(text, font, W, H, s, max(4.0, orig_size * 0.45))
     return s, ls, ok, W
 
 
@@ -654,6 +738,16 @@ def render_page(page, units: list[Unit], fonts, cfg: Config):
         y = u.rect.y0 + asc * size
         placed = []
         area = fitz.Rect(u.rect)
+        if u.leader and lines and u.align == "left":
+            # 목차: 한글 제목 뒤를 원래 점선 끝(쪽번호 앞)까지 점으로 채운다
+            num = (" " + u.leader_num) if u.leader_num else ""
+            x_end = u.rect.x0 + font.text_length(lines[-1], fontsize=size)
+            dot = font.text_length(".", fontsize=size) or 1.0
+            n = int((u.rect.x1 - x_end - font.text_length(num, fontsize=size) - dot) / dot)
+            if n >= 3:
+                lines = lines[:-1] + [lines[-1] + " " + "." * (n - 1) + num]
+            elif num:
+                lines = lines[:-1] + [lines[-1] + num]
         for ln in lines:
             tw = font.text_length(ln, fontsize=size)
             if u.align == "center":
@@ -767,7 +861,21 @@ def prepare_units(doc, cfg: Config, protector: Protector, overrides: dict[str, s
         if cfg.scope == "om" and abs(page.rect) > A4_AREA * 1.6:
             scopes[pno] = (False, "대형 페이지(A3 이상) → 도면으로 판단")
             continue
-        if cls in ("scanned", "garbled", "invisible", "forced"):
+        if cls == "garbled":
+            # 글자깨짐 페이지: 글자 위치/크기/굵기는 PDF 원본 그대로, 글자 내용만 OCR로 읽는다
+            try:
+                units = extract_units(page)
+            except Exception as e:  # noqa: BLE001
+                print(f"  ! p.{pno + 1} 추출 실패: {e}", file=sys.stderr)
+                units = []
+            per_page[pno] = units
+            if ocr_ok:
+                jobs.append((pno, "words", fitz.Rect(page.rect), []))
+            else:
+                for u in units:
+                    u.scope_keep = "글자깨짐 페이지 - OCR(Tesseract) 필요"
+            continue
+        if cls in ("scanned", "invisible", "forced"):
             if ocr_ok:
                 jobs.append((pno, "page", fitz.Rect(page.rect), []))
             continue
@@ -789,11 +897,16 @@ def prepare_units(doc, cfg: Config, protector: Protector, overrides: dict[str, s
     if jobs:
         res = run_ocr_jobs(doc, jobs, ocr, cache, fhash, cfg, label=label)
         for i, (pno, mode, clip, excl) in enumerate(jobs):
+            if mode == "words":
+                assign_ocr_words(per_page.get(pno, []), res.get(i, []))
+                continue
             for b in res.get(i, []):
                 per_page.setdefault(pno, []).append(block_to_unit(pno, b))
     all_units: list[Unit] = []
     for pno in pages:
-        us = per_page.get(pno, [])
+        us = [u for u in per_page.get(pno, []) if u.text]
+        us = merge_paragraphs(us)
+        per_page[pno] = us
         if pno not in scopes:
             if cfg.scope == "om":
                 scopes[pno] = page_scope(doc[pno], us, drawing_counts.get(pno, 0))
@@ -813,6 +926,11 @@ def prepare_units(doc, cfg: Config, protector: Protector, overrides: dict[str, s
 
 
 def classify_unit(u: Unit, protector: Protector, overrides: dict[str, str]):
+    m = LEADER_RE.match(u.text)
+    if m and u.kind == "text":
+        # 점선(과 쪽번호)은 번역에서 빼고 렌더링 때 다시 채움
+        u.text, u.leader, u.leader_num = m.group(1).strip(), True, (m.group(2) or "")
+        u.align = "left"
     if u.text in overrides:
         u.ko, u.status = overrides[u.text], "OVERRIDE"
         return

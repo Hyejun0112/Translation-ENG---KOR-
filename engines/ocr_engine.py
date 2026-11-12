@@ -38,7 +38,7 @@ try:
 except ImportError:  # pragma: no cover
     pytesseract = None  # type: ignore
 
-OCR_VERSION = "5"  # OCR 로직이 바뀌면 올려서 캐시를 무효화
+OCR_VERSION = "6"  # OCR 로직이 바뀌면 올려서 캐시를 무효화
 
 DEFAULT_BULLET_RE = re.compile(
     r"^\s*(?:[•●▪■◦○‣·*\-–—]|\(?\d{1,3}[.)]|\(?[a-zA-Z][.)]|\d+(?:\.\d+)+\.?)\s+"
@@ -479,11 +479,37 @@ class OcrEngine:
                          y0 + (w.y1 - 10) / f, w.text, w.conf) for w in ws])
         return new if new.conf > ln.conf + 3 else ln
 
+    def _ocr_words(self, gray, origin, scale) -> list[OcrBlock]:
+        """글자깨짐 페이지용: 단어 단위 인식 결과만 돌려준다 (위치/크기는 PDF 원본 정보를 사용).
+        1차 psm 3 + 인식된 단어를 지운 이미지로 psm 11 복구 패스."""
+        Hh = gray.shape[0]
+        words = self._tess(gray, 3)
+        masked = gray.copy()
+        for w in words:
+            pad = int(0.3 * w.h) + 2
+            masked[max(0, int(w.y0) - pad):int(w.y1) + pad, max(0, int(w.x0) - pad):int(w.x1) + pad] = 255
+        try:
+            words += [w for w in self._tess(masked, 11) if w.conf >= 60]
+        except Exception:  # noqa: BLE001
+            pass
+        out = []
+        for w in words:
+            if w.h < 4 or w.h > Hh * 0.2 or w.conf < 20:
+                continue
+            if NOISE_RE.match(w.text) and w.conf < 85 and not set(w.text) <= set(".·…"):
+                continue
+            out.append(OcrBlock(
+                rect=(float(origin[0] + w.x0 / scale), float(origin[1] + w.y0 / scale),
+                      float(origin[0] + w.x1 / scale), float(origin[1] + w.y1 / scale)),
+                text=w.text, conf=float(w.conf), size=float(w.h / scale / 0.78),
+                origin_y=float(origin[1] + w.y1 / scale), source="ocr-words"))
+        return out
+
     # -------------------------------------------------------------- 공개 API
     def ocr_image(self, rgb: "np.ndarray", origin: tuple[float, float], scale: float,
                   mode: str = "page", exclude_pt: Optional[list] = None) -> list[OcrBlock]:
         """rgb: 렌더링된 이미지, origin: 이미지 좌상단의 PDF 좌표(pt), scale: px/pt.
-        mode='page'(스캔 페이지 전체) | 'figure'(그림 속 라벨). 스레드 안전."""
+        mode='page'(스캔 페이지 전체) | 'figure'(그림 속 라벨) | 'words'(글자깨짐 페이지 단어). 스레드 안전."""
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
         Hh, Ww = gray.shape
         angle = 0.0
@@ -497,6 +523,9 @@ class OcrEngine:
                 Minv = cv2.invertAffineTransform(M)
             else:
                 angle = 0.0
+
+        if mode == "words":
+            return self._ocr_words(gray, origin, scale)
 
         cells = detect_table_cells(gray) if (mode == "page" and self.tables) else []
         words = self._tess(gray, 3 if mode == "page" else 11)
