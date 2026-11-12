@@ -1,0 +1,70 @@
+en,ko,note
+DANGER,위험,경고어
+WARNING,경고,경고어
+CAUTION,주의,경고어
+NOTICE,유의사항,경고어
+IMPORTANT,중요,경고어
+NOTE,참고,경고어
+operation,운전,고정 용어
+operating,운전,고정 용어
+maintenance,정비,고정 용어
+inspection,점검,고정 용어
+commissioning,시운전,고정 용어
+pre-commissioning,시운전 전 점검,고정 용어
+start-up,기동,고정 용어
+startup,기동,고정 용어
+shutdown,정지,고정 용어
+emergency shutdown,비상정지,고정 용어
+trip,트립,고정 용어
+alarm,경보,고정 용어
+fault,고장,고정 용어
+failure,장애,고정 용어
+troubleshooting,고장진단,고정 용어
+corrective action,시정조치,고정 용어
+preventive maintenance,예방정비,고정 용어
+corrective maintenance,사후정비,고정 용어
+repair,수리,고정 용어
+replacement,교체,고정 용어
+disassembly,분해,고정 용어
+assembly,조립,고정 용어
+lubrication,윤활,고정 용어
+calibration,교정,고정 용어
+preservation,보존,고정 용어
+storage,보관,고정 용어
+actuator,액추에이터,고정 용어
+feed water,급수,고정 용어
+feedwater,급수,고정 용어
+boiler feed water pump,급수펌프,고정 용어
+feed water pump,급수펌프,고정 용어
+forced draft fan,FD Fan,고정 용어
+induced draft fan,ID Fan,고정 용어
+primary air fan,PA Fan,고정 용어
+secondary air fan,SA Fan,고정 용어
+steam drum,스팀드럼,고정 용어
+superheater,과열기,고정 용어
+economizer,절탄기,고정 용어
+air preheater,공기예열기,고정 용어
+Operation and Maintenance Manual,운전 및 정비 매뉴얼,
+Operation Manual,운전 매뉴얼,
+Table of Contents,목차,
+Revision History,개정 이력,
+Deaerator,탈기기,
+Steam Turbine,증기터빈,
+Design Pressure,설계압력,
+Design Temperature,설계온도,
+Operating Pressure,운전압력,
+Operating Temperature,운전온도,
+Interlock,인터록,
+Setpoint,설정값,
+Relief Valve,릴리프 밸브,
+Safety Valve,안전밸브,
+Check Valve,체크 밸브,
+Control Valve,제어 밸브,
+Mechanical Seal,메커니컬 씰,
+Spare Parts,예비품,
+PLC,KEEP,영어 유지
+DCS,KEEP,영어 유지
+ESD,KEEP,영어 유지
+HMI,KEEP,영어 유지
+MCC,KEEP,영어 유지
+P&ID,KEEP,영어 유지

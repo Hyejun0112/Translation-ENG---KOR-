@@ -1,0 +1,9 @@
+# 영어로 유지할 추가 정규식 (한 줄에 하나, # 은 주석)
+# 기본 패턴(규격, Tag No., 모델명, Rev., 수치+단위, URL, 날짜)은 이미 코드에 내장되어 있습니다.
+# 아래는 프로젝트 전용 예시입니다. 필요에 맞게 수정하세요.
+
+# 프로젝트 문서번호 예: TW-BM-ME-1234-001
+\bTW-[A-Z]{2}-[A-Z]{2}-\d{4}(?:-\d{3})?\b
+
+# 제작사/브랜드 (대소문자 구분)
+\b(?:Siemens|ABB|Emerson|Flowserve|KSB|Sulzer|Grundfos|Yokogawa|Honeywell)\b

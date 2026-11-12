@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# 고객 문서 / 결과물 / 캐시 / 로그는 저장소에 올리지 않음
+input/pdf/*
+!input/pdf/.gitkeep
+output/*
+!output/.gitkeep
+cache/
+logs/
+*.pdf
+ocr_debug_*.png

@@ -1,0 +1,9 @@
+# Plant O&M Translator v2.0 (Ollama 로컬 번역) - Python 3.12
+pymupdf>=1.24.3              # PDF 읽기/편집 (레이아웃 유지 텍스트 교체, 표 인식)
+pytesseract>=0.3.10          # OCR (Tesseract 실행파일은 tools\install_tesseract.py 가 설치)
+opencv-python-headless>=4.8  # OCR 전처리 (기울기 보정, 표 괘선 인식)
+numpy>=1.24
+Pillow>=10.0
+fonttools>=4.40              # 한글 폰트 서브셋 (PDF 용량 절감)
+openpyxl>=3.1                # Translation Log / Glossary Excel
+truststore>=0.9              # 회사망(SSL 검사 프록시)에서 Windows 인증서 사용 (Ollama/Tesseract 설치 다운로드)
