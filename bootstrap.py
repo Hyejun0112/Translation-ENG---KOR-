@@ -32,6 +32,7 @@ REQUIRED = {
     "numpy": "numpy",
     "PIL": "Pillow",
     "fontTools": "fonttools",
+    "tkinterdnd2": "tkinterdnd2",
 }
 
 

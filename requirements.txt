@@ -6,3 +6,4 @@ numpy>=1.24
 Pillow>=10.0
 fonttools>=4.40              # 출력 PDF 폰트 서브셋(용량 절감)
 openpyxl>=3.1                # 용어집을 xlsx로 쓸 때만 필요
+tkinterdnd2>=0.4             # GUI에 파일 끌어다 놓기
