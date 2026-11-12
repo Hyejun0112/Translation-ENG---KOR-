@@ -1,5 +1,0 @@
-# 원문 유지(번역 제외)할 페이지 제목 키워드를 한 줄에 하나씩 추가합니다. (대소문자 무시, 정규식 가능)
-# 기본 제외 목록(Datasheet, Parts List, P&ID, Drawing 등)은 프로그램에 이미 들어 있습니다.
-# 예:
-# Commissioning Record
-# Torque Table
