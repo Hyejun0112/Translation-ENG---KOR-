@@ -1,0 +1,4 @@
+pymupdf>=1.24.3
+anthropic>=0.40.0
+openpyxl>=3.1   # 용어집을 xlsx로 쓸 때만 필요
+fonttools>=4.40 # 출력 PDF 폰트 서브셋(용량 절감), 선택

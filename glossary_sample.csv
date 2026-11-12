@@ -1,0 +1,50 @@
+en,ko,note
+WARNING,경고,안전 문구
+CAUTION,주의,안전 문구
+DANGER,위험,안전 문구
+NOTE,참고,
+Operating Manual,운전 매뉴얼,
+Operation and Maintenance Manual,운전 및 정비 매뉴얼,
+Biomass,바이오매스,
+Boiler,보일러,
+Steam Turbine,증기터빈,
+Feed Water Pump,급수 펌프,
+Induced Draft Fan,유인통풍기(ID Fan),약어 병기 예시
+Forced Draft Fan,압입통풍기(FD Fan),
+Deaerator,탈기기,
+Economizer,절탄기,
+Superheater,과열기,
+Strainer,스트레이너,
+Discharge,토출,
+Suction,흡입,
+Relief Valve,릴리프 밸브,
+Check Valve,체크 밸브,
+Gate Valve,게이트 밸브,
+Control Valve,제어 밸브,
+Design Pressure,설계압력,
+Design Temperature,설계온도,
+Operating Pressure,운전압력,
+Operating Temperature,운전온도,
+Rated Capacity,정격용량,
+Lubrication,윤활,
+Start-up,기동,
+Shutdown,정지,
+Trip,트립,
+Interlock,인터록,
+Setpoint,설정값,
+Preventive Maintenance,예방정비,
+Spare Parts,예비품,
+Specification,사양,
+Nameplate,명판,
+Bearing,베어링,
+Mechanical Seal,메커니컬 씰,
+Coupling,커플링,
+Gearbox,기어박스,
+Revision History,개정 이력,
+Table of Contents,목차,
+Vendor,제작사,
+Manufacturer,제작사,
+PLC,KEEP,영어 유지
+DCS,KEEP,영어 유지
+ESD,KEEP,영어 유지
+P&ID,KEEP,영어 유지

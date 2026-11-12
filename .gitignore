@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+translation_cache.sqlite
+*_KO.pdf
+*.review.csv
+*.pdf
