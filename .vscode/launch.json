@@ -9,6 +9,11 @@
   ],
   "configurations": [
     {
+      "name": "OM 번역기 (GUI)",
+      "type": "debugpy", "request": "launch", "console": "integratedTerminal",
+      "program": "${workspaceFolder}/om_gui.py"
+    },
+    {
       "name": "1) 분량 추정 + 페이지 진단 (API 없음)",
       "type": "debugpy", "request": "launch", "console": "integratedTerminal",
       "program": "${workspaceFolder}/om_translate.py",

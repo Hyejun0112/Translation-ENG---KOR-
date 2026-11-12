@@ -1765,8 +1765,26 @@ def interactive_argv() -> Optional[list[str]]:
     return out
 
 
+def launch_gui() -> bool:
+    """인자 없이 실행하면 GUI 창을 띄운다. tkinter를 못 쓰면 False (→ 콘솔 메뉴)."""
+    try:
+        import om_gui
+    except Exception as e:  # noqa: BLE001
+        print(f"GUI를 열 수 없어 콘솔 메뉴로 실행합니다: {e}", file=sys.stderr)
+        return False
+    om_gui.main()
+    return True
+
+
 def main(argv=None):
+    if argv is None and sys.argv[1:] == ["--menu"]:  # 콘솔 번호 메뉴를 원할 때
+        sys.argv = sys.argv[:1]
+        argv = interactive_argv()
+        if not argv:
+            return
     if argv is None and len(sys.argv) == 1:
+        if launch_gui():  # ▶ 버튼/더블클릭: GUI 창
+            return
         argv = interactive_argv()
         if not argv:
             return
