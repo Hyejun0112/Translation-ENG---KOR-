@@ -753,8 +753,12 @@ def prepare_units(doc, cfg: Config, protector: Protector, overrides: dict[str, s
     per_page: dict[int, list[Unit]] = {}
     classes: dict[int, str] = {}
     jobs = []
-    for pno in pages:
+    t_start = time.time()
+    for k, pno in enumerate(pages, 1):
         page = doc[pno]
+        if k == 1 or k == len(pages) or k % 5 == 0:  # 진행 표시 (멈춘 것처럼 보이지 않도록)
+            print(f"  [{label}] 페이지 분석 {k}/{len(pages)} ({int(time.time() - t_start)}초)      ",
+                  end="\r", flush=True)
         cls = "forced" if (cfg.ocr_mode == "force" and ocr_ok) else classify_page(page)
         classes[pno] = cls
         if cls == "empty":

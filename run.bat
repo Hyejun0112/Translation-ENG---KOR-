@@ -2,8 +2,9 @@
 chcp 65001 >nul
 rem ======================================================================
 rem  Plant O&M Translator v2.0
-rem  사용법 1) 더블클릭 → input\pdf 폴더에 PDF를 넣으면 자동 번역 (창을 열어 두세요)
-rem  사용법 2) PDF 파일/폴더를 이 run.bat 아이콘 위로 끌어다 놓기
+rem  사용법 1) 더블클릭 → 번역 프로그램 창(GUI)이 열림 → PDF 추가 → [번역 시작]
+rem  사용법 2) PDF 파일/폴더를 이 run.bat 아이콘 위로 끌어다 놓기 (GUI에 자동 추가)
+rem  콘솔 모드) run.bat --once / --pages 1-5 / --check  (폴더 감시: run.bat --watch)
 rem  결과   : output\원본파일명_KR_O&M.pdf
 rem  번역   : 이 PC의 Ollama + Qwen2.5 (첫 실행 때 자동 설치/모델 다운로드, 약 9GB)
 rem ======================================================================
@@ -48,6 +49,16 @@ if errorlevel 1 (
 )
 
 :RUN
+rem 옵션(--pages, --once, --check 등)을 붙이면 콘솔 모드, 아니면 GUI 창
+set "ARG1=%~1"
+if "%ARG1:~0,2%"=="--" goto CONSOLE
+
+"%VENV_PY%" -c "import tkinter" >nul 2>nul
+if errorlevel 1 goto CONSOLE
+start "" "%~dp0.venv\Scripts\pythonw.exe" "%~dp0gui.py" %*
+exit /b 0
+
+:CONSOLE
 "%VENV_PY%" "%~dp0main.py" %*
 set "RC=%errorlevel%"
 echo.

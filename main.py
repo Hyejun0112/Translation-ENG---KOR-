@@ -253,6 +253,7 @@ def process_pdf(src: Path, cfg: Config, backend, gloss: Glossary, protector: Pro
 
     units, classes, n_fig, scopes = prepare_units(doc, cfg, protector, overrides, ocr, cache,
                                                   file_sha(src), label=src.stem[:20])
+    print(" " * 100, end="\r")  # 진행 표시 줄 지우기
     need_ocr = [p for p, c in classes.items() if c in ("scanned", "garbled", "invisible")]
     if need_ocr and not (ocr is not None and ocr.available):
         print(f"  ! OCR이 필요한 페이지 {len(need_ocr)}개는 영어로 남습니다 "
@@ -572,6 +573,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=f"{config.APP_TITLE} - O&M Manual 영→한 PDF 번역 (Ollama 로컬)")
     ap.add_argument("paths", nargs="*", help="번역할 PDF 파일/폴더 (input\\pdf 로 복사 후 처리)")
     ap.add_argument("--once", action="store_true", help="일괄 처리 후 종료 (폴더 감시 안 함)")
+    ap.add_argument("--watch", action="store_true", help="일괄 처리 후 input\\pdf 폴더 감시 (기본 동작)")
     ap.add_argument("--force", action="store_true", help="이미 번역된 파일도 다시 생성")
     ap.add_argument("--pages", help="일부 페이지만 처리 (예: 1-5,12)")
     ap.add_argument("--mock", action="store_true", help="번역 없이 레이아웃 테스트")
