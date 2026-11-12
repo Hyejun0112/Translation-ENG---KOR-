@@ -90,7 +90,7 @@ from engines.glossary_engine import (  # noqa: E402
 )
 from engines.pdf_engine import (  # noqa: E402
     Unit, build_fonts, build_ocr_engine, classify_unit, clean_text, describe_classes, fitz,
-    parse_pages, prepare_units, render_page, select_pages_safe, save_pdf_safe,
+    draw_layout_debug, parse_pages, prepare_units, render_page, select_pages_safe, save_pdf_safe,
 )
 from engines.qa_engine import load_overrides, verify_output, write_glossary_xlsx, write_log_xlsx  # noqa: E402
 from engines.translation_engine import (  # noqa: E402
@@ -569,6 +569,32 @@ class Runner:
                 print(f"  API 사용량 누적: 입력 {self.backend.in_tokens:,} / 출력 {self.backend.out_tokens:,} 토큰")
         return n_ok
 
+    def debug_layout(self, files: Optional[list[Path]] = None):
+        """번역 없이 문구 인식 상자만 그려서 확인 (글자 겹침 원인 찾기용)"""
+        ocr = build_ocr_engine(self.cfg) if self.cfg.ocr_mode != "off" else None
+        for src in files or list_input_pdfs():
+            doc = fitz.open(src)
+            for pg in doc:
+                if pg.rotation and hasattr(pg, "remove_rotation"):
+                    pg.remove_rotation()
+            self.cfg.pages = parse_pages(self.args.pages, len(doc)) if self.args.pages else None
+            units, classes, _, scopes = prepare_units(doc, self.cfg, self.protector, {}, ocr, self.cache,
+                                                      file_sha(src), label=src.stem[:20])
+            pages = self.cfg.pages if self.cfg.pages is not None else list(range(len(doc)))
+            doc.close()
+            print(" " * 100, end="\r")
+            dst = config.LOG_DIR / f"{src.stem}_LAYOUT_CHECK.pdf"
+            draw_layout_debug(str(src), units, pages, str(dst))
+            print(f"{src.name}: 레이아웃 점검 PDF → {dst}")
+            for pno in pages[:30]:
+                pu = [u for u in units if u.page == pno]
+                n_ov = sum(1 for i, a in enumerate(pu) for b in pu[i + 1:]
+                           if not (a.rect & b.rect).is_empty and (a.rect & b.rect).height > 1.0)
+                print(f"  p.{pno + 1}: {classes.get(pno, '?')}, 문구 {len(pu)}개, 상자 겹침 {n_ov}쌍, "
+                      f"{'번역' if scopes.get(pno, (True, ''))[0] else '원문유지'}")
+            if os.name == "nt":
+                open_folder(dst)
+
     def estimate(self, files: Optional[list[Path]] = None):
         tot_files = tot_chars = tot_items = 0
         uniq: dict[str, None] = {}
@@ -616,6 +642,8 @@ def main(argv=None) -> int:
     ap.add_argument("--check", action="store_true", help="설치 상태 점검")
     ap.add_argument("--set-key", action="store_true", help="Claude API 키 다시 입력")
     ap.add_argument("--estimate", action="store_true", help="번역 분량/토큰 추정만")
+    ap.add_argument("--debug-layout", action="store_true",
+                    help="레이아웃 점검 PDF만 만들기 (API 사용 안 함, logs 폴더에 *_LAYOUT_CHECK.pdf)")
     ap.add_argument("--no-open", action="store_true", help="완료 후 결과 폴더 열지 않기")
     args = ap.parse_args(argv)
 
@@ -634,6 +662,9 @@ def main(argv=None) -> int:
     dropped = import_dropped(args.paths) if args.paths else []
     if args.estimate:
         runner.estimate(dropped or None)
+        return 0
+    if args.debug_layout:
+        runner.debug_layout(dropped or None)
         return 0
 
     runner.prepare()

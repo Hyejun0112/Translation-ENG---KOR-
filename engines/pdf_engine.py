@@ -200,11 +200,14 @@ def merge_paragraphs(units: list[Unit]) -> list[Unit]:
                     continue
                 size = max(a.size, 1.0)
                 gap = b.rect.y0 - a.rect.y1
-                if not (-2.0 <= gap <= 0.8 * size):
+                if not (-0.5 * size <= gap <= 0.8 * size):
                     continue
                 if abs(a.size - b.size) > 0.6 or a.bold != b.bold or a.color != b.color:
                     continue
-                if abs(b.rect.x0 - a.rect.x0) > 0.6 * size:
+                dx = b.rect.x0 - a.rect.x0
+                hanging = bool(BULLET_RE.match(a.text) or NUMBERING_RE.match(a.text))
+                # 같은 왼쪽 시작점, 또는 글머리표/번호 문단의 들여쓴 다음 줄
+                if not (abs(dx) <= 0.6 * size or (hanging and 0 < dx <= 4.0 * size)):
                     continue
                 if LEADER_RE.match(a.text) or a.text.rstrip().endswith(":"):
                     continue
@@ -676,8 +679,9 @@ def free_bottom(u: Unit, units: list[Unit], hedges, page_rect, left: float, righ
     for o in units:
         if o is u:
             continue
-        if o.rect.y0 >= u.rect.y1 - 0.5 and o.rect.x1 > left and o.rect.x0 < right:
-            bottom = min(bottom, o.rect.y0 - 1)
+        # 줄 간격이 좁으면 위아래 글자 상자가 1~2pt 겹친다 → 윗변이 내 높이의 절반 아래면 '아래 줄'
+        if o.rect.y0 > u.rect.y0 + 0.5 * u.rect.height and o.rect.x1 > left and o.rect.x0 < right:
+            bottom = min(bottom, max(o.rect.y0 - 0.5, u.rect.y1))
     for y, xa, xb in hedges:
         if y >= u.rect.y1 - 0.3 and xb > left and xa < right:
             bottom = min(bottom, y - 1.5)
@@ -700,6 +704,74 @@ def apply_redactions(page, whiteout: bool):
 
 
 LINK_KEYS = ("kind", "from", "page", "to", "uri", "zoom", "file", "name")
+
+
+def _place_lines(u: Unit, font, size: float, lines: list[str]):
+    """줄별 위치 계산. 반환: (placed[(x, y, 줄)], 차지 영역, 줄 목록)"""
+    asc = (u.origin_y - u.rect.y0) / u.size if u.size else 0.85
+    asc = min(max(asc, 0.7), 1.0)
+    if u.size and not u.rotated and u.origin_y > u.rect.y0:
+        y = _ink(u).y0 + 0.78 * size  # 원래 글자 윗선에 맞춤 (원래 크기면 원래 기준선과 같음)
+    else:
+        y = u.rect.y0 + asc * size
+    placed = []
+    area = None
+    if u.leader and lines and u.align == "left":
+        # 목차: 한글 제목 뒤를 원래 점선 끝(쪽번호 앞)까지 점으로 채운다
+        num = (" " + u.leader_num) if u.leader_num else ""
+        x_end = u.rect.x0 + font.text_length(lines[-1], fontsize=size)
+        dot = font.text_length(".", fontsize=size) or 1.0
+        n = int((u.rect.x1 - x_end - font.text_length(num, fontsize=size) - dot) / dot)
+        if n >= 3:
+            lines = lines[:-1] + [lines[-1] + " " + "." * (n - 1) + num]
+        elif num:
+            lines = lines[:-1] + [lines[-1] + num]
+    for ln in lines:
+        tw = font.text_length(ln, fontsize=size)
+        if u.align == "center":
+            x = u.rect.x0 + (u.rect.width - tw) / 2
+        elif u.align == "right":
+            x = u.rect.x1 - tw
+        else:
+            x = u.rect.x0
+        if ln:
+            placed.append((x, y, ln))
+            r = fitz.Rect(x, y - asc * size, x + tw, y + 0.28 * size)
+            area = r if area is None else (area | r)
+        y += size * LINE_H
+    return placed, (area if area is not None else fitz.Rect(u.rect)), lines
+
+
+def _ink(o: Unit) -> "fitz.Rect":
+    """글자가 실제로 찍히는 영역 (글꼴 상자는 위아래 여백이 커서 줄 간격이 좁으면 서로 겹친다)"""
+    r = o.rect
+    if not o.size or o.rotated:
+        return fitz.Rect(r)
+    top = min(max(r.y0, o.origin_y - 0.78 * o.size), r.y1)
+    pad = max(0.0, top - r.y0)
+    bot = max(top, r.y1 - 0.5 * pad)
+    return fitz.Rect(r.x0, top, r.x1, bot)
+
+
+def _line_boxes(placed: list, size: float, font) -> list:
+    return [fitz.Rect(x, y - 0.8 * size, x + font.text_length(ln, fontsize=size), y + 0.18 * size)
+            for x, y, ln in placed]
+
+
+def _conflicts(u: Unit, placed: list, size: float, font, others: list[Unit]) -> bool:
+    """번역문이 실제로 찍힐 영역이 다른 문구의 글자 영역을 침범하는지 (원래부터 겹치던 만큼은 허용)."""
+    boxes = _line_boxes(placed, size, font)
+    if not boxes:
+        return False
+    mine = _ink(u)
+    for o in others:
+        oi = _ink(o)
+        allow = (mine & oi).height if not (mine & oi).is_empty else 0.0
+        for bx in boxes:
+            it = bx & oi
+            if not it.is_empty and it.width > 2.0 and it.height > allow + 0.3:
+                return True
+    return False
 
 
 def render_page(page, units: list[Unit], fonts, cfg: Config):
@@ -733,33 +805,25 @@ def render_page(page, units: list[Unit], fonts, cfg: Config):
         u.used_size = size
         if not ok:
             u.notes.append("OVERFLOW(박스 초과, 글자 축소 한계)")
-        asc = (u.origin_y - u.rect.y0) / u.size if u.size else 0.85
-        asc = min(max(asc, 0.7), 1.0)
-        y = u.rect.y0 + asc * size
-        placed = []
-        area = fitz.Rect(u.rect)
-        if u.leader and lines and u.align == "left":
-            # 목차: 한글 제목 뒤를 원래 점선 끝(쪽번호 앞)까지 점으로 채운다
-            num = (" " + u.leader_num) if u.leader_num else ""
-            x_end = u.rect.x0 + font.text_length(lines[-1], fontsize=size)
-            dot = font.text_length(".", fontsize=size) or 1.0
-            n = int((u.rect.x1 - x_end - font.text_length(num, fontsize=size) - dot) / dot)
-            if n >= 3:
-                lines = lines[:-1] + [lines[-1] + " " + "." * (n - 1) + num]
-            elif num:
-                lines = lines[:-1] + [lines[-1] + num]
-        for ln in lines:
-            tw = font.text_length(ln, fontsize=size)
-            if u.align == "center":
-                x = u.rect.x0 + (u.rect.width - tw) / 2
-            elif u.align == "right":
-                x = u.rect.x1 - tw
+        placed, area, lines = _place_lines(u, font, size, lines)
+        # 겹침 방지: 번역문이 다른 문구 자리(아래 줄 등)를 침범하면 원래 칸 안으로 다시 맞춘다
+        others = [o for o in units if o is not u and o.text]
+        if _conflicts(u, placed, size, font, others):
+            # 크기를 0.25pt씩 줄이며(최소 4pt) 다른 문구를 침범하지 않는 첫 크기를 찾는다
+            fixed = False
+            sz = size
+            while sz > 4.0 + 1e-6:
+                sz = max(4.0, sz - 0.25)
+                ls = wrap_text(u.ko, font, sz, box_w)
+                pl, ar, ls = _place_lines(u, font, sz, ls)
+                if not _conflicts(u, pl, sz, font, others):
+                    size, lines, placed, area, fixed = sz, ls, pl, ar, True
+                    break
+            u.used_size = size
+            if fixed:
+                u.notes.append(f"FIT_SMALLER(겹침 방지로 {size:.1f}pt 축소)")
             else:
-                x = u.rect.x0
-            if ln:
-                placed.append((x, y, ln))
-                area |= fitz.Rect(x, y - asc * size, x + tw, y + 0.28 * size)
-            y += size * LINE_H
+                u.notes.append("TEXT_OVERLAP(공간 부족 - 확인 필요)")
         if u.ocr:
             color = tuple(u.fg) if u.fg else (0, 0, 0)
         else:
@@ -767,14 +831,19 @@ def render_page(page, units: list[Unit], fonts, cfg: Config):
         plans.append((u, fname, size, placed, area, color))
 
     # 1-1) 겹침/페이지 밖 검사 (최종 검사용)
+    fonts_obj = {"OMKO": fonts["regular"]["font"], "OMKOB": fonts["bold"]["font"]}
     for i in range(len(plans)):
         ui, ai = plans[i][0], plans[i][4]
         if not page.rect.contains(ai):
             ui.notes.append("PAGE_OVER(페이지 밖으로 나감)")
+        bi = _line_boxes(plans[i][3], plans[i][2], fonts_obj[plans[i][1]])
         for j in range(i + 1, len(plans)):
             uj, aj = plans[j][0], plans[j][4]
-            inter = ai & aj
-            if not inter.is_empty and inter.width > 1.5 and inter.height > 1.5:
+            if (ai & aj).is_empty:
+                continue
+            bj = _line_boxes(plans[j][3], plans[j][2], fonts_obj[plans[j][1]])
+            if any((a & b).width > 1.5 and (a & b).height > 0.5 for a in bi for b in bj
+                   if not (a & b).is_empty):
                 ui.notes.append(f"TEXT_OVERLAP(다른 문구와 겹침: {uj.text[:20]})")
 
     # 2) 원문 제거: 네이티브 텍스트는 리댁션(그림/선은 보존), OCR 영역의 숨은/깨진 텍스트층도 제거
@@ -783,7 +852,9 @@ def render_page(page, units: list[Unit], fonts, cfg: Config):
     any_ocr = any(u.ocr for u in todo)
     for u in todo:
         if not u.ocr:
-            r = fitz.Rect(u.rect.x0 + 0.3, u.rect.y0 + 0.3, u.rect.x1 - 0.3, u.rect.y1 - 0.3)
+            # 글자 상자 대신 실제 글자 영역으로 지운다 → 줄 간격이 좁아도 이웃(원문 유지) 글자를 지우지 않음
+            ink = _ink(u)
+            r = fitz.Rect(u.rect.x0 + 0.3, ink.y0 + 0.2, u.rect.x1 - 0.3, max(ink.y1 - 0.2, ink.y0 + 0.6))
             page.add_redact_annot(r, fill=(1, 1, 1) if cfg.whiteout else False)
             n_redact += 1
         elif has_text_layer and u.source == "ocr-page":
@@ -817,6 +888,33 @@ def render_page(page, units: list[Unit], fonts, cfg: Config):
     for u, fname, size, placed, area, color in plans:
         for x, y, ln in placed:
             page.insert_text(fitz.Point(x, y), ln, fontname=fname, fontsize=size, color=color)
+
+
+def draw_layout_debug(src: str, units: list[Unit], pages: list[int], dst: str) -> int:
+    """레이아웃 점검용 PDF: 인식한 문구 상자를 원본 위에 번호와 함께 표시 (API 사용 안 함).
+    빨강=번역 대상, 회색=원문 유지, 초록=표 칸. 상자끼리 겹치거나 한 문장이 여러 상자로 쪼개졌는지 확인."""
+    doc = fitz.open(src)
+    by_page: dict[int, list[Unit]] = {}
+    for u in units:
+        by_page.setdefault(u.page, []).append(u)
+    for pno in pages:
+        page = doc[pno]
+        if page.rotation and hasattr(page, "remove_rotation"):
+            page.remove_rotation()
+        for k, u in enumerate(by_page.get(pno, []), 1):
+            col = (0.85, 0.1, 0.1) if u.status == "PENDING" else (0.55, 0.55, 0.55)
+            if u.cell is not None:
+                page.draw_rect(u.cell, color=(0.1, 0.6, 0.2), width=0.4, overlay=True)
+            page.draw_rect(u.rect, color=col, width=0.6, overlay=True)
+            page.insert_text(fitz.Point(u.rect.x0, max(u.rect.y0 - 0.8, 5)), f"{k}",
+                             fontsize=5, color=(0, 0, 0.9), overlay=True)
+        y = 8
+        page.insert_text(fitz.Point(4, y), f"p.{pno + 1}  units={len(by_page.get(pno, []))}  "
+                         "red=translate grey=keep green=table-cell", fontsize=6, color=(0, 0, 0.9))
+    select_pages_safe(doc, pages)
+    save_pdf_safe(doc, Path(dst))
+    doc.close()
+    return len(pages)
 
 
 def parse_pages(spec: str, n: int) -> list[int]:

@@ -204,6 +204,8 @@ class App(tk.Tk):
         self.btn_stop.pack(side="left", padx=8)
         self.btn_est = ttk.Button(f3, text="분량 추정", command=self.estimate)
         self.btn_est.pack(side="left")
+        self.btn_dbg = ttk.Button(f3, text="레이아웃 점검", command=self.debug_layout)
+        self.btn_dbg.pack(side="left", padx=8)
         ttk.Button(f3, text="결과 폴더", command=lambda: open_path(config.OUTPUT_DIR)).pack(side="right")
         ttk.Button(f3, text="번역 로그 열기", command=self.open_log).pack(side="right", padx=6)
         ttk.Button(f3, text="한국어 PDF 열기", command=self.open_pdf).pack(side="right")
@@ -393,6 +395,15 @@ class App(tk.Tk):
             return
         self._run(self._base_args() + ["--estimate"] + self.files, "estimate")
 
+    def debug_layout(self):
+        """번역 없이(무료) 문구 인식 상자를 그린 점검 PDF 생성 → 글자 겹침 원인 확인용"""
+        if self.running:
+            return
+        if not self.files:
+            messagebox.showwarning("PDF 없음", "[PDF 추가]로 PDF를 선택하세요.")
+            return
+        self._run(self._base_args() + ["--debug-layout"] + self.files, "estimate")
+
     def _run(self, args: list[str], mode: str, total_files: int = 0):
         self.running, self.stopping, self.mode = True, False, mode
         self.t0 = time.time()
@@ -404,7 +415,7 @@ class App(tk.Tk):
             pb["value"] = 0
         self.v_all.set("")
         self.v_cur.set("")
-        for b in (self.btn_run, self.btn_est):
+        for b in (self.btn_run, self.btn_est, self.btn_dbg):
             b.configure(state="disabled")
         self.btn_stop.configure(state="normal")
         self._log_clear()
@@ -516,7 +527,7 @@ class App(tk.Tk):
 
     def _on_done(self, rc: int):
         self.running = False
-        for b in (self.btn_run, self.btn_est):
+        for b in (self.btn_run, self.btn_est, self.btn_dbg):
             b.configure(state="normal")
         self.btn_stop.configure(state="disabled")
         el = int(time.time() - self.t0)
