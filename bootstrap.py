@@ -33,6 +33,7 @@ REQUIRED = {
     "PIL": "Pillow",
     "fontTools": "fonttools",
     "tkinterdnd2": "tkinterdnd2",
+    "openpyxl": "openpyxl",
 }
 
 

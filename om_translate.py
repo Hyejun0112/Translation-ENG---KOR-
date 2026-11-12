@@ -221,8 +221,8 @@ class Glossary:
             en = r[0]
             ko = r[1] if len(r) > 1 else ""
             note = r[2] if len(r) > 2 else ""
-            if i == 0 and en.strip().lower() in ("en", "english", "term", "영어", "영문", "source"):
-                continue
+            if en.strip().lower() in ("en", "english", "term", "영어", "영문", "source", "원문"):
+                continue  # 머리글 행 (xlsx는 시트마다 있음)
             if en.strip().startswith("#"):
                 continue
             entries.append((en, ko, note))
@@ -332,6 +332,8 @@ class Unit:
     source: str = "native"  # native | ocr-page | ocr-figure | toc
     conf: float = 100.0
     cell: Optional["fitz.Rect"] = None  # 표 셀 경계(번역문이 넘지 않을 한계)
+    tkey: Optional[tuple] = None  # 표 셀 위치 (table_id, row, col)
+    scope_keep: str = ""  # 번역 범위 밖 사유 (데이터시트/도면/표 Tag·Value 열 등)
     fg: Optional[tuple] = None  # OCR: 글자색 (0~1 RGB)
     bg: Optional[tuple] = None  # OCR: 배경색 (0~1 RGB) → 원문을 덮는 패치 색
     ptxt: str = ""
@@ -465,8 +467,8 @@ def cell_merge(segs: list[dict]) -> list[list[dict]]:
     return groups
 
 
-def find_table_cells(page) -> list["fitz.Rect"]:
-    """괘선 표(2x2 이상)의 셀 사각형 목록 (PyMuPDF find_tables)."""
+def find_table_cells(page) -> list[tuple]:
+    """괘선 표(2x2 이상)의 셀 목록 [(Rect, table_id, row, col)] (PyMuPDF find_tables)."""
     if not hasattr(page, "find_tables"):
         return []
     try:
@@ -474,14 +476,26 @@ def find_table_cells(page) -> list["fitz.Rect"]:
     except Exception:  # noqa: BLE001
         return []
     cells = []
-    for t in getattr(tf, "tables", []):
+    for ti, t in enumerate(getattr(tf, "tables", [])):
         if t.row_count < 2 or t.col_count < 2:
             continue
-        for c in t.cells:
-            if c:
-                r = fitz.Rect(c)
-                if r.width > 3 and r.height > 3:
-                    cells.append(r)
+        try:
+            rows = t.rows
+        except Exception:  # noqa: BLE001
+            rows = []
+        if rows:
+            for ri, row in enumerate(rows):
+                for ci, c in enumerate(row.cells):
+                    if c:
+                        r = fitz.Rect(c)
+                        if r.width > 3 and r.height > 3:
+                            cells.append((r, ti, ri, ci))
+        else:
+            for c in t.cells:
+                if c:
+                    r = fitz.Rect(c)
+                    if r.width > 3 and r.height > 3:
+                        cells.append((r, ti, -1, -1))
     return cells
 
 
@@ -557,7 +571,7 @@ def extract_units(page, table_cells: Optional[list] = None) -> list[Unit]:
             bb = sl["bbox"]
             cx, cy = (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2
             hit, best = None, None
-            for i, c in enumerate(cells):
+            for i, (c, *_meta) in enumerate(cells):
                 if c.x0 <= cx <= c.x1 and c.y0 <= cy <= c.y1:
                     a = abs(c)
                     if best is None or a < best:
@@ -585,9 +599,34 @@ def extract_units(page, table_cells: Optional[list] = None) -> list[Unit]:
             add(_group_to_unit(page, g))
 
     for ci, lines in cell_lines.items():
+        rect, ti, ri, col = cells[ci]
         for g in cell_merge(lines):
-            add(_group_to_unit(page, g, cells[ci]))
+            u = _group_to_unit(page, g, rect)
+            if u is not None:
+                u.tkey = (ti, ri, col)
+            add(u)
+    mark_keep_columns(units)
     return units
+
+
+# 표에서 원문 유지할 열 (머리글 기준): Tag / Model / Parameter / Code / Value / Unit 등
+KEEP_COL_RE = re.compile(
+    r"^(?:tag(?:\s*no\.?|\s*number)?|item\s*tag|model(?:\s*no\.?)?|parameter(?:\s*name)?|"
+    r"(?:alarm\s*|error\s*|fault\s*)?code|value|values|unit|units|signal(?:\s*name)?|"
+    r"part\s*(?:no\.?|number)|drawing\s*no\.?|doc(?:ument)?\s*no\.?|serial\s*no\.?|loop\s*no\.?)$",
+    re.I)
+
+
+def mark_keep_columns(units: list[Unit]):
+    """표 머리글(첫 행)이 Tag/Value/Unit 등이면 그 열의 본문 셀은 원문 유지."""
+    headers: dict[tuple, str] = {}
+    for u in units:
+        if u.tkey and u.tkey[1] == 0:
+            headers[(u.tkey[0], u.tkey[2])] = re.sub(r"[:\s]+$", "", u.text.strip())
+    keep_cols = {k for k, t in headers.items() if KEEP_COL_RE.match(t)}
+    for u in units:
+        if u.tkey and u.tkey[1] > 0 and (u.tkey[0], u.tkey[2]) in keep_cols:
+            u.scope_keep = f"표 '{headers[(u.tkey[0], u.tkey[2])]}' 열 원문유지"
 
 
 def figure_regions(page, min_w: float = 40, min_h: float = 20) -> list["fitz.Rect"]:
@@ -673,6 +712,15 @@ class MockBackend:
         return {i: "[번역] " + t for i, t in items}
 
 
+class MemoryBackend:
+    """API 없이 번역 메모리(Copilot 답변을 저장한 캐시)만 사용."""
+    name = "memory"
+    in_tokens = out_tokens = 0
+
+    def translate(self, items, glossary_entries, tone):
+        return {}
+
+
 class AnthropicBackend:
     name = "anthropic"
 
@@ -740,6 +788,36 @@ class Cache:
             self.db.commit()
 
 
+def tm_key(text: str) -> str:
+    """번역 메모리 키: 원문(정리된 텍스트) 기준. Copilot/API/수정본 모두 같은 메모리를 공유."""
+    return "tm|" + hashlib.sha256(clean_text(text).encode("utf-8")).hexdigest()
+
+
+def tm_get(cache: "Cache", text: str) -> Optional[str]:
+    return cache.get(tm_key(text))
+
+
+def tm_put(cache: "Cache", text: str, ko: str):
+    cache.put(tm_key(text), ko)
+
+
+def _nospace(t: str) -> str:
+    return re.sub(r"\s+", "", t)
+
+
+def missing_protected(protector: "Protector", text: str, ko: str) -> list[str]:
+    """원문에서 보호해야 하는 문자열(Tag/숫자/단위/규격 등)이 번역문에 그대로 있는지 검사.
+    빠진 항목 목록을 돌려준다(공백 차이는 허용)."""
+    _, toks = protector.protect(text, tokenize_numbers=len(text) <= 80)
+    need = Counter(_nospace(t) for t in toks if _nospace(t))
+    ko_ns = _nospace(ko)
+    miss = []
+    for t, n in need.items():
+        if ko_ns.count(t) < n:
+            miss.append(t)
+    return miss
+
+
 def file_sha(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -762,7 +840,8 @@ class Config:
     min_scale: float = 0.6
     min_size: float = 5.0
     ocr_mode: str = "auto"      # auto | off | force
-    ocr_figures: bool = True    # 그림(래스터 이미지) 속 글자도 OCR
+    ocr_figures: bool = False   # 그림(래스터 이미지) 속 글자 OCR (도면 내부 문자는 원문 유지가 원칙 → 기본 끔)
+    scope: str = "om"           # om: O&M 대상만 번역(데이터시트/부품목록/도면 등 원문 유지) | all: 전부 번역
     ocr_workers: int = 2
     whiteout: bool = False
     font: str = ""
@@ -1249,6 +1328,17 @@ def render_page(page, units: list[Unit], fonts, cfg: Config):
             color = fitz.sRGB_to_pdf(u.color) if hasattr(fitz, "sRGB_to_pdf") else (0, 0, 0)
         plans.append((u, fname, size, placed, area, color))
 
+    # 1-1) 겹침/페이지 밖 검사 (최종 검사용)
+    for i in range(len(plans)):
+        ui, ai = plans[i][0], plans[i][4]
+        if not page.rect.contains(ai):
+            ui.notes.append("PAGE_OVER(페이지 밖으로 나감)")
+        for j in range(i + 1, len(plans)):
+            uj, aj = plans[j][0], plans[j][4]
+            inter = ai & aj
+            if not inter.is_empty and inter.width > 1.5 and inter.height > 1.5:
+                ui.notes.append(f"TEXT_OVERLAP(다른 문구와 겹침: {uj.text[:20]})")
+
     # 2) 원문 제거: 네이티브 텍스트는 리댁션(그림/선은 보존), OCR 영역의 숨은/깨진 텍스트층도 제거
     links = [{k: l[k] for k in LINK_KEYS if k in l} for l in page.get_links()]
     n_redact = 0
@@ -1310,11 +1400,75 @@ def parse_pages(spec: str, n: int) -> list[int]:
     return sorted({p for p in out if 0 <= p < n})
 
 
+# ----------------------------------------------------------------------------
+# 번역 범위 (O&M 대상만 번역, 아래 문서/페이지는 원문 유지)
+# ----------------------------------------------------------------------------
+EXCLUDE_TITLE_KW = [
+    r"data\s*sheets?", r"technical\s+data", r"performance\s+data", r"design\s+data",
+    r"equipment\s+list", r"valve\s+list", r"line\s+list", r"instrument\s+list", r"cable\s+list",
+    r"i\s*/\s*o\s+list", r"(?:spare\s+)?parts?\s+list", r"bill\s+of\s+materials?", r"\bBOM\b",
+    r"catalogu?e", r"brochure", r"ordering\s+information", r"material\s+specification",
+    r"fuel\s+specification", r"certificates?", r"inspection\s+report", r"test\s+report",
+    r"packing\s+list", r"shipping\s+list", r"P\s*&\s*I\s*D", r"piping\s+(?:and|&)\s+instrument(?:ation)?\s+diagram",
+    r"process\s+flow\s+diagram", r"\bPFD\b", r"logic\s+diagram", r"wiring\s+diagram",
+    r"single\s+line\s+diagram", r"loop\s+diagram", r"general\s+arrangement", r"\bGA\s+drawing",
+    r"arrangement\s+drawing", r"dimension(?:al)?\s+drawing", r"hook[\s-]*up", r"DCS\s+screen",
+    r"PLC\s+screen", r"HMI\s+screen",
+]
+EXCLUDE_TITLE_RE = re.compile("|".join(f"(?:{k})" for k in EXCLUDE_TITLE_KW), re.I)
+FORCE_TRANSLATE_TITLE_RE = re.compile(r"contents|목차|index|revision|operation|maintenance|procedure|"
+                                      r"troubleshooting|instruction|description", re.I)
+A4_AREA = 595 * 842
+
+
+def load_scope_keywords(path: Optional[str] = None):
+    """scope_keywords.txt(한 줄에 하나, 정규식 가능)가 있으면 제외 키워드에 추가."""
+    global EXCLUDE_TITLE_RE
+    p = Path(path) if path else Path(__file__).resolve().parent / "scope_keywords.txt"
+    if not p.exists():
+        return
+    extra = [ln.strip() for ln in read_text_auto(p).splitlines() if ln.strip() and not ln.startswith("#")]
+    if extra:
+        EXCLUDE_TITLE_RE = re.compile("|".join(f"(?:{k})" for k in EXCLUDE_TITLE_KW + extra), re.I)
+
+
+def page_title_text(page, units: list[Unit]) -> str:
+    """페이지 제목 후보: 위쪽 35% 영역에서 본문보다 큰 글자/굵은 글자, 없으면 첫 3개 블록."""
+    if not units:
+        return ""
+    sizes = sorted(u.size for u in units if u.size)
+    med = sizes[len(sizes) // 2] if sizes else 10
+    top = page.rect.y0 + page.rect.height * 0.35
+    cands = [u for u in units if u.rect.y0 < top and (u.size >= med * 1.12 or u.bold) and len(u.text) < 120]
+    if not cands:
+        cands = sorted(units, key=lambda u: (u.rect.y0, u.rect.x0))[:3]
+    return " | ".join(u.text for u in cands)
+
+
+def page_scope(page, units: list[Unit], drawings_count: int) -> tuple[bool, str]:
+    """(번역 여부, 사유)"""
+    area = abs(page.rect)
+    if area > A4_AREA * 1.6:
+        return False, "대형 페이지(A3 이상) → 도면으로 판단"
+    title = page_title_text(page, units)
+    m = EXCLUDE_TITLE_RE.search(title)
+    if m and not re.search(r"contents|목차", title, re.I):
+        return False, f"제외 문서 제목 '{m.group(0)}'"
+    if units and drawings_count > 1500:
+        avg = sum(len(u.text) for u in units) / len(units)
+        if avg < 14:
+            return False, "도면/다이어그램으로 판단(선 많고 짧은 라벨 위주)"
+    return True, ""
+
+
 def prepare_units(doc, cfg: Config, protector: Protector, overrides: dict[str, str],
                   ocr=None, cache: Optional[Cache] = None, fhash: str = "", label: str = ""):
     """페이지 진단 → 네이티브 추출 + (필요 시) OCR → 번역 단위 목록.
-    반환: (units, {pno: page_class}, n_figure_regions)"""
+    반환: (units, {pno: page_class}, n_figure_regions, {pno: (번역여부, 사유)})"""
     pages = cfg.pages if cfg.pages is not None else list(range(len(doc)))
+    load_scope_keywords()
+    scopes: dict[int, tuple[bool, str]] = {}
+    drawing_counts: dict[int, int] = {}
     ocr_ok = bool(ocr is not None and ocr.available and cfg.ocr_mode != "off" and cache is not None)
     per_page: dict[int, list[Unit]] = {}
     classes: dict[int, str] = {}
@@ -1324,6 +1478,10 @@ def prepare_units(doc, cfg: Config, protector: Protector, overrides: dict[str, s
         cls = "forced" if (cfg.ocr_mode == "force" and ocr_ok) else classify_page(page)
         classes[pno] = cls
         if cls == "empty":
+            scopes[pno] = (False, "빈 페이지")
+            continue
+        if cfg.scope == "om" and abs(page.rect) > A4_AREA * 1.6:
+            scopes[pno] = (False, "대형 페이지(A3 이상) → 도면으로 판단")
             continue
         if cls in ("scanned", "garbled", "invisible", "forced"):
             if ocr_ok:
@@ -1335,6 +1493,10 @@ def prepare_units(doc, cfg: Config, protector: Protector, overrides: dict[str, s
             print(f"  ! p.{pno + 1} 추출 실패: {e}", file=sys.stderr)
             units = []
         per_page[pno] = units
+        try:
+            drawing_counts[pno] = len(page.get_cdrawings()) if hasattr(page, "get_cdrawings") else 0
+        except Exception:  # noqa: BLE001
+            drawing_counts[pno] = 0
         if ocr_ok and cfg.ocr_figures:
             for r in figure_regions(page):
                 excl = [tuple(u.rect) for u in units if u.rect.intersects(r)]
@@ -1347,12 +1509,23 @@ def prepare_units(doc, cfg: Config, protector: Protector, overrides: dict[str, s
                 per_page.setdefault(pno, []).append(block_to_unit(pno, b))
     all_units: list[Unit] = []
     for pno in pages:
-        for i, u in enumerate(per_page.get(pno, [])):
+        us = per_page.get(pno, [])
+        if pno not in scopes:
+            if cfg.scope == "om":
+                scopes[pno] = page_scope(doc[pno], us, drawing_counts.get(pno, 0))
+            else:
+                scopes[pno] = (True, "")
+        ok, why = scopes[pno]
+        for i, u in enumerate(us):
             u.idx = i
+            if not ok:
+                u.scope_keep = why
+            elif cfg.scope != "om":
+                u.scope_keep = ""
             all_units.append(u)
     for u in all_units:
         classify_unit(u, protector, overrides)
-    return all_units, classes, n_fig
+    return all_units, classes, n_fig, scopes
 
 
 def classify_unit(u: Unit, protector: Protector, overrides: dict[str, str]):
@@ -1361,7 +1534,9 @@ def classify_unit(u: Unit, protector: Protector, overrides: dict[str, str]):
         return
     ptxt, tokens = protector.protect(u.text, tokenize_numbers=len(u.text) <= 80)
     u.ptxt, u.tokens = ptxt, tokens
-    if not needs_translation(ptxt):
+    if u.scope_keep:
+        u.status = "SCOPE_KEEP"
+    elif not needs_translation(ptxt):
         u.status = "KEEP"
     elif u.rotated:
         u.status = "ROTATED_SKIPPED"
@@ -1371,10 +1546,29 @@ def classify_unit(u: Unit, protector: Protector, overrides: dict[str, str]):
 
 
 def load_overrides(path: Optional[str]) -> dict[str, str]:
+    """수정 목록: CSV(원문,번역) 또는 Translation_Log.xlsx ('수정 번역(입력)' 열에 쓴 행만 반영)."""
     path = optional_path(path, "overrides")
     if not path:
         return {}
     d = {}
+    if Path(path).suffix.lower() in (".xlsx", ".xlsm"):
+        import openpyxl
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        for ws in wb.worksheets:
+            rows = list(ws.iter_rows(values_only=True))
+            if not rows:
+                continue
+            head = [str(c or "").strip() for c in rows[0]]
+            if "원문" not in head:
+                continue
+            ci = head.index("원문")
+            fix = head.index("수정 번역(입력)") if "수정 번역(입력)" in head else None
+            if fix is None:
+                continue
+            for r in rows[1:]:
+                if r and len(r) > max(ci, fix) and r[ci] and r[fix] and str(r[fix]).strip():
+                    d[clean_text(str(r[ci]))] = str(r[fix]).strip()
+        return d
     for row in csv.reader(read_text_auto(Path(path)).splitlines()):
         if len(row) >= 2 and not row[0].startswith("#"):
             d[clean_text(row[0])] = row[1].strip()
@@ -1386,14 +1580,19 @@ def describe_classes(classes: dict[int, str]) -> str:
     return ", ".join(f"{PAGE_CLASS_KO.get(k, k)} {v}p" for k, v in c.most_common())
 
 
-def verify_output(dst: Path, expect_pages: int, translated_pages: set[int]) -> list[str]:
-    """출력 PDF를 다시 열어 페이지 수/한글 추출/깨진 글자 여부를 확인."""
-    warn = []
+def verify_output(dst: Path, expect_pages: int, translated_pages: set[int],
+                  src: Optional[Path] = None, pages: Optional[list[int]] = None) -> tuple[list[str], list]:
+    """출력 PDF를 다시 열어 최종 검사. 반환: (경고 목록, [(항목, 결과, 상세)])"""
+    warn: list[str] = []
+    checks: list = []
     try:
         d = fitz.open(dst)
+        checks.append(("PDF 열림", "OK", dst.name))
     except Exception as e:  # noqa: BLE001
-        return [f"출력 PDF를 열 수 없음: {e}"]
-    if len(d) != expect_pages:
+        return [f"출력 PDF를 열 수 없음: {e}"], [("PDF 열림", "실패", str(e))]
+    ok = len(d) == expect_pages
+    checks.append(("페이지 누락", "OK" if ok else "확인필요", f"{len(d)} / {expect_pages}페이지"))
+    if not ok:
         warn.append(f"페이지 수 불일치: {len(d)} != {expect_pages}")
     bad_pages = []
     for i in sorted(translated_pages):
@@ -1402,10 +1601,33 @@ def verify_output(dst: Path, expect_pages: int, translated_pages: set[int]) -> l
         t = d[i].get_text("text")
         if not re.search(r"[가-힣]", t) or t.count("\ufffd") > 3:
             bad_pages.append(i + 1)
+    checks.append(("한글 출력", "OK" if not bad_pages else "확인필요",
+                   f"번역 페이지 {len(translated_pages)}개" + (f", 의심 {bad_pages[:20]}" if bad_pages else "")))
     if bad_pages:
         warn.append(f"한글 추출 불가/깨짐 의심 페이지: {bad_pages[:20]}")
+    if src is not None:
+        try:
+            o = fitz.open(src)
+            pl = pages if pages is not None else list(range(len(o)))
+            size_bad, img_bad, order_bad = [], [], []
+            for i, pno in enumerate(pl):
+                if i >= len(d):
+                    break
+                a, b = o[pno], d[i]
+                if abs(a.rect.width - b.rect.width) > 1 or abs(a.rect.height - b.rect.height) > 1:
+                    size_bad.append(pno + 1)
+                if len(a.get_images(full=True)) != len(b.get_images(full=True)):
+                    img_bad.append(pno + 1)
+            checks.append(("페이지 순서", "OK" if not order_bad else "확인필요", "원본과 같은 순서로 저장"))
+            checks.append(("페이지 크기/방향", "OK" if not size_bad else "확인필요",
+                           "원본과 동일 (회전 페이지는 보이는 모습 그대로 정규화)" if not size_bad else f"다름: {size_bad[:20]}"))
+            checks.append(("그림/사진 유지", "OK" if not img_bad else "확인필요",
+                           "페이지별 이미지 개수 동일" if not img_bad else f"이미지 개수 다름: {img_bad[:20]}"))
+            o.close()
+        except Exception as e:  # noqa: BLE001
+            checks.append(("원본 비교", "확인필요", str(e)))
     d.close()
-    return warn
+    return warn, checks
 
 
 def make_compare(src: Path, dst: Path, pages: list[int], out: Path):
@@ -1481,7 +1703,7 @@ def process_pdf(src: Path, dst: Path, cfg: Config, backend, gloss: Glossary,
             pg.remove_rotation()
 
     fhash = file_sha(src)
-    units, classes, n_fig = prepare_units(doc, cfg, protector, overrides, ocr, cache, fhash,
+    units, classes, n_fig, scopes = prepare_units(doc, cfg, protector, overrides, ocr, cache, fhash,
                                           label=src.stem[:20])
     need_ocr = [p for p, c in classes.items() if c in ("scanned", "garbled", "invisible")]
     ocr_ok = bool(ocr is not None and ocr.available and cfg.ocr_mode != "off")
@@ -1500,25 +1722,48 @@ def process_pdf(src: Path, dst: Path, cfg: Config, backend, gloss: Glossary,
 
     pending = list(dict.fromkeys(u.ptxt for u in units + toc_units if u.status == "PENDING"))
     n_ocr_units = sum(1 for u in units if u.ocr)
-    print(f"  페이지 {n_pages} ({describe_classes(classes)}) | 텍스트블록 {len(units)}"
+    n_scope = sum(1 for p, (ok, _) in scopes.items() if not ok)
+    print(f"  페이지 {n_pages} ({describe_classes(classes)}) | 원문유지 페이지 {n_scope} | 텍스트블록 {len(units)}"
           f" (OCR {n_ocr_units}, 그림영역 {n_fig}) | 번역대상(중복제거) {len(pending)}")
-    res = translate_texts(pending, backend, gloss, cache, cfg, label=src.stem[:20])
+    use_tm = backend.name == "memory"
+    res = {} if use_tm else translate_texts(pending, backend, gloss, cache, cfg, label=src.stem[:20])
 
+    n_missing = 0
     for u in units + toc_units:
         if u.status == "PENDING":
-            ko = res.get(u.ptxt)
-            if ko:
-                u.ko = restore_tokens(ko, u.tokens)
-                if clean_text(u.ko) == u.text:  # 번역 결과가 원문과 같으면 원본 그대로 둔다
-                    u.ko, u.status = None, "UNCHANGED"
+            if use_tm:
+                ko = tm_get(cache, u.text)
+                if ko is None:
+                    u.status = "UNTRANSLATED"
+                    u.notes.append("번역문 없음(Copilot 답변 미입력) → 원문 유지")
+                    n_missing += 1
                     continue
-                u.status = "TRANSLATED"
-                for en, kor, _ in gloss.find(u.text):
-                    if kor not in u.ko:
-                        u.notes.append(f"GLOSSARY_MISS: {en}→{kor}")
+                u.ko = ko
             else:
-                u.status = "FAILED"
-                u.notes.append("번역 실패/토큰 불일치: 원문 영어 유지")
+                ko = res.get(u.ptxt)
+                if not ko:
+                    u.status = "FAILED"
+                    u.notes.append("번역 실패/토큰 불일치: 원문 영어 유지")
+                    continue
+                u.ko = restore_tokens(ko, u.tokens)
+                if backend.name != "mock":
+                    tm_put(cache, u.text, u.ko)  # API 번역도 번역 메모리에 저장(재사용)
+            if clean_text(u.ko) == u.text:  # 번역 결과가 원문과 같으면 원본 그대로 둔다
+                u.ko, u.status = None, "UNCHANGED"
+                continue
+            u.status = "TRANSLATED"
+            for en, kor, _ in gloss.find(u.text):
+                if kor not in u.ko:
+                    u.notes.append(f"GLOSSARY_MISS: {en}→{kor}")
+        elif u.status == "OVERRIDE":
+            tm_put(cache, u.text, u.ko)
+    for u in units + toc_units:
+        if u.ko and u.status in ("TRANSLATED", "OVERRIDE"):
+            miss = missing_protected(protector, u.text, u.ko)
+            if miss:
+                u.notes.append("TAG_CHANGED(원문 Tag/숫자/단위 누락: " + ", ".join(miss[:5]) + ")")
+    if use_tm and n_missing:
+        print(f"  ! 번역문이 없는 문구 {n_missing}개는 원문 유지 (Copilot 번역 탭에서 남은 배치를 입력하세요)")
 
     # 렌더링
     translated_pages: set[int] = set()
@@ -1553,7 +1798,7 @@ def process_pdf(src: Path, dst: Path, cfg: Config, backend, gloss: Glossary,
         out_doc.close()
     doc.close()
 
-    warns = verify_output(dst, len(pages), translated_pages)
+    warns, checks = verify_output(dst, len(pages), translated_pages, src, pages)
     for w in warns:
         print(f"  ! 검증: {w}", file=sys.stderr)
     if cfg.compare:
@@ -1561,29 +1806,148 @@ def process_pdf(src: Path, dst: Path, cfg: Config, backend, gloss: Glossary,
         make_compare(src, dst, pages, cmp_path)
         print(f"  비교본: {cmp_path.name}")
 
-    write_report(dst.with_suffix(".review.csv"), src.name, units + toc_units)
     cnt = Counter(u.status for u in units + toc_units)
-    flagged = sum(1 for u in units if u.notes)
-    print(f"  완료 {time.time() - t0:.0f}s | 번역 {cnt['TRANSLATED']} | 유지 {cnt['KEEP']} | "
-          f"실패 {cnt['FAILED']} | 검토필요 {flagged} → {dst.name}")
+    flagged = sum(1 for u in units if u.notes and u.status not in ("SCOPE_KEEP",))
+    n_overlap = sum(1 for u in units if any(n.startswith(("TEXT_OVERLAP", "PAGE_OVER")) for n in u.notes))
+    n_overflow = sum(1 for u in units if any(n.startswith("OVERFLOW") for n in u.notes))
+    checks.append(("텍스트 겹침", "OK" if not n_overlap else "확인필요", f"{n_overlap}건"))
+    checks.append(("셀/박스 초과", "OK" if not n_overflow else "확인필요", f"{n_overflow}건 (글자 축소 한계)"))
+    n_tagfail = sum(1 for u in units if any("TAG_CHANGED" in n for n in u.notes))
+    checks.append(("Tag/숫자/단위 유지", "OK" if not n_tagfail else "확인필요",
+                   "번역문에 원문의 Tag·숫자·단위가 그대로 있는지 검사 완료"))
+    log_path = dst.with_name(f"{src.stem}_Translation_Log.xlsx")
+    write_log_xlsx(log_path, src.name, units + toc_units, classes, scopes, checks, pages)
+    print(f"  번역 로그: {log_path.name}")
+    print(f"  완료 {time.time() - t0:.0f}s | 번역 {cnt['TRANSLATED']} | 원문유지 {cnt['KEEP'] + cnt['SCOPE_KEEP']} | "
+          f"미번역 {cnt['UNTRANSLATED'] + cnt['FAILED']} | 검토필요 {flagged} → {dst.name}")
     return {"file": src.name, "pages": n_pages, "translated": cnt["TRANSLATED"],
-            "failed": cnt["FAILED"], "flagged": flagged,
+            "failed": cnt["FAILED"], "untranslated": cnt["UNTRANSLATED"], "flagged": flagged,
+            "units": units,
             "scanned_pages": len(need_ocr), "ocr_blocks": n_ocr_units,
             "warnings": " / ".join(warns)}
 
 
-def write_report(path: Path, src_name: str, units: list[Unit]):
-    with open(path, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.writer(f)
-        w.writerow(["file", "page", "idx", "source", "ocr_conf", "x0", "y0", "x1", "y1", "status",
-                    "orig_size", "used_size", "original", "translation", "notes"])
-        for u in units:
-            if u.status == "KEEP":
-                continue
-            w.writerow([src_name, u.page + 1, u.idx, u.source, round(u.conf, 1) if u.ocr else "",
-                        round(u.rect.x0, 1), round(u.rect.y0, 1), round(u.rect.x1, 1),
-                        round(u.rect.y1, 1), u.status, round(u.size, 1), round(u.used_size, 1),
-                        u.text, u.ko or "", "; ".join(u.notes)])
+STATUS_KO = {
+    "TRANSLATED": "번역", "OVERRIDE": "수정반영", "KEEP": "원문유지(번호/기호)",
+    "SCOPE_KEEP": "원문유지(번역범위 밖)", "UNTRANSLATED": "미번역(답변없음)", "FAILED": "실패",
+    "UNCHANGED": "원문과 동일", "ROTATED_SKIPPED": "회전문자(건너뜀)", "PENDING": "대기",
+}
+SOURCE_KO = {"native": "본문", "ocr-page": "OCR(스캔)", "ocr-figure": "OCR(그림)", "toc": "북마크"}
+
+
+def _xlsx_sheet(wb, title, header, rows, widths, wrap_cols=()):
+    from openpyxl.styles import Alignment, Font, PatternFill
+    ws = wb.create_sheet(title)
+    ws.append(header)
+    for r in rows:
+        ws.append(r)
+    fill = PatternFill("solid", fgColor="1F4E78")
+    for c in ws[1]:
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = fill
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for i, w in enumerate(widths, 1):
+        ws.column_dimensions[ws.cell(1, i).column_letter].width = w
+    for col in wrap_cols:
+        for c in ws.iter_cols(min_col=col, max_col=col, min_row=2):
+            for cell in c:
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    return ws
+
+
+def write_log_xlsx(path: Path, src_name: str, units: list[Unit], classes: dict, scopes: dict,
+                   checks: list, pages: list[int]):
+    """Translation_Log.xlsx: 번역로그 / 페이지 / 최종검사. '수정 번역(입력)' 열에 고쳐 쓰고
+    이 파일을 '수정 목록(overrides)'으로 지정해 다시 생성하면 반영된다."""
+    try:
+        import openpyxl
+        from openpyxl.styles import PatternFill
+    except ImportError:
+        with open(path.with_suffix(".csv"), "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(["페이지", "상태", "원문", "번역", "비고"])
+            for u in units:
+                w.writerow([u.page + 1, STATUS_KO.get(u.status, u.status), u.text, u.ko or "", "; ".join(u.notes)])
+        return
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    rows = []
+    for u in units:
+        if u.status == "KEEP":
+            continue
+        kind = SOURCE_KO.get(u.source, u.source) + ("·표" if (u.cell is not None) else "")
+        size = f"{u.size:.1f}→{u.used_size:.1f}" if u.used_size else (f"{u.size:.1f}" if u.size else "")
+        rows.append([u.page + 1, u.idx + 1 if u.idx >= 0 else "", kind, STATUS_KO.get(u.status, u.status),
+                     u.text, u.ko or "", "", size, "; ".join(u.notes) or u.scope_keep])
+    ws = _xlsx_sheet(wb, "번역로그", ["페이지", "순번", "구분", "상태", "원문", "번역", "수정 번역(입력)",
+                                     "글자크기(pt)", "비고"], rows, [7, 6, 11, 16, 60, 60, 40, 11, 40], (5, 6, 7, 9))
+    warn_fill = PatternFill("solid", fgColor="FFF2CC")
+    for r in ws.iter_rows(min_row=2):
+        st, note = r[3].value or "", r[8].value or ""
+        if st.startswith(("미번역", "실패")) or any(k in note for k in ("OVERFLOW", "OVERLAP", "TAG_CHANGED", "LOW_CONF")):
+            for c in r:
+                c.fill = warn_fill
+    prow = []
+    for pno in pages:
+        ok, why = scopes.get(pno, (True, ""))
+        n_tr = sum(1 for u in units if u.page == pno and u.status in ("TRANSLATED", "OVERRIDE") and u.kind == "text")
+        prow.append([pno + 1, PAGE_CLASS_KO.get(classes.get(pno, ""), classes.get(pno, "")),
+                     "번역" if ok else "원문유지", why, n_tr])
+    _xlsx_sheet(wb, "페이지", ["페이지", "PDF 종류", "번역 여부", "사유", "번역 블록 수"], prow, [8, 16, 11, 50, 13])
+    cnt = Counter(u.status for u in units)
+    stat = [[STATUS_KO.get(k, k), v] for k, v in cnt.most_common()]
+    _xlsx_sheet(wb, "최종검사", ["항목", "결과", "상세"], [list(c) for c in checks] + [["", "", ""]] +
+                [["상태별 건수", s_, str(v)] for s_, v in stat], [22, 12, 70], (3,))
+    try:
+        wb.save(path)
+    except PermissionError:
+        alt = path.with_name(path.stem + time.strftime("_%H%M%S") + path.suffix)
+        wb.save(alt)
+        print(f"  ! {path.name} 이(가) 열려 있어 {alt.name} 로 저장했습니다.", file=sys.stderr)
+
+
+def write_glossary_xlsx(path: Path, gloss: Glossary, units: list[Unit], top: int = 300):
+    """Plant_O&M_Glossary.xlsx: 문서에 쓰인 용어집 용어 + 자주 나오는 미등록 용어 후보(ko 칸을 채워 재사용)."""
+    try:
+        import openpyxl
+    except ImportError:
+        return
+    texts = [u.text for u in units if u.status in ("TRANSLATED", "OVERRIDE", "UNTRANSLATED", "FAILED")]
+    used = Counter()
+    for t in texts:
+        for en, ko, note in gloss.find(t):
+            used[(en, ko, note)] += 1
+    for k in gloss.keep:
+        n = sum(1 for t in texts if re.search(r"(?<![A-Za-z0-9])" + re.escape(k) + r"(?![A-Za-z0-9])", t))
+        if n:
+            used[(k, "KEEP", "영어 유지")] += n
+    rows1 = [[en, ko, note, n] for (en, ko, note), n in sorted(used.items(), key=lambda x: -x[1])]
+    cnt: Counter = Counter()
+    example: dict[str, str] = {}
+    known = set(gloss.trans) | {k.lower() for k in gloss.keep}
+    for t in texts:
+        low = [w.lower() for w in re.findall(r"[A-Za-z][A-Za-z\-/&]+", t)]
+        for n in (1, 2, 3):
+            for i in range(len(low) - n + 1):
+                g = low[i:i + n]
+                if g[0] in STOP or g[-1] in STOP or any(len(x) < 3 for x in g):
+                    continue
+                k = " ".join(g)
+                if k in known:
+                    continue
+                cnt[k] += 1
+                example.setdefault(k, t[:90])
+    rows2 = [[k, "", "", c, example[k]] for k, c in cnt.most_common(top) if c >= 2]
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    _xlsx_sheet(wb, "용어집(적용)", ["en", "ko", "note", "출현 수"], rows1, [34, 28, 24, 10])
+    _xlsx_sheet(wb, "용어 후보(미등록)", ["en", "ko", "note", "출현 수", "예문"], rows2, [30, 24, 16, 10, 70], (5,))
+    try:
+        wb.save(path)
+    except PermissionError:
+        print(f"  ! {path.name} 이(가) 열려 있어 저장하지 못했습니다.", file=sys.stderr)
 
 
 # ----------------------------------------------------------------------------
@@ -1596,7 +1960,8 @@ def list_pdfs(p: str) -> list[Path]:
     if not path.exists():
         sys.exit(f"입력 경로가 없습니다: {p}")
     return sorted(x for x in path.rglob("*")
-                  if x.suffix.lower() == ".pdf" and not x.stem.endswith(("_KO", "_KO_compare")))
+                  if x.suffix.lower() == ".pdf"
+                  and not x.stem.endswith(("_KO", "_KO_compare", "_KR_O&M", "_KR_O&M_compare")))
 
 
 def build_ctx(args):
@@ -1607,8 +1972,49 @@ def build_ctx(args):
 
 
 def base_config(args) -> Config:
-    return Config(ocr_mode=args.ocr, ocr_figures=not args.no_ocr_figures,
-                  ocr_workers=args.ocr_workers)
+    return Config(ocr_mode=args.ocr, ocr_figures=bool(args.ocr_figures) and not args.no_ocr_figures,
+                  ocr_workers=args.ocr_workers, scope=args.scope)
+
+
+def cmd_export(args):
+    """Copilot 배치 프롬프트 만들기 (API 없음)."""
+    import om_copilot
+    gloss, protector, overrides = build_ctx(args)
+    cfg = base_config(args)
+    ocr = build_ocr_engine(args)
+    outdir = Path(args.output)
+    outdir.mkdir(parents=True, exist_ok=True)
+    cache = Cache(Path(args.cache) if args.cache else outdir / "translation_cache.sqlite")
+    pdfs: list[Path] = []
+    for inp in args.input:
+        pdfs += list_pdfs(inp)
+    if not pdfs:
+        sys.exit("PDF 파일을 찾지 못했습니다.")
+    if len(pdfs) == 1 and args.pages:
+        n = len(fitz.open(pdfs[0]))
+        cfg.pages = parse_pages(args.pages, n)
+    om_copilot.export(pdfs, outdir, cfg, gloss, protector, overrides, ocr, cache,
+                      max_chars=args.batch_chars, max_items=args.batch_items)
+
+
+def cmd_import(args):
+    """Copilot 답변 파일(batch_001_답변.txt 등) 반영."""
+    import om_copilot
+    gloss, protector, _ = build_ctx(args)
+    outdir = Path(args.output)
+    cache = Cache(Path(args.cache) if args.cache else outdir / "translation_cache.sqlite")
+    man = om_copilot.load_manifest(outdir)
+    if man is None:
+        sys.exit("먼저 export 를 실행하세요.")
+    if args.batch and args.file:
+        targets = [(args.batch, Path(args.file))]
+    else:
+        targets = [(b["no"], om_copilot.work_dir(outdir) / f"batch_{b['no']:03d}_답변.txt") for b in man["batches"]]
+    for no, f in targets:
+        if not f.exists() or not f.read_text(encoding="utf-8-sig").strip():
+            continue
+        r = om_copilot.import_answer(outdir, no, f.read_text(encoding="utf-8-sig"), cache, protector)
+        print(om_copilot.format_result(r))
 
 
 def cmd_estimate(args):
@@ -1623,7 +2029,7 @@ def cmd_estimate(args):
     for src in list_pdfs(args.input):
         doc = fitz.open(src)
         cfg.pages = parse_pages(args.pages, len(doc)) if args.pages else None
-        units, classes, n_fig = prepare_units(doc, cfg, protector, overrides, ocr, cache,
+        units, classes, n_fig, scopes = prepare_units(doc, cfg, protector, overrides, ocr, cache,
                                               file_sha(src) if cache else "", label=src.stem[:20])
         pend = [u for u in units if u.status == "PENDING"]
         for u in pend:
@@ -1667,7 +2073,7 @@ def cmd_terms(args):
     for src in list_pdfs(args.input):
         doc = fitz.open(src)
         cfg.pages = parse_pages(args.pages, len(doc)) if args.pages else None
-        units, classes, _ = prepare_units(doc, cfg, protector, overrides, ocr, cache, file_sha(src),
+        units, classes, _, _scopes = prepare_units(doc, cfg, protector, overrides, ocr, cache, file_sha(src),
                                           label=src.stem[:20])
         for u in units:
             words = re.findall(r"[A-Za-z][A-Za-z\-/&]+", u.text)
@@ -1701,12 +2107,20 @@ def cmd_translate(args):
     cfg.force, cfg.compare = args.force, args.compare
     if args.backend == "mock":
         cfg.model = "mock"  # 캐시 키 분리: mock 결과가 실제 번역 캐시에 섞이지 않게 함
-    backend = MockBackend() if args.backend == "mock" else AnthropicBackend(args.model)
+    if args.backend == "mock":
+        backend = MockBackend()
+    elif args.backend == "memory":
+        backend = MemoryBackend()
+        cfg.model = "memory"
+    else:
+        backend = AnthropicBackend(args.model)
     ocr = build_ocr_engine(args)
     outdir = Path(args.output)
     outdir.mkdir(parents=True, exist_ok=True)
     cache = Cache(Path(args.cache) if args.cache else outdir / "translation_cache.sqlite")
-    pdfs = list_pdfs(args.input)
+    pdfs = []
+    for inp in args.input:
+        pdfs += [p_ for p_ in list_pdfs(inp) if p_ not in pdfs]
     if not pdfs:
         sys.exit("PDF 파일을 찾지 못했습니다.")
     ocr_desc = "꺼짐" if ocr is None else (
@@ -1716,7 +2130,7 @@ def cmd_translate(args):
           f"OCR {ocr_desc} | 파일 {len(pdfs)}개")
     summary = []
     for i, src in enumerate(pdfs, 1):
-        dst = outdir / f"{src.stem}_KO.pdf"
+        dst = outdir / f"{src.stem}_KR_O&M.pdf"
         print(f"[{i}/{len(pdfs)}] {src.name}")
         if dst.exists() and not cfg.force:
             print("  이미 존재 → 건너뜀 (--force 로 재생성)")
@@ -1734,7 +2148,7 @@ def cmd_translate(args):
             summary.append({"file": src.name, "error": str(e)})
     if summary:
         with open(outdir / "summary.csv", "w", newline="", encoding="utf-8-sig") as f:
-            keys = ["file", "pages", "translated", "failed", "flagged", "scanned_pages",
+            keys = ["file", "pages", "translated", "untranslated", "failed", "flagged", "scanned_pages",
                     "ocr_blocks", "warnings", "error"]
             w = csv.DictWriter(f, fieldnames=keys)
             w.writeheader()
@@ -1742,7 +2156,11 @@ def cmd_translate(args):
                 w.writerow({k: s.get(k, "") for k in keys})
     if hasattr(backend, "in_tokens") and backend.in_tokens:
         print(f"\nAPI 사용량: 입력 {backend.in_tokens:,} / 출력 {backend.out_tokens:,} 토큰")
-    print(f"결과 폴더: {outdir.resolve()}  (summary.csv, *.review.csv 확인)")
+    all_units = [u for s_ in summary for u in s_.get("units", [])]
+    if all_units:
+        write_glossary_xlsx(outdir / "Plant_O&M_Glossary.xlsx", gloss, all_units)
+        print("용어집: Plant_O&M_Glossary.xlsx")
+    print(f"결과 폴더: {outdir.resolve()}")
     errs = [s for s in summary if s.get("error")]
     if errs:
         print(f"! 실패한 파일 {len(errs)}개: " + ", ".join(e["file"] for e in errs), file=sys.stderr)
@@ -1769,8 +2187,9 @@ def interactive_argv() -> Optional[list[str]]:
     print(" 2) 용어 후보 추출 → terms_candidates.csv")
     print(" 3) OCR 결과 확인 (한 페이지, 디버그 PNG)")
     print(" 4) 레이아웃 테스트 (API 사용 안 함, '[번역]' 접두)")
-    print(" 5) 샘플 번역 (일부 페이지, 실제 API)")
-    print(" 6) 전체 번역 (실제 API)")
+    print(" 5) 한국어 PDF 만들기 - 일부 페이지 (Copilot 번역 반영, API 없음)")
+    print(" 6) 한국어 PDF 만들기 - 전체 (Copilot 번역 반영, API 없음)")
+    print("    ※ Copilot 번역(문장 추출/답변 붙여넣기)은 GUI에서: py om_gui.py")
     print(" 0) 종료")
     choice = _ask("번호 선택", "1")
     if choice not in {"1", "2", "3", "4", "5", "6"}:
@@ -1805,8 +2224,9 @@ def interactive_argv() -> Optional[list[str]]:
         return []
     if choice in ("4", "5"):
         pages = _ask("페이지 범위 (예: 1-5,12)", "1-5")
-        out = ["translate", src, "-o", "OM_SAMPLE", "--pages", pages, "--compare", "--force", *common]
+        out = ["translate", src, "-o", "OM_KO", "--pages", pages, "--force", *common]
         if choice == "4":
+            out[3] = str(Path("OM_KO") / "레이아웃_테스트")
             out += ["--backend", "mock"]
         return out
     out = ["translate", src, "-o", "OM_KO", *common]
@@ -1851,7 +2271,11 @@ def main(argv=None):
         g = p.add_argument_group("OCR")
         g.add_argument("--ocr", choices=["auto", "off", "force"], default="auto",
                        help="auto: 스캔/글자깨짐 페이지만 OCR(기본) | force: 모든 페이지 OCR | off")
-        g.add_argument("--no-ocr-figures", action="store_true", help="그림(래스터 이미지) 속 글자 OCR 끄기")
+        g.add_argument("--ocr-figures", action="store_true",
+                       help="그림(래스터 이미지) 속 글자도 OCR해서 번역 (기본 끔: 도면 내부 문자는 원문 유지)")
+        g.add_argument("--no-ocr-figures", action="store_true", help=argparse.SUPPRESS)
+        p.add_argument("--scope", choices=["om", "all"], default="om",
+                       help="om: O&M 대상만 번역, 데이터시트/부품목록/도면/표의 Tag·Value 열은 원문 유지(기본) | all: 전부 번역")
         g.add_argument("--ocr-lang", default="eng", help="Tesseract 언어 (기본 eng)")
         g.add_argument("--ocr-dpi", type=int, default=400, help="OCR 렌더링 해상도 (기본 400)")
         g.add_argument("--ocr-min-conf", type=float, default=50, help="페이지 OCR 최소 신뢰도(기본 50)")
@@ -1875,11 +2299,31 @@ def main(argv=None):
     p.add_argument("--cache", default="translation_cache.sqlite")
     p.set_defaults(fn=cmd_terms)
 
-    p = sub.add_parser("translate", help="번역 실행")
+    p = sub.add_parser("export", help="Copilot 번역용 배치 프롬프트 만들기 (API 없음)")
     common(p)
+    p.add_argument("more_inputs", nargs="*", help="추가 PDF/폴더")
+    p.add_argument("-o", "--output", required=True, help="결과 폴더 (Copilot_작업 폴더가 생김)")
+    p.add_argument("--cache", help="캐시 파일 (기본: 결과폴더/translation_cache.sqlite)")
+    p.add_argument("--batch-chars", type=int, default=6000, help="배치당 최대 글자 수(기본 6000)")
+    p.add_argument("--batch-items", type=int, default=60, help="배치당 최대 문구 수(기본 60)")
+    p.set_defaults(fn=cmd_export)
+
+    p = sub.add_parser("import", help="Copilot 답변 반영")
+    p.add_argument("-o", "--output", required=True, help="export 때와 같은 결과 폴더")
+    p.add_argument("--cache")
+    p.add_argument("--glossary")
+    p.add_argument("--keep-patterns")
+    p.add_argument("--batch", type=int, help="배치 번호 (--file 과 함께)")
+    p.add_argument("--file", help="답변 텍스트 파일")
+    p.set_defaults(fn=cmd_import)
+
+    p = sub.add_parser("translate", help="한국어 PDF 생성")
+    common(p)
+    p.add_argument("more_inputs", nargs="*", help="추가 PDF/폴더")
     p.add_argument("-o", "--output", required=True, help="출력 폴더")
     p.add_argument("--cache", help="캐시 파일 (기본: 출력폴더/translation_cache.sqlite)")
-    p.add_argument("--backend", choices=["anthropic", "mock"], default="anthropic")
+    p.add_argument("--backend", choices=["memory", "anthropic", "mock"], default="memory",
+                   help="memory: Copilot 답변 등 번역 메모리 사용(기본, API 없음) | anthropic: API 자동 번역 | mock: 레이아웃 테스트")
     p.add_argument("--model", default=DEFAULT_MODEL)
     p.add_argument("--tone", choices=list(TONES), default="formal")
     p.add_argument("--workers", type=int, default=4, help="동시 API 호출 수")
@@ -1893,6 +2337,8 @@ def main(argv=None):
     p.set_defaults(fn=cmd_translate)
 
     args = ap.parse_args(argv)
+    if args.cmd in ("export", "translate"):
+        args.input = [args.input] + list(args.more_inputs or [])
     args.fn(args)
 
 
