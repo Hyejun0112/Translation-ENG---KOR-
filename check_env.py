@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""설치 상태 점검: 패키지 / Tesseract / 한글 폰트 / API 키.  실행: py check_env.py"""
+import importlib
+import os
+import sys
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+except Exception:  # noqa: BLE001
+    pass
+
+ok_all = True
+
+
+def line(ok: bool, name: str, msg: str = ""):
+    global ok_all
+    ok_all &= ok
+    print(f"[{'OK' if ok else '!!'}] {name:<22} {msg}")
+
+
+print(f"Python {sys.version.split()[0]}  ({sys.executable})")
+for mod, pip_name in [("pymupdf", "pymupdf"), ("anthropic", "anthropic"), ("pytesseract", "pytesseract"),
+                      ("cv2", "opencv-python-headless"), ("numpy", "numpy"), ("PIL", "Pillow"),
+                      ("fontTools", "fonttools"), ("openpyxl", "openpyxl")]:
+    try:
+        m = importlib.import_module(mod)
+        line(True, pip_name, getattr(m, "__version__", getattr(m, "VersionBind", "")))
+    except ImportError:
+        line(False, pip_name, f"미설치 → pip install {pip_name}")
+
+try:
+    from om_ocr import OcrEngine
+    eng = OcrEngine()
+    if eng.available:
+        import pytesseract
+        line(True, "Tesseract", f"{pytesseract.get_tesseract_version()}  ({eng.cmd})")
+    else:
+        line(False, "Tesseract", eng.reason)
+except Exception as e:  # noqa: BLE001
+    line(False, "Tesseract", str(e))
+
+try:
+    from om_translate import find_font
+    reg, bold = find_font("", "regular"), find_font("", "bold")
+    line(bool(reg), "한글 폰트(본문)", reg or "없음 → --font 로 지정")
+    line(bool(bold), "한글 폰트(굵게)", bold or "없음 (본문 폰트로 대체됨)")
+except SystemExit as e:
+    line(False, "한글 폰트", str(e))
+
+line(bool(os.environ.get("ANTHROPIC_API_KEY")), "ANTHROPIC_API_KEY",
+     "설정됨" if os.environ.get("ANTHROPIC_API_KEY") else "미설정 → setx ANTHROPIC_API_KEY \"sk-ant-...\" 후 VS Code 재시작")
+
+print("\n모두 정상입니다." if ok_all else "\n'!!' 항목을 확인하세요. (README 1장 참고)")

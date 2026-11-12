@@ -1,0 +1,21 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "환경 설정: 가상환경 생성 + 패키지 설치",
+      "type": "shell",
+      "windows": {
+        "command": "py -m venv .venv; .\\.venv\\Scripts\\python.exe -m pip install -U pip; .\\.venv\\Scripts\\python.exe -m pip install -r requirements.txt"
+      },
+      "command": "python3 -m venv .venv && ./.venv/bin/pip install -U pip && ./.venv/bin/pip install -r requirements.txt",
+      "problemMatcher": []
+    },
+    {
+      "label": "점검: Tesseract / 한글 폰트 / 패키지",
+      "type": "shell",
+      "windows": { "command": ".\\.venv\\Scripts\\python.exe check_env.py" },
+      "command": "./.venv/bin/python check_env.py",
+      "problemMatcher": []
+    }
+  ]
+}
