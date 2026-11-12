@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-gui.py - Plant O&M Translator v2.0 화면(GUI)
-============================================
-run.bat 더블클릭 시 이 창이 열립니다.
+gui.py - Plant O&M Translator v2.0 프로그램 창
+==============================================
+OM_Translator.pyw 를 더블클릭하면 이 창이 열립니다.
 
-  1) [PDF 추가] 또는 [폴더 추가]로 번역할 PDF 선택 (input\\pdf 폴더의 PDF는 자동으로 목록에 표시)
-  2) 옵션 확인 (모델, 페이지 범위, 다시 만들기)
-  3) [▶ 번역 시작] → 진행률 / 남은 시간 표시
-  4) 끝나면 [한국어 PDF 열기] / [번역 로그 열기] / [결과 폴더]
+  1) Claude API 키 입력 → [저장] (처음 한 번. 이 PC의 .env 파일에만 저장, GitHub에 올라가지 않음)
+  2) [PDF 추가] / [폴더 추가] 로 번역할 PDF 선택 (input\\pdf 폴더의 PDF는 자동으로 목록에 표시)
+  3) 옵션 확인 (모델, 페이지 범위)  →  [분량 추정] 으로 미리 확인 (선택)
+  4) [▶ 번역 시작] → 진행률 / 남은 시간
+  5) [한국어 PDF 열기] / [번역 로그 열기] / [결과 폴더]
 
-실제 번역은 main.py(검증된 번역 파이프라인)를 백그라운드로 실행합니다.
-설정은 cache\\gui_settings.json 에 저장됩니다.
+실제 번역은 main.py(번역 파이프라인)를 백그라운드로 실행합니다.
 """
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+import webbrowser
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -36,13 +37,14 @@ import config  # noqa: E402
 
 IS_WIN = os.name == "nt"
 SETTINGS = config.CACHE_DIR / "gui_settings.json"
-MODELS = ["qwen2.5:14b", "qwen2.5:7b", "qwen2.5:32b"]
 NO_WINDOW = 0x08000000 if IS_WIN else 0
+KEY_URL = "https://console.anthropic.com/settings/keys"
 
 RE_FILE = re.compile(r"^\[(\d+)/(\d+)\]\s+(.+?)\s*$")
 RE_PAGE = re.compile(r"페이지 분석 (\d+)/(\d+)")
 RE_OCR = re.compile(r"OCR (\d+)/(\d+)")
 RE_TR = re.compile(r"번역 (\d+)/(\d+) 묶음 \((\d+)%\).*?남은 시간 약 (.+?)\s*$")
+RE_USAGE = re.compile(r"API 사용량 누적: 입력 ([\d,]+) / 출력 ([\d,]+) 토큰")
 
 
 def open_path(p: Path):
@@ -57,21 +59,36 @@ def open_path(p: Path):
         messagebox.showerror("열기 실패", f"{p}\n\n{e}")
 
 
+def model_label(mid: str) -> str:
+    for m, desc in config.MODEL_CHOICES:
+        if m == mid:
+            return f"{m}  ({desc})"
+    return mid
+
+
+def label_to_model(label: str) -> str:
+    return label.split()[0].strip() if label.strip() else config.DEFAULT_MODEL
+
+
 class App(tk.Tk):
     def __init__(self, initial_files: list[str] | None = None):
         super().__init__()
-        self.title(f"{config.APP_TITLE}  -  O&M Manual 영→한 번역 (Ollama 로컬)")
-        sh = self.winfo_screenheight()
-        self.geometry(f"960x{max(600, min(760, sh - 90))}+60+30")
-        self.minsize(820, 560)
+        self.title(f"{config.APP_TITLE}  -  O&M Manual 영→한 번역 (Claude API)")
+        sh, sw = self.winfo_screenheight(), self.winfo_screenwidth()
+        w = min(980, sw - 40)
+        self.geometry(f"{w}x{max(620, min(800, sh - 90))}+{max(0, (sw - w) // 2)}+20")
+        self.minsize(860, 600)
         config.ensure_dirs()
+        config.load_env()
         self.proc: subprocess.Popen | None = None
         self.q: queue.Queue = queue.Queue()
         self.running = False
         self.stopping = False
+        self.mode = ""
         self.t0 = 0.0
         self.files: list[str] = []
         self.done_files: list[str] = []
+        self.usage = ""
         self._style()
         self._build()
         self._load_settings()
@@ -80,10 +97,10 @@ class App(tk.Tk):
         self.refresh_input_folder()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(100, self._poll)
-        self.after(300, self.check_ollama_async)
         self.after(200, self._front)
+        self.after(400, lambda: self.verify_key_async(silent=True))
 
-    # ------------------------------------------------------------------ 화면
+    # ================================================================== 화면
     def _style(self):
         st = ttk.Style(self)
         if IS_WIN and "vista" in st.theme_names():
@@ -95,6 +112,7 @@ class App(tk.Tk):
         st.configure("Hint.TLabel", foreground="#666666")
         st.configure("Ok.TLabel", foreground="#1a7f37")
         st.configure("Bad.TLabel", foreground="#c62828")
+        st.configure("Link.TLabel", foreground="#1565c0")
 
     def _front(self):
         try:
@@ -113,20 +131,39 @@ class App(tk.Tk):
         head = ttk.Frame(root)
         head.grid(row=0, column=0, sticky="ew")
         ttk.Label(head, text="발전플랜트 O&M Manual 영→한 번역", style="Title.TLabel").pack(side="left")
-        self.v_ollama = tk.StringVar(value="Ollama 확인 중...")
-        self.lbl_ollama = ttk.Label(head, textvariable=self.v_ollama, style="Hint.TLabel")
-        self.lbl_ollama.pack(side="right")
+        self.v_keystate = tk.StringVar(value="")
+        self.lbl_keystate = ttk.Label(head, textvariable=self.v_keystate, style="Hint.TLabel")
+        self.lbl_keystate.pack(side="right")
         ttk.Label(root, text="원본 레이아웃(그림·표·도면) 그대로, O&M 문구만 한국어로 바꾼 PDF를 만듭니다. "
-                             "번역은 이 PC에서만 실행됩니다(외부 전송 없음).",
-                  style="Hint.TLabel").grid(row=1, column=0, sticky="w", pady=(2, 8))
+                             "번역: Claude API", style="Hint.TLabel").grid(row=1, column=0, sticky="w", pady=(2, 8))
+
+        # 0. API 키
+        fk = ttk.LabelFrame(root, text=" Claude API 키 (처음 한 번) ", padding=8)
+        fk.grid(row=2, column=0, sticky="ew")
+        fk.columnconfigure(1, weight=1)
+        ttk.Label(fk, text="API 키").grid(row=0, column=0, sticky="w")
+        self.v_key = tk.StringVar(value=os.environ.get("ANTHROPIC_API_KEY", ""))
+        self.ent_key = ttk.Entry(fk, textvariable=self.v_key, show="•")
+        self.ent_key.grid(row=0, column=1, sticky="ew", padx=6)
+        self.v_show = tk.BooleanVar(value=False)
+        ttk.Checkbutton(fk, text="보기", variable=self.v_show,
+                        command=lambda: self.ent_key.configure(show="" if self.v_show.get() else "•")).grid(row=0, column=2)
+        ttk.Button(fk, text="붙여넣기", command=self.paste_key).grid(row=0, column=3, padx=(6, 0))
+        ttk.Button(fk, text="저장", command=self.save_key).grid(row=0, column=4, padx=6)
+        lk = ttk.Label(fk, text="키 발급(console.anthropic.com)", style="Link.TLabel", cursor="hand2")
+        lk.grid(row=0, column=5, sticky="w")
+        lk.bind("<Button-1>", lambda e: webbrowser.open(KEY_URL))
+        ttk.Label(fk, text="키는 이 PC의 .env 파일에만 저장되고 GitHub에는 올라가지 않습니다. "
+                           "다른 사람과 공유하거나 채팅/메일에 붙여넣지 마세요.",
+                  style="Hint.TLabel").grid(row=1, column=0, columnspan=6, sticky="w", pady=(4, 0))
 
         # 1. 파일
         f1 = ttk.LabelFrame(root, text=" 1. 번역할 PDF ", padding=8)
-        f1.grid(row=2, column=0, sticky="nsew")
-        root.rowconfigure(2, weight=1)
+        f1.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
+        root.rowconfigure(3, weight=1)
         f1.columnconfigure(0, weight=1)
         f1.rowconfigure(0, weight=1)
-        self.lst = tk.Listbox(f1, height=6, selectmode="extended", activestyle="none")
+        self.lst = tk.Listbox(f1, height=5, selectmode="extended", activestyle="none")
         self.lst.grid(row=0, column=0, sticky="nsew")
         sb = ttk.Scrollbar(f1, orient="vertical", command=self.lst.yview)
         sb.grid(row=0, column=1, sticky="ns")
@@ -134,26 +171,25 @@ class App(tk.Tk):
         bf = ttk.Frame(f1)
         bf.grid(row=0, column=2, sticky="n", padx=(8, 0))
         for i, (t, cmd) in enumerate([("PDF 추가…", self.add_files), ("폴더 추가…", self.add_folder),
-                                      ("선택 삭제", self.remove_sel), ("모두 지우기", self.clear_files),
-                                      ("input\\pdf 열기", lambda: open_path(config.INPUT_DIR))]):
-            ttk.Button(bf, text=t, command=cmd, width=15).grid(row=i, column=0, pady=2, sticky="ew")
+                                      ("선택 삭제", self.remove_sel), ("모두 지우기", self.clear_files)]):
+            ttk.Button(bf, text=t, command=cmd, width=13).grid(row=i // 2, column=i % 2, padx=2, pady=2, sticky="ew")
 
         # 2. 옵션
         f2 = ttk.LabelFrame(root, text=" 2. 옵션 ", padding=8)
-        f2.grid(row=3, column=0, sticky="ew", pady=(8, 0))
-        self.v_model = tk.StringVar(value=config.DEFAULT_MODEL)
+        f2.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        self.v_model = tk.StringVar(value=model_label(config.DEFAULT_MODEL))
         self.v_pages = tk.StringVar(value="")
         self.v_force = tk.BooleanVar(value=False)
         self.v_scope = tk.BooleanVar(value=True)
         self.v_ocr = tk.BooleanVar(value=True)
-        ttk.Label(f2, text="번역 모델").grid(row=0, column=0, sticky="w")
-        ttk.Combobox(f2, textvariable=self.v_model, values=MODELS, width=16).grid(row=0, column=1, sticky="w", padx=6)
-        ttk.Label(f2, text="14b: 품질 우선 / 7b: 속도 우선", style="Hint.TLabel").grid(row=0, column=2, sticky="w")
-        ttk.Label(f2, text="페이지").grid(row=0, column=3, sticky="e", padx=(20, 0))
-        ttk.Entry(f2, textvariable=self.v_pages, width=12).grid(row=0, column=4, sticky="w", padx=6)
-        ttk.Label(f2, text="비우면 전체 (예: 1-5)", style="Hint.TLabel").grid(row=0, column=5, sticky="w")
+        ttk.Label(f2, text="모델").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(f2, textvariable=self.v_model, state="readonly", width=40,
+                     values=[model_label(m) for m, _ in config.MODEL_CHOICES]).grid(row=0, column=1, sticky="w", padx=6)
+        ttk.Label(f2, text="페이지").grid(row=0, column=2, sticky="e", padx=(16, 0))
+        ttk.Entry(f2, textvariable=self.v_pages, width=12).grid(row=0, column=3, sticky="w", padx=6)
+        ttk.Label(f2, text="비우면 전체 (예: 1-5)", style="Hint.TLabel").grid(row=0, column=4, sticky="w")
         o = ttk.Frame(f2)
-        o.grid(row=1, column=0, columnspan=6, sticky="w", pady=(6, 0))
+        o.grid(row=1, column=0, columnspan=5, sticky="w", pady=(6, 0))
         ttk.Checkbutton(o, text="O&M 대상만 번역 (도면·데이터시트·부품목록·표 Tag/Value 열은 원문 유지)",
                         variable=self.v_scope).pack(side="left")
         ttk.Checkbutton(o, text="스캔 페이지 OCR", variable=self.v_ocr).pack(side="left", padx=14)
@@ -161,40 +197,42 @@ class App(tk.Tk):
 
         # 3. 실행
         f3 = ttk.Frame(root)
-        f3.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        f3.grid(row=5, column=0, sticky="ew", pady=(10, 0))
         self.btn_run = ttk.Button(f3, text="▶  번역 시작", style="Run.TButton", command=self.start)
         self.btn_run.pack(side="left")
         self.btn_stop = ttk.Button(f3, text="■ 중지", command=self.stop, state="disabled")
         self.btn_stop.pack(side="left", padx=8)
+        self.btn_est = ttk.Button(f3, text="분량 추정", command=self.estimate)
+        self.btn_est.pack(side="left")
         ttk.Button(f3, text="결과 폴더", command=lambda: open_path(config.OUTPUT_DIR)).pack(side="right")
         ttk.Button(f3, text="번역 로그 열기", command=self.open_log).pack(side="right", padx=6)
         ttk.Button(f3, text="한국어 PDF 열기", command=self.open_pdf).pack(side="right")
 
         # 진행률
         f4 = ttk.Frame(root)
-        f4.grid(row=5, column=0, sticky="ew", pady=(10, 0))
+        f4.grid(row=6, column=0, sticky="ew", pady=(10, 0))
         f4.columnconfigure(1, weight=1)
         ttk.Label(f4, text="전체").grid(row=0, column=0, sticky="w")
         self.pb_all = ttk.Progressbar(f4, maximum=100)
         self.pb_all.grid(row=0, column=1, sticky="ew", padx=6)
         self.v_all = tk.StringVar(value="")
-        ttk.Label(f4, textvariable=self.v_all, width=26).grid(row=0, column=2, sticky="w")
+        ttk.Label(f4, textvariable=self.v_all, width=28).grid(row=0, column=2, sticky="w")
         ttk.Label(f4, text="현재 파일").grid(row=1, column=0, sticky="w", pady=(4, 0))
         self.pb_cur = ttk.Progressbar(f4, maximum=100)
         self.pb_cur.grid(row=1, column=1, sticky="ew", padx=6, pady=(4, 0))
         self.v_cur = tk.StringVar(value="")
-        ttk.Label(f4, textvariable=self.v_cur, width=26).grid(row=1, column=2, sticky="w", pady=(4, 0))
-        self.v_status = tk.StringVar(value="대기 중 - PDF를 추가하고 [번역 시작]을 누르세요.")
-        ttk.Label(root, textvariable=self.v_status).grid(row=6, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(f4, textvariable=self.v_cur, width=28).grid(row=1, column=2, sticky="w", pady=(4, 0))
+        self.v_status = tk.StringVar(value="대기 중 - API 키를 저장하고, PDF를 추가한 뒤 [번역 시작]을 누르세요.")
+        ttk.Label(root, textvariable=self.v_status).grid(row=7, column=0, sticky="w", pady=(6, 0))
 
         # 로그
         f5 = ttk.LabelFrame(root, text=" 진행 기록 ", padding=4)
-        f5.grid(row=7, column=0, sticky="nsew", pady=(6, 0))
-        root.rowconfigure(7, weight=2)
+        f5.grid(row=8, column=0, sticky="nsew", pady=(6, 0))
+        root.rowconfigure(8, weight=2)
         f5.columnconfigure(0, weight=1)
         f5.rowconfigure(0, weight=1)
         mono = ("Consolas", 9) if IS_WIN else ("TkFixedFont", 9)
-        self.log = tk.Text(f5, height=8, wrap="word", font=mono, background="#1e1e1e", foreground="#e6e6e6")
+        self.log = tk.Text(f5, height=7, wrap="word", font=mono, background="#1e1e1e", foreground="#e6e6e6")
         self.log.grid(row=0, column=0, sticky="nsew")
         ls = ttk.Scrollbar(f5, orient="vertical", command=self.log.yview)
         ls.grid(row=0, column=1, sticky="ns")
@@ -203,12 +241,67 @@ class App(tk.Tk):
         self.log.tag_configure("ok", foreground="#7ee787")
 
         tools = ttk.Frame(root)
-        tools.grid(row=8, column=0, sticky="ew", pady=(6, 0))
+        tools.grid(row=9, column=0, sticky="ew", pady=(6, 0))
         ttk.Button(tools, text="설치 점검", command=self.check_env).pack(side="left")
         ttk.Button(tools, text="Tesseract(OCR) 설치", command=self.install_tesseract).pack(side="left", padx=6)
-        ttk.Button(tools, text="로그 폴더", command=lambda: open_path(config.LOG_DIR)).pack(side="left")
+        ttk.Button(tools, text="input\\pdf 폴더", command=lambda: open_path(config.INPUT_DIR)).pack(side="left")
+        ttk.Button(tools, text="로그 폴더", command=lambda: open_path(config.LOG_DIR)).pack(side="left", padx=6)
+        ttk.Button(tools, text="용어집 열기", command=self.open_glossary).pack(side="left")
+        if IS_WIN:
+            ttk.Button(tools, text="바탕화면 바로가기 만들기", command=self.make_shortcut).pack(side="right")
 
-    # ------------------------------------------------------------------ 파일 목록
+    # ================================================================== API 키
+    def paste_key(self):
+        try:
+            self.v_key.set(self.clipboard_get().strip())
+        except Exception:  # noqa: BLE001
+            messagebox.showinfo("붙여넣기", "클립보드가 비어 있습니다. 키를 복사한 뒤 다시 누르세요.")
+
+    def save_key(self):
+        key = self.v_key.get().strip().strip('"').strip("'")
+        if not key.startswith("sk-"):
+            messagebox.showwarning("API 키", "'sk-ant-' 로 시작하는 Claude API 키를 넣어 주세요.")
+            return
+        self.v_key.set(key)
+        self.verify_key_async(silent=False, save=True)
+
+    def verify_key_async(self, silent: bool, save: bool = False):
+        key = self.v_key.get().strip()
+        if not key:
+            self._set_keystate("API 키 없음 - 아래 칸에 입력 후 [저장]", False)
+            return
+        self._set_keystate("API 키 확인 중...", None)
+
+        def work():
+            ok, msg = True, ""
+            try:
+                import anthropic
+                anthropic.Anthropic(api_key=key, max_retries=1, timeout=20).models.list(limit=1)
+                msg = "API 키 확인됨"
+            except ImportError:
+                msg = "API 키 저장됨 (확인은 번역 시작 시)"
+            except Exception as e:  # noqa: BLE001
+                code = getattr(e, "status_code", None)
+                if code in (401, 403):
+                    ok, msg = False, "API 키가 올바르지 않습니다"
+                else:
+                    msg = f"API 키 저장됨 (연결 확인 불가: {type(e).__name__})"
+            self.q.put(("key", (ok, msg, save, silent)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _set_keystate(self, msg: str, ok):
+        self.v_keystate.set(msg)
+        self.lbl_keystate.configure(style="Hint.TLabel" if ok is None else ("Ok.TLabel" if ok else "Bad.TLabel"))
+
+    def _on_key_result(self, ok: bool, msg: str, save: bool, silent: bool):
+        if ok and save:
+            config.save_env("ANTHROPIC_API_KEY", self.v_key.get().strip())
+            msg = "✔ " + msg + " · 저장 완료"
+        self._set_keystate(msg if ok else "✘ " + msg, ok)
+        if not silent:
+            (messagebox.showinfo if ok else messagebox.showerror)("API 키", msg)
+
+    # ================================================================== 파일 목록
     def _add(self, p: str):
         p = str(Path(p))
         if Path(p).is_dir():
@@ -244,11 +337,12 @@ class App(tk.Tk):
         self.lst.delete(0, "end")
         self.files.clear()
 
-    # ------------------------------------------------------------------ 설정
+    # ================================================================== 설정
     def _load_settings(self):
         try:
             d = json.loads(SETTINGS.read_text(encoding="utf-8"))
-            self.v_model.set(d.get("model", config.DEFAULT_MODEL))
+            if d.get("model"):
+                self.v_model.set(model_label(d["model"]))
             self.v_scope.set(d.get("scope", True))
             self.v_ocr.set(d.get("ocr", True))
         except Exception:  # noqa: BLE001
@@ -257,64 +351,65 @@ class App(tk.Tk):
     def _save_settings(self):
         try:
             SETTINGS.parent.mkdir(parents=True, exist_ok=True)
-            SETTINGS.write_text(json.dumps({"model": self.v_model.get(), "scope": self.v_scope.get(),
-                                            "ocr": self.v_ocr.get()}, ensure_ascii=False), encoding="utf-8")
+            SETTINGS.write_text(json.dumps({"model": label_to_model(self.v_model.get()),
+                                            "scope": self.v_scope.get(), "ocr": self.v_ocr.get()},
+                                           ensure_ascii=False), encoding="utf-8")
         except Exception:  # noqa: BLE001
             pass
 
-    # ------------------------------------------------------------------ Ollama 상태
-    def check_ollama_async(self):
-        def work():
-            try:
-                from engines.ollama_manager import has_model, server_version, system_ram_gb
-                ver = server_version(config.OLLAMA_URL)
-                if not ver:
-                    msg, ok = "Ollama 꺼짐 (번역 시작 시 자동 실행/설치)", False
-                elif has_model(config.OLLAMA_URL, self.v_model.get()):
-                    msg, ok = f"Ollama {ver} 준비됨 · {self.v_model.get()} · RAM {system_ram_gb():.0f}GB", True
-                else:
-                    msg, ok = f"Ollama {ver} · {self.v_model.get()} 모델 없음 (시작 시 자동 다운로드)", False
-            except Exception as e:  # noqa: BLE001
-                msg, ok = f"Ollama 확인 실패: {e}", False
-            self.q.put(("ollama", (msg, ok)))
-        threading.Thread(target=work, daemon=True).start()
+    # ================================================================== 실행
+    def _base_args(self) -> list[str]:
+        a = [sys.executable, "-u", str(BASE_DIR / "main.py"), "--once", "--no-open",
+             "--model", label_to_model(self.v_model.get())]
+        if self.v_pages.get().strip():
+            a += ["--pages", self.v_pages.get().strip()]
+        if not self.v_scope.get():
+            a += ["--scope", "all"]
+        if not self.v_ocr.get():
+            a += ["--no-ocr"]
+        return a
 
-    # ------------------------------------------------------------------ 실행
     def start(self):
         if self.running:
+            return
+        if not self.v_key.get().strip():
+            messagebox.showwarning("API 키 필요", "위쪽 [API 키] 칸에 Claude API 키를 넣고 [저장]을 누르세요.")
+            self.ent_key.focus_set()
             return
         if not self.files:
             messagebox.showwarning("PDF 없음", "[PDF 추가]로 번역할 PDF를 선택하세요.")
             return
+        if not config.ENV_FILE.exists() or "ANTHROPIC_API_KEY" not in config.ENV_FILE.read_text(encoding="utf-8"):
+            config.save_env("ANTHROPIC_API_KEY", self.v_key.get().strip())
         self._save_settings()
-        args = [sys.executable, "-u", str(BASE_DIR / "main.py"), "--once", "--no-open",
-                "--model", self.v_model.get().strip() or config.DEFAULT_MODEL]
-        if self.v_pages.get().strip():
-            args += ["--pages", self.v_pages.get().strip()]
-        if self.v_force.get():
-            args += ["--force"]
-        if not self.v_scope.get():
-            args += ["--scope", "all"]
-        if not self.v_ocr.get():
-            args += ["--no-ocr"]
-        args += self.files
-        self._run(args, total_files=len(self.files))
+        args = self._base_args() + (["--force"] if self.v_force.get() else []) + self.files
+        self._run(args, "translate", total_files=len(self.files))
 
-    def _run(self, args: list[str], total_files: int = 0):
-        self.running, self.stopping = True, False
+    def estimate(self):
+        if self.running:
+            return
+        if not self.files:
+            messagebox.showwarning("PDF 없음", "[PDF 추가]로 PDF를 선택하세요.")
+            return
+        self._run(self._base_args() + ["--estimate"] + self.files, "estimate")
+
+    def _run(self, args: list[str], mode: str, total_files: int = 0):
+        self.running, self.stopping, self.mode = True, False, mode
         self.t0 = time.time()
         self.n_total = max(1, total_files)
         self.cur_idx = 0
         self.done_files = []
-        self.pb_all["value"] = 0
-        self.pb_cur["value"] = 0
+        self.usage = ""
+        for pb in (self.pb_all, self.pb_cur):
+            pb["value"] = 0
         self.v_all.set("")
         self.v_cur.set("")
-        self.btn_run.configure(state="disabled")
+        for b in (self.btn_run, self.btn_est):
+            b.configure(state="disabled")
         self.btn_stop.configure(state="normal")
         self._log_clear()
         env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1", PYTHONUNBUFFERED="1",
-                   OM_PACKAGES_INSTALLED="1")
+                   OM_PACKAGES_INSTALLED="1", ANTHROPIC_API_KEY=self.v_key.get().strip())
         threading.Thread(target=self._worker, args=(args, env), daemon=True).start()
 
     def _worker(self, args, env):
@@ -363,7 +458,7 @@ class App(tk.Tk):
                 pass
             self._log("중지했습니다. 번역된 문구는 저장되어 있어 다시 시작하면 이어서 진행합니다.", "err")
 
-    # ------------------------------------------------------------------ 진행 표시
+    # ================================================================== 진행 표시
     def _poll(self):
         try:
             while True:
@@ -372,17 +467,15 @@ class App(tk.Tk):
                     self._on_line(data)
                 elif kind == "progress":
                     self._on_progress(data)
-                elif kind == "ollama":
-                    msg, ok = data
-                    self.v_ollama.set(msg)
-                    self.lbl_ollama.configure(style="Ok.TLabel" if ok else "Bad.TLabel")
+                elif kind == "key":
+                    self._on_key_result(*data)
                 elif kind == "err":
                     self._log(data, "err")
                 elif kind == "done":
                     self._on_done(data)
         except queue.Empty:
             pass
-        if self.running:
+        if self.running and self.mode == "translate":
             el = int(time.time() - self.t0)
             self.v_all.set(f"{self.cur_idx}/{self.n_total} 파일 · 경과 {el // 3600}:{el % 3600 // 60:02d}:{el % 60:02d}")
         self.after(150, self._poll)
@@ -402,6 +495,9 @@ class App(tk.Tk):
             self.pb_all["value"] = self.cur_idx * 100 / self.n_total
         if s.startswith("→") and s.endswith(".pdf"):
             self.done_files.append(s[1:].strip())
+        mu = RE_USAGE.search(s)
+        if mu:
+            self.usage = f"입력 {mu.group(1)} / 출력 {mu.group(2)} 토큰"
         tag = "err" if (s.startswith(("!", "✘", "Traceback")) or "Error" in s) else ("ok" if s.startswith("✔") else "")
         self._log(line.rstrip(), tag)
 
@@ -420,24 +516,28 @@ class App(tk.Tk):
 
     def _on_done(self, rc: int):
         self.running = False
-        self.btn_run.configure(state="normal")
+        for b in (self.btn_run, self.btn_est):
+            b.configure(state="normal")
         self.btn_stop.configure(state="disabled")
         el = int(time.time() - self.t0)
-        self.check_ollama_async()
         if self.stopping:
             self.v_status.set("중지됨")
+            return
+        if self.mode != "translate":
+            self.v_status.set("완료" if rc == 0 else "오류 - 진행 기록을 확인하세요.")
             return
         if rc == 0:
             self.pb_all["value"] = 100
             self.pb_cur["value"] = 100
-            self.v_status.set(f"완료 ({el // 60}분 {el % 60}초) - [한국어 PDF 열기]로 결과를 확인하세요.")
+            extra = f" · API 사용량 {self.usage}" if self.usage else ""
+            self.v_status.set(f"완료 ({el // 60}분 {el % 60}초){extra}")
             self._log("✔ 모든 작업 완료", "ok")
-            if self.done_files:
-                if messagebox.askyesno("번역 완료", f"{len(self.done_files)}개 파일 번역이 끝났습니다.\n결과 폴더를 열까요?"):
-                    open_path(config.OUTPUT_DIR)
+            if self.done_files and messagebox.askyesno(
+                    "번역 완료", f"{len(self.done_files)}개 파일 번역이 끝났습니다.\n결과 폴더를 열까요?"):
+                open_path(config.OUTPUT_DIR)
         else:
             self.v_status.set("오류로 종료 - 진행 기록의 빨간 줄을 확인하세요.")
-            messagebox.showerror("오류", "번역 중 오류가 발생했습니다.\n진행 기록(빨간 줄) 또는 [로그 폴더]의 로그를 확인하세요.")
+            messagebox.showerror("오류", "번역 중 오류가 발생했습니다.\n진행 기록(빨간 줄)을 확인하세요.")
 
     def _log(self, text: str, tag: str = ""):
         self.log.configure(state="normal")
@@ -450,7 +550,7 @@ class App(tk.Tk):
         self.log.delete("1.0", "end")
         self.log.configure(state="disabled")
 
-    # ------------------------------------------------------------------ 결과 열기
+    # ================================================================== 결과 / 도구
     def _newest(self, pattern: str):
         fs = sorted(config.OUTPUT_DIR.glob(pattern), key=lambda p: p.stat().st_mtime)
         return fs[-1] if fs else None
@@ -463,14 +563,31 @@ class App(tk.Tk):
         f = self._newest(f"*{config.LOG_SUFFIX}.xlsx")
         open_path(f) if f else messagebox.showinfo("결과 없음", "아직 만들어진 번역 로그가 없습니다.")
 
-    # ------------------------------------------------------------------ 도구
+    def open_glossary(self):
+        p = config.glossary_path()
+        open_path(p) if p else messagebox.showinfo("용어집", "data\\glossary.csv 가 없습니다.")
+
+    def make_shortcut(self):
+        """바탕화면에 'OM 번역기' 바로가기 생성 (OM_Translator.pyw 실행)."""
+        target = BASE_DIR / "OM_Translator.pyw"
+        ps = ("$d=[Environment]::GetFolderPath('Desktop');"
+              "$s=(New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $d 'OM 번역기.lnk'));"
+              f"$s.TargetPath='{target}';$s.WorkingDirectory='{BASE_DIR}';"
+              "$s.IconLocation='shell32.dll,165';$s.Save()")
+        r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+                           capture_output=True, text=True, creationflags=NO_WINDOW)
+        if r.returncode == 0:
+            messagebox.showinfo("바로가기", "바탕화면에 'OM 번역기' 바로가기를 만들었습니다.")
+        else:
+            messagebox.showerror("바로가기", r.stderr or r.stdout or "생성 실패")
+
     def check_env(self):
         if not self.running:
-            self._run([sys.executable, "-u", str(BASE_DIR / "main.py"), "--check"])
+            self._run([sys.executable, "-u", str(BASE_DIR / "main.py"), "--check"], "check")
 
     def install_tesseract(self):
         if not self.running:
-            self._run([sys.executable, "-u", str(config.TOOLS_DIR / "install_tesseract.py")])
+            self._run([sys.executable, "-u", str(config.TOOLS_DIR / "install_tesseract.py")], "tools")
 
     def on_close(self):
         if self.running and not messagebox.askyesno("종료", "번역이 진행 중입니다. 중지하고 닫을까요?\n"

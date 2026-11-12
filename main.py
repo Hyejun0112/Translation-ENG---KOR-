@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-main.py - Plant O&M Translator v2.0
-===================================
-사용법 (일반 사용자): run.bat 더블클릭 → input\\pdf 폴더에 PDF 넣기 → output 폴더에 결과 생성
-          또는 PDF 파일(여러 개)/폴더를 run.bat 아이콘 위로 끌어다 놓기
+main.py - Plant O&M Translator v2.0 번역 파이프라인
+==================================================
+일반 사용자는 OM_Translator.pyw(프로그램 창)를 더블클릭해서 사용합니다.
+이 파일은 프로그램 창이 내부적으로 실행하며, 명령줄에서 직접 실행할 수도 있습니다.
 
 결과물 (output 폴더)
   원본파일명_KR_O&M.pdf              한국어 O&M 문서 (원본 레이아웃 그대로)
@@ -17,12 +17,10 @@ main.py - Plant O&M Translator v2.0
   python main.py --once             일괄 처리만 하고 종료
   python main.py --force            이미 번역된 파일도 다시 생성
   python main.py --pages 1-5        각 PDF의 일부 페이지만 (샘플 확인용, 결과는 해당 페이지만)
-  python main.py --mock             번역 없이 레이아웃만 테스트 (글자 앞에 [번역])
-  python main.py --check            설치 상태 점검 (Python 패키지 / Tesseract / Ollama / 모델 / RAM)
-  python main.py --model qwen2.5:7b 다른 Ollama 모델 사용
-  python main.py --estimate         번역 분량 추정만
-
-번역은 이 PC의 Ollama(Qwen2.5)로 실행되며 문서 내용이 외부로 전송되지 않습니다.
+  python main.py --mock             API 없이 레이아웃만 테스트 (글자 앞에 [번역])
+  python main.py --check            설치 상태 점검
+  python main.py --set-key          Claude API 키 다시 입력
+  python main.py --estimate         번역 분량/토큰 추정만
 """
 from __future__ import annotations
 
@@ -48,7 +46,7 @@ except Exception:  # noqa: BLE001
 # 0. 필요한 패키지 자동 설치 (표준 라이브러리만 사용하는 단계)
 # ============================================================================
 REQUIRED_MODULES = {
-    "pymupdf": "pymupdf", "pytesseract": "pytesseract",
+    "pymupdf": "pymupdf", "anthropic": "anthropic", "pytesseract": "pytesseract",
     "cv2": "opencv-python-headless", "numpy": "numpy", "PIL": "Pillow",
     "fontTools": "fonttools", "openpyxl": "openpyxl",
 }
@@ -83,6 +81,7 @@ import shutil  # noqa: E402
 import traceback  # noqa: E402
 from collections import Counter  # noqa: E402
 from types import SimpleNamespace  # noqa: E402
+from typing import Optional  # noqa: E402
 
 import config  # noqa: E402
 from config import Config  # noqa: E402
@@ -94,9 +93,8 @@ from engines.pdf_engine import (  # noqa: E402
     parse_pages, prepare_units, render_page, select_pages_safe, save_pdf_safe,
 )
 from engines.qa_engine import load_overrides, verify_output, write_glossary_xlsx, write_log_xlsx  # noqa: E402
-from engines.ollama_manager import ensure_ollama, status_lines  # noqa: E402
 from engines.translation_engine import (  # noqa: E402
-    Cache, MockBackend, OllamaBackend, file_sha, tm_get, tm_put, translate_texts,
+    AnthropicBackend, Cache, MockBackend, file_sha, tm_get, tm_put, translate_texts,
 )
 
 logging.getLogger("fontTools").setLevel(logging.ERROR)  # 폰트 서브셋 시 무해한 경고 숨김
@@ -162,8 +160,49 @@ def is_interactive() -> bool:
 
 
 # ============================================================================
-# 3. 첫 실행 설정: Tesseract (Ollama 는 engines/ollama_manager.py)
+# 3. 첫 실행 설정: API 키 / Tesseract
 # ============================================================================
+def validate_api_key(key: str) -> tuple[bool, str]:
+    """API 키 확인 (모델 목록 조회 - 번역 비용 없음)."""
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=key)
+        client.models.list(limit=1)
+        return True, ""
+    except Exception as e:  # noqa: BLE001
+        code = getattr(e, "status_code", None)
+        if code in (401, 403):
+            return False, "API 키가 올바르지 않거나 권한이 없습니다."
+        # 네트워크/프록시 문제 등은 키 자체의 문제로 단정하지 않음
+        return True, f"(키 확인 생략: {type(e).__name__})"
+
+
+def ensure_api_key(force_ask: bool = False) -> str:
+    key = "" if force_ask else config.get_api_key()
+    if key:
+        return key
+    if not is_interactive():
+        sys.exit("Claude API 키가 없습니다. 프로그램 창의 [API 키] 칸에 키를 넣고 [저장]을 누르세요.")
+    print("\n[첫 실행 설정] Claude API 키가 필요합니다.")
+    print("  발급: https://console.anthropic.com  →  API Keys  →  Create Key  (sk-ant- 로 시작)")
+    print("  키는 이 PC의 프로젝트 폴더 .env 파일에만 저장됩니다.\n")
+    for _ in range(3):
+        key = input("  API 키를 붙여넣고 Enter: ").strip().strip('"').strip("'")
+        if not key:
+            continue
+        if not key.startswith("sk-"):
+            print("  ! 'sk-' 로 시작하는 키를 넣어 주세요.")
+            continue
+        ok, msg = validate_api_key(key)
+        if not ok:
+            print(f"  ! {msg}")
+            continue
+        config.save_env("ANTHROPIC_API_KEY", key)
+        print(f"  ✔ 저장했습니다. {msg}\n")
+        return key
+    sys.exit("API 키 입력을 취소했습니다.")
+
+
 def ensure_tesseract(cfg: Config, ocr) -> object:
     """OCR 엔진 확인. 없으면 자동 설치를 제안(대화형일 때)."""
     if ocr is None or ocr.available:
@@ -200,12 +239,12 @@ def check_env() -> int:
         import pytesseract
         line(True, "Tesseract", f"{pytesseract.get_tesseract_version()} ({ocr.cmd})")
     else:
-        line(False, "Tesseract", (ocr.reason if ocr else "OCR 꺼짐") + "  → python tools\\install_tesseract.py")
+        line(False, "Tesseract", (ocr.reason if ocr else "OCR 꺼짐") + "  → 프로그램 창의 [Tesseract(OCR) 설치]")
     from engines.pdf_engine import find_font
     reg = find_font("", "regular")
     line(bool(reg), "한글 폰트", reg or "없음 (C:\\Windows\\Fonts\\malgun.ttf 필요)")
-    for ok, name, msg in status_lines(config.OLLAMA_URL, config.DEFAULT_MODEL):
-        line(ok, name, msg)
+    key = config.get_api_key()
+    line(bool(key), "Claude API 키", "설정됨 (.env)" if key else "미설정 → 프로그램 창에서 입력 후 [저장]")
     gp = config.glossary_path()
     line(gp is not None, "용어집", str(gp) if gp else "data\\glossary.csv 없음")
     print("\n모두 정상입니다." if ok_all else "\n'!!' 항목을 확인하세요.")
@@ -269,7 +308,7 @@ def process_pdf(src: Path, cfg: Config, backend, gloss: Glossary, protector: Pro
         toc_units.append(tu)
     all_units = units + toc_units
 
-    # 번역 메모리 먼저 (같은 문구는 다시 번역하지 않음)
+    # 번역 메모리 먼저 (같은 문구는 다시 API 호출하지 않음)
     use_tm = backend.name != "mock"
     from_tm = 0
     if use_tm:
@@ -283,7 +322,7 @@ def process_pdf(src: Path, cfg: Config, backend, gloss: Glossary, protector: Pro
     n_scope = sum(1 for ok, _ in scopes.values() if not ok)
     chars = sum(len(t) for t in pending)
     print(f"  페이지 {n_pages} ({describe_classes(classes)}) | 원문유지 페이지 {n_scope} | 텍스트블록 {len(units)}"
-          f" | 번역메모리 재사용 {from_tm} | 새로 번역 {len(pending)}문구 ({chars:,}자)")
+          f" | 번역메모리 재사용 {from_tm} | API 번역 {len(pending)}문구 ({chars:,}자)")
     res = translate_texts(pending, backend, gloss, cache, cfg, label=src.stem[:20]) if pending else {}
 
     for u in all_units:
@@ -414,7 +453,7 @@ def list_input_pdfs() -> list[Path]:
 
 
 def import_dropped(paths: list[str]) -> list[Path]:
-    """run.bat 위로 끌어다 놓은 PDF/폴더를 input\\pdf 로 복사."""
+    """명령줄로 받은 PDF/폴더를 input\\pdf 로 복사."""
     copied = []
     for a in paths:
         p = Path(a.strip('"'))
@@ -479,16 +518,12 @@ class Runner:
         if self.cfg.backend == "mock":
             self.backend = MockBackend()
         else:
-            model = ensure_ollama(config.OLLAMA_URL, self.cfg.model, config.FALLBACK_MODEL, is_interactive())
-            if not model:
-                sys.exit("Ollama 준비에 실패했습니다. 위 메시지를 확인하세요. (번역 없이 확인: run.bat --mock)")
-            self.cfg.model = model
-            self.backend = OllamaBackend(model, config.OLLAMA_URL, timeout=config.OLLAMA_TIMEOUT_SEC,
-                                         num_ctx=config.OLLAMA_NUM_CTX, temperature=config.OLLAMA_TEMPERATURE)
+            os.environ["ANTHROPIC_API_KEY"] = ensure_api_key()
+            self.backend = AnthropicBackend(self.cfg.model)
         self.ocr = ensure_tesseract(self.cfg, build_ocr_engine(self.cfg))
         ocr_desc = ("꺼짐" if self.ocr is None else
                     (f"사용 ({self.ocr.dpi}dpi)" if self.ocr.available else "사용 불가"))
-        print(f"  번역: {'레이아웃 테스트(mock)' if self.cfg.backend == 'mock' else 'Ollama ' + self.cfg.model + ' (로컬)'}"
+        print(f"  번역: {'레이아웃 테스트(mock)' if self.cfg.backend == 'mock' else 'Claude API ' + self.cfg.model}"
               f" | 용어집 {len(self.gloss.trans)}개(영어유지 {len(self.gloss.keep)}) | OCR {ocr_desc}"
               f" | 범위 {'O&M 대상만' if self.cfg.scope == 'om' else '전체'}")
         print("-" * 72)
@@ -530,15 +565,14 @@ class Runner:
                 print("    (원본 파일을 다시 저장하거나 교체하면 다시 시도합니다)")
         if n_ok:
             update_glossary_xlsx(self.gloss)
-            if isinstance(self.backend, OllamaBackend) and self.backend.calls:
-                print(f"  번역 처리량: 요청 {self.backend.calls}회, 출력 {self.backend.out_tokens:,} 토큰, "
-                      f"속도 {self.backend.tokens_per_sec():.1f} 토큰/초")
+            if self.backend is not None and getattr(self.backend, "in_tokens", 0):
+                print(f"  API 사용량 누적: 입력 {self.backend.in_tokens:,} / 출력 {self.backend.out_tokens:,} 토큰")
         return n_ok
 
-    def estimate(self):
+    def estimate(self, files: Optional[list[Path]] = None):
         tot_files = tot_chars = tot_items = 0
         uniq: dict[str, None] = {}
-        for src in list_input_pdfs():
+        for src in files or list_input_pdfs():
             doc = fitz.open(src)
             self.cfg.pages = parse_pages(self.args.pages, len(doc)) if self.args.pages else None
             self.cfg.ocr_mode = "off"
@@ -553,12 +587,11 @@ class Runner:
             tot_items += len(pend)
             doc.close()
         tot_chars = sum(len(t) for t in uniq)
-        out_tok = int(tot_chars / 1.8)
+        in_tok = int(tot_chars / 3.5 + len(uniq) * 12 + 1100 * max(1, len(uniq) // 40)) if uniq else 0
+        out_tok = int(tot_chars / 2.2)
         print(f"\n파일 {tot_files}개 | 번역 문구 {tot_items}개 (중복 제거 {len(uniq)}개, {tot_chars:,}자)")
-        print(f"예상 출력 약 {out_tok:,} 토큰 (스캔 페이지 OCR 분량 제외)")
-        for label, tps in (("GPU(12GB 이상)", 25.0), ("CPU만(16GB RAM)", 3.0)):
-            sec = out_tok / tps * 1.3
-            print(f"  예상 번역 시간 - {label}: 약 {int(sec // 3600)}시간 {int(sec % 3600 // 60)}분")
+        print(f"예상 API 사용량: 입력 약 {in_tok:,} 토큰 / 출력 약 {out_tok:,} 토큰 "
+              f"(스캔 페이지 OCR 분량은 제외)")
 
 
 def open_folder(p: Path):
@@ -570,17 +603,18 @@ def open_folder(p: Path):
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description=f"{config.APP_TITLE} - O&M Manual 영→한 PDF 번역 (Ollama 로컬)")
+    ap = argparse.ArgumentParser(description=f"{config.APP_TITLE} - O&M Manual 영→한 PDF 번역")
     ap.add_argument("paths", nargs="*", help="번역할 PDF 파일/폴더 (input\\pdf 로 복사 후 처리)")
     ap.add_argument("--once", action="store_true", help="일괄 처리 후 종료 (폴더 감시 안 함)")
     ap.add_argument("--watch", action="store_true", help="일괄 처리 후 input\\pdf 폴더 감시 (기본 동작)")
     ap.add_argument("--force", action="store_true", help="이미 번역된 파일도 다시 생성")
     ap.add_argument("--pages", help="일부 페이지만 처리 (예: 1-5,12)")
-    ap.add_argument("--mock", action="store_true", help="번역 없이 레이아웃 테스트")
-    ap.add_argument("--model", help="Ollama 모델 (기본: config.DEFAULT_MODEL = qwen2.5:14b)")
+    ap.add_argument("--mock", action="store_true", help="API 없이 레이아웃 테스트")
+    ap.add_argument("--model", help="Claude 모델 (기본: config.DEFAULT_MODEL)")
     ap.add_argument("--scope", choices=["om", "all"], help="om: O&M 대상만(기본) | all: 전부 번역")
     ap.add_argument("--no-ocr", action="store_true", help="OCR 사용 안 함")
     ap.add_argument("--check", action="store_true", help="설치 상태 점검")
+    ap.add_argument("--set-key", action="store_true", help="Claude API 키 다시 입력")
     ap.add_argument("--estimate", action="store_true", help="번역 분량/토큰 추정만")
     ap.add_argument("--no-open", action="store_true", help="완료 후 결과 폴더 열지 않기")
     args = ap.parse_args(argv)
@@ -592,13 +626,16 @@ def main(argv=None) -> int:
 
     if args.check:
         return check_env()
-
-    runner = Runner(args)
-    if args.estimate:
-        runner.estimate()
+    if args.set_key:
+        ensure_api_key(force_ask=True)
         return 0
 
+    runner = Runner(args)
     dropped = import_dropped(args.paths) if args.paths else []
+    if args.estimate:
+        runner.estimate(dropped or None)
+        return 0
+
     runner.prepare()
 
     files = dropped or list_input_pdfs()

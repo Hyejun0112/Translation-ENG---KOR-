@@ -4,11 +4,12 @@ config.py - Plant O&M Translator v2.0 설정
 ==========================================
 대부분의 사용자는 이 파일을 고칠 필요가 없습니다.
 바꿀 수 있는 주요 항목:
-  - DEFAULT_MODEL      : 번역에 사용할 Ollama 모델 (기본 qwen2.5:14b, PC가 느리면 qwen2.5:7b)
+  - DEFAULT_MODEL      : 번역에 사용할 Claude 모델
   - TRANSLATE_SCOPE    : "om"(O&M 대상만 번역, 도면/데이터시트 원문 유지) 또는 "all"
   - OCR_*              : 스캔 PDF 인식 설정
   - WATCH_INTERVAL_SEC : input\\pdf 폴더 확인 주기(초)
-번역은 이 PC의 Ollama 로 실행되며 문서 내용이 외부로 전송되지 않습니다.
+API 키는 이 파일이 아니라 프로젝트 폴더의 .env 파일에 저장됩니다(프로그램 창에서 입력 → [저장]).
+.env 는 .gitignore 에 들어 있어 GitHub 에 올라가지 않습니다. API 키를 코드에 직접 쓰지 마세요.
 """
 from __future__ import annotations
 
@@ -65,17 +66,18 @@ load_env()  # 아래 설정들이 .env 값을 쓰도록 먼저 읽는다
 
 
 # ----------------------------------------------------------------------------
-# 번역 (Ollama 로컬 LLM - 인터넷 전송 없음, 무료)
+# 번역 (Claude API)
 # ----------------------------------------------------------------------------
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
-DEFAULT_MODEL = os.environ.get("OM_MODEL", "qwen2.5:14b")   # 권장: RAM 16GB 이상 또는 GPU 12GB 이상
-FALLBACK_MODEL = "qwen2.5:7b"   # RAM 이 부족할 때 제안하는 작은 모델 (약 5GB)
-OLLAMA_TIMEOUT_SEC = 1800       # 한 묶음 번역 최대 대기 시간 (CPU 번역은 느림)
-OLLAMA_NUM_CTX = 8192           # 모델 문맥 길이
-OLLAMA_TEMPERATURE = 0.1        # 낮을수록 일관된 번역
-API_WORKERS = 1                 # 동시 요청 수 (로컬 PC는 1이 가장 빠름)
-MAX_CHUNK_CHARS = 1500          # 한 번에 보내는 최대 글자 수 (로컬 모델은 작게 나눌수록 정확)
-MAX_CHUNK_ITEMS = 12            # 한 번에 보내는 최대 문구 수
+DEFAULT_MODEL = os.environ.get("OM_MODEL", "claude-sonnet-5-5")
+# 프로그램 창에서 고를 수 있는 모델: (모델 ID, 설명)
+MODEL_CHOICES = [
+    ("claude-sonnet-5-5", "Sonnet - 품질/비용 균형 (권장)"),
+    ("claude-haiku-5-5", "Haiku - 빠르고 저렴"),
+    ("claude-opus-5-5", "Opus - 최고 품질, 비용 높음"),
+]
+API_WORKERS = 4                 # 동시 API 호출 수 (속도 제한 오류가 나면 2로)
+MAX_CHUNK_CHARS = 4500          # 한 번 호출에 보내는 최대 글자 수
+MAX_CHUNK_ITEMS = 40            # 한 번 호출에 보내는 최대 문구 수
 TONE = "formal"                 # formal: ~합니다/~하십시오 | concise: 개조식
 
 # ----------------------------------------------------------------------------
@@ -109,7 +111,7 @@ MOVE_DONE_INPUTS = False        # True면 처리한 원본을 input\pdf\_done �
 @dataclass
 class Config:
     """한 번의 실행에 쓰는 설정 묶음 (엔진들이 공통으로 사용)."""
-    backend: str = "ollama"             # ollama | mock(레이아웃 테스트)
+    backend: str = "anthropic"          # anthropic | mock(레이아웃 테스트)
     model: str = DEFAULT_MODEL
     tone: str = TONE
     workers: int = API_WORKERS
@@ -135,7 +137,7 @@ class Config:
 
 
 # ----------------------------------------------------------------------------
-# .env (선택: OLLAMA_URL, OM_MODEL 등 환경별 설정)
+# .env (API 키 저장)
 # ----------------------------------------------------------------------------
 def save_env(key: str, value: str) -> None:
     """.env 에 KEY=VALUE 를 저장(있으면 교체)."""
@@ -146,6 +148,11 @@ def save_env(key: str, value: str) -> None:
     lines.append(f"{key}={value}")
     ENV_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
     os.environ[key] = value
+
+
+def get_api_key() -> str:
+    load_env()
+    return os.environ.get("ANTHROPIC_API_KEY", "").strip()
 
 
 def glossary_path() -> Optional[Path]:

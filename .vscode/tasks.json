@@ -2,10 +2,10 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "Plant O&M Translator 실행 (run.bat)",
+      "label": "OM 번역기 실행 (OM_Translator.pyw)",
       "type": "shell",
-      "windows": { "command": ".\\run.bat" },
-      "command": "./.venv/bin/python main.py",
+      "windows": { "command": "start '' '.\\OM_Translator.pyw'" },
+      "command": "python3 OM_Translator.pyw",
       "problemMatcher": []
     }
   ]

@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-translation_engine.py - 로컬 LLM(Ollama + Qwen2.5) 번역 / 번역 메모리
-=====================================================================
-- OllamaBackend   : 이 PC에서 실행 중인 Ollama(http://127.0.0.1:11434)에 번역 요청.
-                    인터넷/외부 전송 없음. JSON 형식 강제, 재시도, 처리 속도 집계
+translation_engine.py - Claude API 번역 / 번역 메모리
+=====================================================
+- AnthropicBackend: Claude API 호출 (JSON 입출력, 재시도, 사용량 집계, 오류 메시지 한글 안내)
 - MockBackend     : 번역 없이 '[번역]' 접두만 붙이는 레이아웃 테스트용
 - Cache           : SQLite 번역 메모리 + OCR 결과 캐시 (재실행/중단 후 재개 시 다시 번역하지 않음)
 - translate_texts : 중복 제거된 문구를 묶음으로 나눠 번역, 보호 토큰 불일치 시 개별 재시도,
@@ -13,13 +12,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
@@ -92,92 +90,60 @@ class MockBackend:
         return {i: "[번역] " + t for i, t in items}
 
 
-class OllamaBackend:
-    """Ollama 로컬 서버의 /api/chat 사용. 표준 라이브러리(urllib)만 사용."""
-    name = "ollama"
+class AnthropicBackend:
+    name = "anthropic"
 
-    def __init__(self, model: str, url: str, timeout: int = 900, num_ctx: int = 8192,
-                 temperature: float = 0.1):
+    def __init__(self, model: str, client=None, api_key: Optional[str] = None):
         self.model = model
-        self.url = url.rstrip("/")
-        self.timeout = timeout
-        self.num_ctx = num_ctx
-        self.temperature = temperature
+        if client is None:
+            try:
+                import anthropic
+            except ImportError:
+                sys.exit("'pip install anthropic' 이 필요합니다.")
+            key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+            if not key:
+                sys.exit("Claude API 키가 없습니다. 프로그램 창의 [API 키] 칸에 키를 넣고 [저장]을 누르세요.")
+            client = anthropic.Anthropic(api_key=key, max_retries=3)
+        self.client = client
         self.lock = threading.Lock()
         self.in_tokens = 0
         self.out_tokens = 0
-        self.gen_seconds = 0.0
-        self.calls = 0
-
-    def _post(self, path: str, payload: dict) -> dict:
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(self.url + path, data=data,
-                                     headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=self.timeout) as r:
-            return json.loads(r.read().decode("utf-8"))
-
-    @staticmethod
-    def _parse(content: str) -> dict[str, str]:
-        data = parse_json_loose(content)
-        tr = data.get("translations", data) if isinstance(data, dict) else data
-        out: dict[str, str] = {}
-        if isinstance(tr, dict):
-            if "id" in tr and "ko" in tr:
-                out[str(tr["id"])] = str(tr["ko"])
-            else:
-                out = {str(k): str(v) for k, v in tr.items() if isinstance(v, str)}
-        elif isinstance(tr, list):
-            for x in tr:
-                if isinstance(x, dict) and "id" in x and "ko" in x:
-                    out[str(x["id"])] = str(x["ko"])
-        return out
-
-    def tokens_per_sec(self) -> float:
-        return self.out_tokens / self.gen_seconds if self.gen_seconds > 0 else 0.0
 
     def translate(self, items, glossary_entries, tone):
         gl = "\n".join(
-            f"- {en} => {ko}" + (f"   ({note})" if note else "") for en, ko, note in glossary_entries
+            f"{en} => {ko}" + (f"   ({note})" if note else "") for en, ko, note in glossary_entries
         ) or "(none)"
         payload = json.dumps([{"id": i, "text": t} for i, t in items], ensure_ascii=False)
-        user = (f"Glossary (must use these Korean terms):\n{gl}\n\n"
-                f"Items to translate ({len(items)} items, JSON):\n{payload}\n\n"
-                f"Return ONLY this JSON with exactly {len(items)} entries and the same ids:\n"
-                f'{{"translations":[{{"id":"<id>","ko":"<Korean>"}}]}}')
+        user = f"<glossary>\n{gl}\n</glossary>\n<items>\n{payload}\n</items>\nReturn the JSON only."
         system = SYSTEM_PROMPT.format(tone=TONES[tone])
-        src_chars = sum(len(t) for _, t in items)
-        body = {
-            "model": self.model, "stream": False, "format": "json", "keep_alive": "30m",
-            "options": {"temperature": self.temperature, "num_ctx": self.num_ctx,
-                        "num_predict": max(512, int(src_chars * 2.5) + 300)},
-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        }
-        last: Exception | None = None
-        for attempt in range(4):
+        last = None
+        for attempt in range(6):
             try:
-                resp = self._post("/api/chat", body)
+                resp = self.client.messages.create(
+                    model=self.model, max_tokens=8000, system=system,
+                    messages=[{"role": "user", "content": user}],
+                )
                 with self.lock:
-                    self.calls += 1
-                    self.in_tokens += int(resp.get("prompt_eval_count") or 0)
-                    self.out_tokens += int(resp.get("eval_count") or 0)
-                    self.gen_seconds += float(resp.get("eval_duration") or 0) / 1e9
-                out = self._parse(resp.get("message", {}).get("content", ""))
-                if out:
-                    return out
-                last = ValueError("빈 번역 결과")
-            except urllib.error.HTTPError as e:
-                detail = e.read().decode("utf-8", "replace")[:300]
-                if e.code == 404:
-                    raise RuntimeError(f"Ollama 모델 '{self.model}' 이(가) 없습니다. "
-                                       f"run.bat 을 다시 실행하면 자동으로 받습니다. ({detail})") from e
-                last = RuntimeError(f"HTTP {e.code}: {detail}")
-            except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
-                last = RuntimeError(f"Ollama 서버 연결 실패({e}). Ollama 가 실행 중인지 확인하세요.")
-            except (ValueError, KeyError, TypeError) as e:
-                last = e  # JSON 형식 오류 → 온도를 조금 올려 재시도
-                body["options"]["temperature"] = min(0.5, self.temperature + 0.15 * (attempt + 1))
-            time.sleep(min(20, 2 ** attempt))
-        raise RuntimeError(f"Ollama 번역 실패: {last}")
+                    self.in_tokens += getattr(resp.usage, "input_tokens", 0)
+                    self.out_tokens += getattr(resp.usage, "output_tokens", 0)
+                text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+                data = parse_json_loose(text)
+                return {str(x["id"]): x["ko"] for x in data["translations"]}
+            except Exception as e:  # noqa: BLE001
+                last = e
+                code = getattr(e, "status_code", None)
+                if code == 401:
+                    raise RuntimeError("API 키가 올바르지 않습니다 (401). 프로그램 창에서 키를 다시 저장하세요.") from e
+                if code == 403:
+                    raise RuntimeError("API 키에 권한이 없습니다 (403). console.anthropic.com 에서 확인하세요.") from e
+                if code == 404:
+                    raise RuntimeError(f"모델 '{self.model}' 을(를) 찾을 수 없습니다 (404).") from e
+                if code == 400 and "credit" in str(e).lower():
+                    raise RuntimeError("API 크레딧(잔액)이 부족합니다. console.anthropic.com → Billing 에서 충전하세요.") from e
+                if code == 400:
+                    raise
+                time.sleep(min(60, 2 ** attempt))
+        raise RuntimeError(f"API 호출 실패: {last}")
 
 
 class Cache:
