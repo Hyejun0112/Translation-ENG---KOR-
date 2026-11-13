@@ -182,12 +182,20 @@ class App(tk.Tk):
         self.v_force = tk.BooleanVar(value=False)
         self.v_scope = tk.BooleanVar(value=True)
         self.v_ocr = tk.BooleanVar(value=True)
+        self.v_scale = tk.StringVar(value=f"{round(config.TEXT_SCALE * 100)}%")
         ttk.Label(f2, text="모델").grid(row=0, column=0, sticky="w")
         ttk.Combobox(f2, textvariable=self.v_model, state="readonly", width=40,
                      values=[model_label(m) for m, _ in config.MODEL_CHOICES]).grid(row=0, column=1, sticky="w", padx=6)
         ttk.Label(f2, text="페이지").grid(row=0, column=2, sticky="e", padx=(16, 0))
         ttk.Entry(f2, textvariable=self.v_pages, width=12).grid(row=0, column=3, sticky="w", padx=6)
         ttk.Label(f2, text="비우면 전체 (예: 1-5)", style="Hint.TLabel").grid(row=0, column=4, sticky="w")
+        ttk.Label(f2, text="번역 글자 크기").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        cb = ttk.Combobox(f2, textvariable=self.v_scale, state="readonly", width=8,
+                          values=["100%", "95%", "92%", "90%", "88%", "85%", "80%"])
+        cb.grid(row=2, column=1, sticky="w", padx=6, pady=(6, 0))
+        cb.bind("<<ComboboxSelected>>", lambda e: config.save_env("OM_TEXT_SCALE", f"{self._scale() / 100:.2f}"))
+        ttk.Label(f2, text="원문 대비 (작을수록 겹침↓, 기본 92%) · 바꾼 뒤엔 '다시 만들기' 체크",
+                  style="Hint.TLabel").grid(row=2, column=2, columnspan=3, sticky="w", pady=(6, 0))
         o = ttk.Frame(f2)
         o.grid(row=1, column=0, columnspan=5, sticky="w", pady=(6, 0))
         ttk.Checkbutton(o, text="O&M 대상만 번역 (도면·데이터시트·부품목록·표 Tag/Value 열은 원문 유지)",
@@ -369,7 +377,14 @@ class App(tk.Tk):
             a += ["--scope", "all"]
         if not self.v_ocr.get():
             a += ["--no-ocr"]
+        a += ["--text-scale", str(self._scale())]
         return a
+
+    def _scale(self) -> int:
+        try:
+            return int(self.v_scale.get().rstrip("%"))
+        except ValueError:
+            return 92
 
     def start(self):
         if self.running:

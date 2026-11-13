@@ -505,6 +505,8 @@ class Runner:
             self.cfg.ocr_mode = "off"
         if args.scope:
             self.cfg.scope = args.scope
+        if args.text_scale:
+            self.cfg.text_scale = min(100, max(60, args.text_scale)) / 100.0
         self.cfg.force = args.force
         self.gloss = Glossary.load(str(config.glossary_path()) if config.glossary_path() else None)
         self.protector = Protector(load_keep_patterns(str(config.KEEP_PATTERNS_FILE)
@@ -639,6 +641,7 @@ def main(argv=None) -> int:
     ap.add_argument("--model", help="Claude 모델 (기본: config.DEFAULT_MODEL)")
     ap.add_argument("--scope", choices=["om", "all"], help="om: O&M 대상만(기본) | all: 전부 번역")
     ap.add_argument("--no-ocr", action="store_true", help="OCR 사용 안 함")
+    ap.add_argument("--text-scale", type=int, help="번역 글자 크기 %% (원문 대비, 60~100, 기본 92)")
     ap.add_argument("--check", action="store_true", help="설치 상태 점검")
     ap.add_argument("--set-key", action="store_true", help="Claude API 키 다시 입력")
     ap.add_argument("--estimate", action="store_true", help="번역 분량/토큰 추정만")

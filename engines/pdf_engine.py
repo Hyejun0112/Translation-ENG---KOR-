@@ -872,8 +872,10 @@ def render_page(page, units: list[Unit], fonts, cfg: Config):
             # 그림 속 라벨: 래스터 그림의 선/기호를 덮지 않도록 원래 자리에서 거의 넓히지 않고 축소로 맞춘다
             box_w = min(box_w, u.rect.width * 1.12 + 2)
             bottom = u.rect.y1 + 0.15 * u.size
+        # 번역 글자 크기: 원문 크기 × 설정 비율(기본 92%)에서 시작해 필요하면 더 줄인다
+        base = max(3.5, u.size * getattr(cfg, "text_scale", 1.0))
         size, lines, ok, _w = fit_text(u.ko, font, u.rect.width, u.rect.height, box_w,
-                                       bottom - u.rect.y0, u.size, cfg)
+                                       bottom - u.rect.y0, base, cfg)
         u.used_size = size
         if not ok:
             u.notes.append("OVERFLOW(박스 초과, 글자 축소 한계)")

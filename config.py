@@ -87,6 +87,12 @@ TRANSLATE_SCOPE = "om"          # om: 도면·데이터시트·부품목록·표
 TRANSLATE_FIGURE_TEXT = False   # 그림(래스터 이미지) 속 글자까지 번역 (도면 내부 문자는 원문 유지 원칙)
 MIN_FONT_SCALE = 0.6            # 한글이 길 때 글자 축소 하한 (원래 크기 대비)
 MIN_FONT_SIZE = 5.0             # 글자 크기 하한 (pt)
+# 번역 글자 크기 = 원문 글자 크기 × 이 비율 (한글이 영어보다 커 보이고 길어지므로 기본 92%)
+# GUI [번역 글자 크기]에서 바꾸면 .env 의 OM_TEXT_SCALE 로 저장됨
+try:
+    TEXT_SCALE = min(1.0, max(0.6, float(os.environ.get("OM_TEXT_SCALE", "0.92"))))
+except ValueError:
+    TEXT_SCALE = 0.92
 
 # ----------------------------------------------------------------------------
 # OCR (스캔 PDF / 글자깨짐 페이지)
@@ -119,6 +125,7 @@ class Config:
     max_chunk_items: int = MAX_CHUNK_ITEMS
     min_scale: float = MIN_FONT_SCALE
     min_size: float = MIN_FONT_SIZE
+    text_scale: float = TEXT_SCALE
     ocr_mode: str = OCR_MODE
     ocr_figures: bool = TRANSLATE_FIGURE_TEXT
     ocr_workers: int = OCR_WORKERS
