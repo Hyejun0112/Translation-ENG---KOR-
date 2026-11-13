@@ -75,6 +75,7 @@ class Unit:
     last_x1: float = 0.0     # 마지막 줄의 오른쪽 끝 (문단 이어짐 판단용)
     leader: bool = False     # 목차 줄: 제목 뒤 점선(......)을 번역 후 다시 채움
     leader_num: str = ""     # 점선 뒤 쪽번호가 같은 글자 상자에 있으면 보관
+    bullet: bool = False     # 글머리표/번호로 시작하는 항목 (앞 문구와 합치지 않음)
 
 
 PUNCT = set("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
@@ -118,14 +119,25 @@ def classify_page(page) -> str:
     return "native"
 
 
-def split_line_segments(ln: dict) -> list[dict]:
-    """한 줄 안에서 열 간격이 크게 벌어진 텍스트(표의 셀 등)를 별도 세그먼트로 분리."""
+# 글머리표/번호 기호만 있는 조각: "–", "•", "1.", "a)", "1.2.3"
+MARKER_RE = re.compile(r"^(?:[•●▪■◦○‣·*\-–—►▶➢✓□❑o]|\(?\d{1,3}[.)]|\(?[a-zA-Z][.)]|\d{1,2}(?:\.\d{1,2}){0,3}\.?)$")
+
+
+def split_line_segments(ln: dict, vedges: Optional[list] = None) -> list[dict]:
+    """한 줄 안에서 열 간격이 크게 벌어진 텍스트(표의 셀 등)를 별도 세그먼트로 분리.
+    - 세로 괘선을 사이에 둔 글자도 분리 (괘선 표인데 표 인식이 안 된 경우: 개정 이력 표 등)
+    - 맨 앞이 글머리표/번호 기호만이면 기호는 원문 그대로 두고(번역 단위에서 제외),
+      다음 조각에 '_marker' 표시 → 표로 오인하지 않고 항목 시작으로 처리"""
     spans = [s for s in ln["spans"] if s["text"].strip()]
+    y0, y1 = ln["bbox"][1], ln["bbox"][3]
+    walls = [x for x, a, b in (vedges or []) if a <= y0 + 1 and b >= y1 - 1]
     segs, cur = [], []
     for s in spans:
         if cur:
-            gap = s["bbox"][0] - cur[-1]["bbox"][2]
-            if gap > max(6.0, 0.8 * max(s["size"], 1.0)):
+            px, nx = cur[-1]["bbox"][2], s["bbox"][0]
+            gap = nx - px
+            wall = any(px - 0.5 <= x <= nx + 0.5 for x in walls)
+            if wall or gap > max(6.0, 0.8 * max(s["size"], 1.0)):
                 segs.append(cur)
                 cur = []
         cur.append(s)
@@ -139,6 +151,9 @@ def split_line_segments(ln: dict) -> list[dict]:
         text = "".join(s["text"] for s in sg).strip()
         if text:
             out.append({"bbox": tuple(r), "spans": sg, "dir": ln["dir"], "_text": text})
+    if len(out) >= 2 and MARKER_RE.match(out[0]["_text"]):
+        out = out[1:]
+        out[0]["_marker"] = True
     return out
 
 
@@ -177,7 +192,8 @@ def _group_to_unit(page, g: list[dict], cell=None) -> Optional[Unit]:
             align = "right"  # 오른쪽 정렬은 숫자 위주 칸만 (글자 칸은 왼쪽 정렬로 둔다)
     return Unit(page=page.number, idx=0, rect=rect, text=text, size=size, color=color,
                 bold=bold, origin_y=first["origin"][1], align=align, rotated=rotated,
-                cell=fitz.Rect(cell) if cell is not None else None, last_x1=g[-1]["bbox"][2])
+                cell=fitz.Rect(cell) if cell is not None else None, last_x1=g[-1]["bbox"][2],
+                bullet=bool(g[0].get("_marker") or BULLET_RE.match(text)))
 
 
 # 목차 점선: "Purpose of the manual ........" / "Title . . . . ." / "Title ……"
@@ -185,7 +201,19 @@ LEADER_RE = re.compile(r"^(.*?[^.\s·…])\s*(?:[.·…]\s*){4,}(\d{1,4})?\s*$")
 NUMBERING_RE = re.compile(r"^\s*(?:\d+(?:\.\d+)*\.?|[A-Z]\.|\(?[a-z]\))\s+\S")
 
 
-def merge_paragraphs(units: list[Unit]) -> list[Unit]:
+def _rule_between(a, b, hedges) -> bool:
+    """a(위)와 b(아래) 사이에 가로 괘선(표의 행 경계 등)이 있는지"""
+    lo, hi = min(a.y1, b.y0) - 1.0, max(a.y1, b.y0) + 1.0
+    x0, x1 = max(a.x0, b.x0), min(a.x1, b.x1)
+    if x1 <= x0:
+        x0, x1 = min(a.x0, b.x0), max(a.x1, b.x1)
+    for y, xa, xb in hedges or []:
+        if lo <= y <= hi and xa < x1 and xb > x0:
+            return True
+    return False
+
+
+def merge_paragraphs(units: list[Unit], hedges: Optional[list] = None) -> list[Unit]:
     """줄마다 따로 저장된 문단을 하나의 번역 단위로 합친다.
     (같은 글꼴/크기, 바로 아래 줄, 같은 왼쪽 시작점, 앞 줄이 꽉 찬 경우만. 글머리표/번호/목차 줄은 합치지 않음)"""
     out: list[Unit] = []
@@ -193,6 +221,7 @@ def merge_paragraphs(units: list[Unit]) -> list[Unit]:
         target = None
         if (b.kind == "text" and b.cell is None and not b.rotated and b.source in ("native", "native-ocr")
                 and re.search(r"[A-Za-z]{2,}", b.text)
+                and not b.bullet
                 and not BULLET_RE.match(b.text) and not NUMBERING_RE.match(b.text) and not LEADER_RE.match(b.text)):
             for a in reversed(out[-8:]):
                 if (a.cell is not None or a.rotated or a.source not in ("native", "native-ocr") or a.kind != "text"
@@ -205,7 +234,7 @@ def merge_paragraphs(units: list[Unit]) -> list[Unit]:
                 if abs(a.size - b.size) > 0.6 or a.bold != b.bold or a.color != b.color:
                     continue
                 dx = b.rect.x0 - a.rect.x0
-                hanging = bool(BULLET_RE.match(a.text) or NUMBERING_RE.match(a.text))
+                hanging = bool(a.bullet or BULLET_RE.match(a.text) or NUMBERING_RE.match(a.text))
                 # 같은 왼쪽 시작점, 또는 글머리표/번호 문단의 들여쓴 다음 줄
                 if not (abs(dx) <= 0.6 * size or (hanging and 0 < dx <= 4.0 * size)):
                     continue
@@ -213,6 +242,8 @@ def merge_paragraphs(units: list[Unit]) -> list[Unit]:
                     continue
                 if a.last_x1 < max(a.rect.x1, b.rect.x1) - 3.0 * size:
                     continue  # 앞 줄이 짧게 끝남 = 문단 끝
+                if _rule_between(a.rect, b.rect, hedges):
+                    continue  # 표의 행 경계선을 넘어 합치지 않음
                 target = a
                 break
         if target is None:
@@ -233,6 +264,7 @@ def extract_units(page, table_cells: Optional[list] = None) -> list[Unit]:
     """네이티브(텍스트 레이어가 있는) 페이지에서 번역 단위를 추출."""
     d = page.get_text("dict", flags=TEXT_FLAGS)
     cells = find_table_cells(page) if table_cells is None else table_cells
+    vedges, hedges = page_edges(page)
     units: list[Unit] = []
     seen = set()
     cell_lines: dict[int, list[dict]] = {}
@@ -247,16 +279,45 @@ def extract_units(page, table_cells: Optional[list] = None) -> list[Unit]:
         u.idx = len(units)
         units.append(u)
 
+    # 1차: 블록별 줄 조각
+    blocks = []
     for b in d.get("blocks", []):
         if b.get("type") != 0:
             continue
         seg_lines: list[dict] = []
         tabular = False
         for ln in b.get("lines", []):
-            segs = split_line_segments(ln)
+            segs = split_line_segments(ln, vedges)
             if len(segs) > 1:
                 tabular = True
             seg_lines += segs
+        blocks.append([seg_lines, tabular])
+    # 2차: 글머리표 기호가 따로 떨어진 줄("–" 혼자)이면 같은 높이 오른쪽 글자에 '항목 시작' 표시 후 기호는 원문 유지
+    allsegs = [sl for bl in blocks for sl in bl[0]]
+    drop = set()
+    for m in allsegs:
+        if not MARKER_RE.match(m["_text"]):
+            continue
+        mb = m["bbox"]
+        mh = max(mb[3] - mb[1], 1.0)
+        best = None
+        for t in allsegs:
+            if t is m or MARKER_RE.match(t["_text"]):
+                continue
+            tb = t["bbox"]
+            ov = min(mb[3], tb[3]) - max(mb[1], tb[1])
+            if ov < 0.5 * min(mh, tb[3] - tb[1]) or tb[0] < mb[2] - 0.5 or tb[0] - mb[2] > 45:
+                continue
+            if best is None or tb[0] < best["bbox"][0]:
+                best = t
+        if best is not None:
+            best["_marker"] = True
+            drop.add(id(m))
+    for bl in blocks:
+        seg_lines, tabular = bl
+        seg_lines = [sl for sl in seg_lines if id(sl) not in drop]
+        if not seg_lines:
+            continue
         # 괘선 표 셀 안에 있는 줄은 셀 단위로 따로 모은다
         rest = []
         for sl in seg_lines:
@@ -277,11 +338,12 @@ def extract_units(page, table_cells: Optional[list] = None) -> list[Unit]:
         if not tabular:
             tabular = is_tabular(rest)
         if tabular:
-            groups = column_merge(rest)
+            groups = column_merge(rest, hedges)
         else:
             groups, cur = [], []
             for ln in rest:
-                if cur and BULLET_RE.match(ln["_text"]):
+                if cur and (ln.get("_marker") or BULLET_RE.match(ln["_text"])
+                            or _rule_between(fitz.Rect(cur[-1]["bbox"]), fitz.Rect(ln["bbox"]), hedges)):
                     groups.append(cur)
                     cur = []
                 cur.append(ln)
@@ -591,9 +653,12 @@ def wrap_text(text: str, font, size: float, width: float) -> list[str]:
 
 def _shrink_fit(text, font, width, height, start, lo, tol=0.35):
     size = start
+    words = [w for w in text.split() if w]
     while True:
         lines = wrap_text(text, font, size, width)
         ok = len(lines) * size * LINE_H <= height + size * tol
+        if ok and words:  # 단어가 글자 단위로 쪼개지면(예: '개/정') 더 줄여 본다
+            ok = max(font.text_length(w, fontsize=size) for w in words) <= width + 0.5
         if ok or size <= lo + 1e-6:
             return size, lines, ok
         size = max(lo, size - 0.25)
@@ -767,6 +832,7 @@ def _conflicts(u: Unit, placed: list, size: float, font, others: list[Unit]) -> 
     for o in others:
         oi = _ink(o)
         allow = (mine & oi).height if not (mine & oi).is_empty else 0.0
+        allow = min(allow, 0.35 * max(min(u.size, o.size), 1.0))
         for bx in boxes:
             it = bx & oi
             if not it.is_empty and it.width > 2.0 and it.height > allow + 0.3:
@@ -774,8 +840,14 @@ def _conflicts(u: Unit, placed: list, size: float, font, others: list[Unit]) -> 
     return False
 
 
+def _same_as_source(u: Unit) -> bool:
+    norm = lambda t: re.sub(r"\s+", "", t or "")  # noqa: E731
+    return norm(u.ko) == norm(u.text)
+
+
 def render_page(page, units: list[Unit], fonts, cfg: Config):
-    todo = [u for u in units if u.ko]
+    # 번역해도 원문과 같은 문구(사람 이름·날짜·코드 등)는 지우고 다시 쓰지 않고 원본 글꼴 그대로 둔다
+    todo = [u for u in units if u.ko and not _same_as_source(u)]
     if not todo:
         return
     vedges, hedges = page_edges(page)  # 리댁션 전에 계산(원본 도형 기준)
@@ -1003,7 +1075,7 @@ def prepare_units(doc, cfg: Config, protector: Protector, overrides: dict[str, s
     all_units: list[Unit] = []
     for pno in pages:
         us = [u for u in per_page.get(pno, []) if u.text]
-        us = merge_paragraphs(us)
+        us = merge_paragraphs(us, page_edges(doc[pno])[1])
         per_page[pno] = us
         if pno not in scopes:
             if cfg.scope == "om":

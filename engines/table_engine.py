@@ -40,8 +40,15 @@ def is_tabular(lines: list[dict]) -> bool:
     return False
 
 
-def column_merge(segs: list[dict]) -> list[list[dict]]:
-    """괘선 없는 표 블록: 같은 열에서 바로 아래 이어지는 줄만 하나의 셀(문단)로 합친다."""
+def _hrule_between(lb, sb, hedges) -> bool:
+    lo, hi = min(lb[3], sb[1]) - 1.0, max(lb[3], sb[1]) + 1.0
+    x0, x1 = min(lb[0], sb[0]), max(lb[2], sb[2])
+    return any(lo <= y <= hi and xa < x1 and xb > x0 for y, xa, xb in hedges or [])
+
+
+def column_merge(segs: list[dict], hedges: list | None = None) -> list[list[dict]]:
+    """괘선 없는 표 블록: 같은 열에서 바로 아래 이어지는 줄만 하나의 셀(문단)로 합친다.
+    (가로 괘선을 넘거나, 글머리표 항목이 시작되면 합치지 않음)"""
     segs = sorted(segs, key=lambda s: (s["bbox"][1], s["bbox"][0]))
     groups: list[list[dict]] = []
     for s in segs:
@@ -53,7 +60,8 @@ def column_merge(segs: list[dict]) -> list[list[dict]]:
                         or abs((lb[0] + lb[2]) / 2 - (sb[0] + sb[2]) / 2) < 1.5)
             gap = sb[1] - lb[3]
             size = last["spans"][0]["size"]
-            if same_col and -1.0 <= gap < 0.5 * size and not BULLET_RE.match(s["_text"]):
+            if (same_col and -1.0 <= gap < 0.5 * size and not BULLET_RE.match(s["_text"])
+                    and not s.get("_marker") and not _hrule_between(lb, sb, hedges)):
                 g.append(s)
                 placed = True
                 break
