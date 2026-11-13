@@ -260,12 +260,58 @@ def output_paths(src: Path) -> tuple[Path, Path]:
     return dst, log
 
 
-def needs_processing(src: Path, force: bool) -> bool:
+# 레이아웃 코드가 바뀌면 이 값을 올린다 → 예전에 만든 결과도 자동으로 다시 만든다
+LAYOUT_VERSION = "2026-11-13a"
+STAMP_FILE = ".om_stamps.json"
+_sha_memo: dict = {}
+
+
+def _src_sha(src: Path) -> str:
+    st = src.stat()
+    k = (str(src), st.st_size, st.st_mtime)
+    if k not in _sha_memo:
+        _sha_memo[k] = file_sha(src)
+    return _sha_memo[k]
+
+
+def make_stamp(src: Path, cfg: Optional[Config]) -> str:
+    """원본 내용 + 결과에 영향을 주는 설정 → 이 값이 같아야 '이미 번역됨'으로 본다"""
+    parts = [_src_sha(src), LAYOUT_VERSION]
+    if cfg is not None:
+        parts += [f"scale={getattr(cfg, 'text_scale', 1.0):.2f}", f"scope={cfg.scope}", f"ocr={cfg.ocr_mode}",
+                  f"model={cfg.model}"]
+    return "|".join(parts)
+
+
+def _stamps() -> dict:
+    f = config.OUTPUT_DIR / STAMP_FILE
+    try:
+        return json.loads(f.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def save_stamp(src: Path, cfg: Config) -> None:
+    d = _stamps()
+    d[src.name] = make_stamp(src, cfg)
+    try:
+        (config.OUTPUT_DIR / STAMP_FILE).write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def needs_processing(src: Path, force: bool, cfg: Optional[Config] = None) -> bool:
     dst, log = output_paths(src)
     if force or not dst.exists():
         return True
     if src.stat().st_mtime > dst.stat().st_mtime:
         return True  # 원본이 더 새로움
+    # 같은 이름의 다른 파일로 바꿨거나(날짜가 예전이어도), 글자 크기 등 설정이 바뀌었으면 다시 만든다
+    try:
+        if _stamps().get(src.name) != make_stamp(src, cfg):
+            return True
+    except OSError:
+        return True
     if log.exists() and log.stat().st_mtime > dst.stat().st_mtime + 5:
         return True  # 번역 로그에 수정 번역을 입력함
     return False
@@ -468,7 +514,10 @@ def import_dropped(paths: list[str]) -> list[Path]:
             dst = config.INPUT_DIR / f.name
             try:
                 if f.resolve() != dst.resolve():
-                    shutil.copy2(f, dst)
+                    same = (dst.exists() and dst.stat().st_size == f.stat().st_size
+                            and file_sha(dst) == file_sha(f))
+                    if not same:  # 내용이 다를 때만 복사 (수정 날짜 '지금' → 새 파일로 인식)
+                        shutil.copyfile(f, dst)
                 copied.append(dst)
                 print(f"  추가: {f.name}")
             except Exception as e:  # noqa: BLE001
@@ -533,7 +582,8 @@ class Runner:
     def run_batch(self, files: list[Path]) -> int:
         todo = []
         for f in files:
-            if not needs_processing(f, self.cfg.force):
+            # 페이지를 지정한 실행은 항상 새로 만든다 (확인용)
+            if not needs_processing(f, self.cfg.force or bool(self.args.pages), self.cfg):
                 continue
             if self.failed.get(str(f)) == f.stat().st_mtime:
                 continue
@@ -552,6 +602,8 @@ class Runner:
                 doc.close()
                 self.cfg.pages = parse_pages(self.args.pages, n) if self.args.pages else None
                 process_pdf(src, self.cfg, self.backend, self.gloss, self.protector, self.cache, self.ocr)
+                if not self.cfg.pages:  # 일부 페이지만 만든 결과는 '완료'로 기록하지 않음
+                    save_stamp(src, self.cfg)
                 n_ok += 1
                 self.failed.pop(str(src), None)
                 if config.MOVE_DONE_INPUTS:
@@ -680,9 +732,10 @@ def main(argv=None) -> int:
     n = runner.run_batch(files) if files else 0
     if n and not args.no_open:
         open_folder(config.OUTPUT_DIR)
-    skipped = [f for f in files if not needs_processing(f, False)] if files and not args.force else []
+    skipped = [f for f in files if not needs_processing(f, False, runner.cfg)] if files and not args.force else []
     if files and n == 0 and skipped:
-        print(f"이미 번역된 파일 {len(skipped)}개는 건너뛰었습니다. (다시 만들려면 결과 PDF를 지우거나 --force)")
+        print(f"이미 같은 원본·같은 설정으로 번역된 파일 {len(skipped)}개는 건너뛰었습니다. "
+              "(다시 만들려면 '이미 번역된 파일도 다시 만들기' 체크)")
 
     if args.once or args.pages:
         return 0
@@ -695,7 +748,7 @@ def main(argv=None) -> int:
     try:
         while True:
             time.sleep(config.WATCH_INTERVAL_SEC)
-            pending = [f for f in list_input_pdfs() if needs_processing(f, False)]
+            pending = [f for f in list_input_pdfs() if needs_processing(f, False, runner.cfg)]
             if pending:
                 print(f"\n[{time.strftime('%H:%M:%S')}] 새 PDF {len(pending)}개 감지")
                 if runner.run_batch(pending) and not args.no_open:
