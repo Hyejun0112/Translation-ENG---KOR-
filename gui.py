@@ -191,7 +191,7 @@ class App(tk.Tk):
         ttk.Label(f2, text="비우면 전체 (예: 1-5)", style="Hint.TLabel").grid(row=0, column=4, sticky="w")
         ttk.Label(f2, text="번역 글자 크기").grid(row=2, column=0, sticky="w", pady=(6, 0))
         cb = ttk.Combobox(f2, textvariable=self.v_scale, state="readonly", width=8,
-                          values=["100%", "95%", "92%", "90%", "88%", "85%", "80%"])
+                          values=["100%", "95%", "92%", "90%", "88%", "85%", "82%", "80%", "78%", "75%", "72%", "70%", "65%", "60%"])
         cb.grid(row=2, column=1, sticky="w", padx=6, pady=(6, 0))
         cb.bind("<<ComboboxSelected>>", lambda e: config.save_env("OM_TEXT_SCALE", f"{self._scale() / 100:.2f}"))
         ttk.Label(f2, text="원문 대비 (작을수록 겹침↓, 기본 92%) · 바꾼 뒤엔 '다시 만들기' 체크",

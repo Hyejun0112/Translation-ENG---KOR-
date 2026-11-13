@@ -123,6 +123,15 @@ def classify_page(page) -> str:
 MARKER_RE = re.compile(r"^(?:[•●▪■◦○‣·*\-–—►▶➢✓□❑o]|\(?\d{1,3}[.)]|\(?[a-zA-Z][.)]|\d{1,2}(?:\.\d{1,2}){0,3}\.?)$")
 
 
+def is_math_span(s: dict) -> bool:
+    """수식 글꼴(Cambria Math 등) 또는 수학용 기울임 문자(𝑃, 𝑚𝑒𝑎𝑠𝑢𝑟𝑒𝑑 …)로 된 글자 조각"""
+    f = (s.get("font") or "").lower()
+    if "math" in f or "stix" in f or f.startswith("cmmi") or f.startswith("cmsy"):
+        return True
+    t = s.get("text") or ""
+    return any(0x1D400 <= ord(c) <= 0x1D7FF for c in t)
+
+
 def split_line_segments(ln: dict, vedges: Optional[list] = None) -> list[dict]:
     """한 줄 안에서 열 간격이 크게 벌어진 텍스트(표의 셀 등)를 별도 세그먼트로 분리.
     - 세로 괘선을 사이에 둔 글자도 분리 (괘선 표인데 표 인식이 안 된 경우: 개정 이력 표 등)
@@ -137,9 +146,13 @@ def split_line_segments(ln: dict, vedges: Optional[list] = None) -> list[dict]:
             px, nx = cur[-1]["bbox"][2], s["bbox"][0]
             gap = nx - px
             wall = any(px - 0.5 <= x <= nx + 0.5 for x in walls)
-            if wall or gap > max(6.0, 0.8 * max(s["size"], 1.0)):
+            math_edge = is_math_span(cur[-1]) != is_math_span(s)  # 수식 ↔ 일반 글자 경계
+            hard = wall or gap > max(6.0, 0.8 * max(s["size"], 1.0))
+            if hard or math_edge:
                 segs.append(cur)
                 cur = []
+                if not hard:
+                    s = dict(s, _soft=True)  # 수식 경계로만 나뉨 (문장 중간 수식이면 다시 붙임)
         cur.append(s)
     if cur:
         segs.append(cur)
@@ -150,7 +163,33 @@ def split_line_segments(ln: dict, vedges: Optional[list] = None) -> list[dict]:
             r |= fitz.Rect(s["bbox"])
         text = "".join(s["text"] for s in sg).strip()
         if text:
-            out.append({"bbox": tuple(r), "spans": sg, "dir": ln["dir"], "_text": text})
+            out.append({"bbox": tuple(r), "spans": sg, "dir": ln["dir"], "_text": text,
+                        "_math": all(is_math_span(x) for x in sg)})
+    # 수식 조각(줄 앞/뒤의 𝑃 기호, 첨자 등)은 번역하지 않고 원본 그대로 둔다
+    # 예) "𝑃 measured/windbox = Current measured windbox pressure" → "= 현재 측정된 …" 만 번역
+    lead = 0
+    while lead < len(out) - 1 and out[lead]["_math"]:
+        lead += 1
+    trail = len(out)
+    while trail > lead + 1 and out[trail - 1]["_math"]:
+        trail -= 1
+    trimmed = bool(lead or trail < len(out))
+    if trimmed:
+        out = out[lead:trail]
+    # 문장 중간의 수식(예: "where 𝑥 is …")은 떼지 않고 다시 한 문장으로
+    j = 1
+    while j < len(out):
+        if out[j]["spans"][0].get("_soft"):
+            a, b = out[j - 1], out[j]
+            out[j - 1] = dict(a, bbox=tuple(fitz.Rect(a["bbox"]) | fitz.Rect(b["bbox"])), spans=a["spans"] + b["spans"],
+                              _text=a["_text"] + " " + b["_text"], _math=a["_math"] and b["_math"])
+            del out[j]
+        else:
+            j += 1
+    if trimmed:
+        out[0]["_marker"] = True  # 수식 뒤 설명 = 항목 시작 (앞 줄과 합치지 않음)
+    if out and all(o["_math"] for o in out):
+        return []  # 수식만 있는 줄
     if len(out) >= 2 and MARKER_RE.match(out[0]["_text"]):
         out = out[1:]
         out[0]["_marker"] = True
@@ -848,6 +887,12 @@ def _same_as_source(u: Unit) -> bool:
 def render_page(page, units: list[Unit], fonts, cfg: Config):
     # 번역해도 원문과 같은 문구(사람 이름·날짜·코드 등)는 지우고 다시 쓰지 않고 원본 글꼴 그대로 둔다
     todo = [u for u in units if u.ko and not _same_as_source(u)]
+    for u in list(todo):
+        font = fonts["bold" if u.bold else "regular"]["font"]
+        miss = sorted({c for c in u.ko if not c.isspace() and not font.has_glyph(ord(c))})
+        if miss:  # 한글 글꼴에 없는 글자 → 그리면 □□□ 로 깨짐 → 원문 유지
+            todo.remove(u)
+            u.notes.append("GLYPH_MISSING(글꼴에 없는 글자 " + "".join(miss[:8]) + " → 원문 유지)")
     if not todo:
         return
     vedges, hedges = page_edges(page)  # 리댁션 전에 계산(원본 도형 기준)
