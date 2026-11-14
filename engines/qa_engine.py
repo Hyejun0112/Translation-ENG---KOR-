@@ -65,7 +65,10 @@ def verify_output(dst: Path, expect_pages: int, translated_pages: set[int],
                 if abs(a.rect.width - b.rect.width) > 1 or abs(a.rect.height - b.rect.height) > 1:
                     size_bad.append(pno + 1)
                 try:  # 화면에 놓인 그림 개수 (스캔/사진/로고/스탬프)
-                    if len(a.get_image_info()) != len(b.get_image_info()):
+                    def big(pg):  # 1~2pt 짜리 점(글자처럼 쓰인 그림)은 세지 않는다
+                        return sum(1 for im in pg.get_image_info()
+                                   if im["bbox"][2] - im["bbox"][0] >= 4 and im["bbox"][3] - im["bbox"][1] >= 4)
+                    if big(a) != big(b):
                         img_bad.append(pno + 1)
                 except Exception:  # noqa: BLE001
                     pass
@@ -116,12 +119,16 @@ STATUS_KO = {
 SOURCE_KO = {"native": "본문", "native-ocr": "본문(글자깨짐→OCR)", "ocr-page": "OCR(스캔)", "ocr-figure": "OCR(그림)", "toc": "북마크"}
 
 
+_ILLEGAL_XLSX = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
 def _xlsx_sheet(wb, title, header, rows, widths, wrap_cols=()):
     from openpyxl.styles import Alignment, Font, PatternFill
     ws = wb.create_sheet(title)
     ws.append(header)
     for r in rows:
-        ws.append(r)
+        # 엑셀에 넣을 수 없는 제어문자는 지운다 (한 글자 때문에 로그 전체 저장이 실패하지 않게)
+        ws.append([_ILLEGAL_XLSX.sub("", c) if isinstance(c, str) else c for c in r])
     fill = PatternFill("solid", fgColor="1F4E78")
     for c in ws[1]:
         c.font = Font(bold=True, color="FFFFFF")

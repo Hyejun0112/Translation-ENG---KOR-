@@ -255,7 +255,11 @@ def needs_translation(ptxt: str) -> bool:
     return bool(re.search(r"[A-Za-z]{2,}", rem))
 
 
+CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ufffe\uffff]")
+
+
 def clean_text(s: str) -> str:
+    s = CONTROL_RE.sub(" ", s)  # PDF 글꼴에 섞인 제어문자 (엑셀 저장 오류·번역 요청 오류의 원인)
     for a, b in LIGATURES.items():
         s = s.replace(a, b)
     return re.sub(r"\s+", " ", s).strip()

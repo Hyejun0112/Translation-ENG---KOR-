@@ -85,10 +85,14 @@ class Unit:
     uls: list = field(default_factory=list)    # 밑줄: {"rect", "x0", "x1", "oy", "size", "color"} (번역 폭에 맞춰 다시 그림)
     segs: list = field(default_factory=list, repr=False)  # 원문 줄 조각 (문단 이어짐 판단용)
     tab: bool = False        # 괘선 없는 표/다단 블록에서 나온 문구 (다른 블록과 합치지 않음)
+    hang: float = 0.0        # 내어쓰기: 둘째 줄부터 왼쪽 시작이 첫 줄보다 안쪽인 정도 ("1. 글…" 의 다음 줄)
     symbol: bool = False     # 첨자가 붙은 기호 (P wbox, V PA total, T bed ave …) → 번역하지 않고 원본 그대로
 
 
 PUNCT = set("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
+
+
+MAX_PAGE_IMAGES = 2000
 
 
 PAGE_CLASS_KO = {
@@ -175,6 +179,32 @@ def seg_text(sg: list[dict]) -> str:
     return "".join(out).strip()
 
 
+# Symbol / Wingdings 글꼴의 사용자 정의 영역 글자 → 같은 모양의 표준 글자 (그대로 두면 한글 글꼴에서 □ 로 깨짐)
+SYMBOL_PUA = {0xF0B1: "±", 0xF0B0: "°", 0xF0B4: "×", 0xF0B7: "•", 0xF0A3: "≤", 0xF0B3: "≥", 0xF06D: "µ",
+              0xF0D7: "·", 0xF0A2: "′", 0xF0B2: "″", 0xF0BB: "≈", 0xF0B9: "≠", 0xF0AE: "→", 0xF0AC: "←",
+              0xF057: "Ω", 0xF044: "Δ", 0xF061: "α", 0xF062: "β", 0xF064: "δ", 0xF070: "π", 0xF071: "θ",
+              0xF06C: "λ", 0xF068: "η", 0xF072: "ρ", 0xF073: "σ", 0xF0C6: "∅", 0xF0A5: "∞", 0xF0D6: "√",
+              0xF02D: "−", 0xF0BC: "…", 0xF0A0: " ", 0xF020: " "}
+WINGDINGS_PUA = {0xF0A7: "▪", 0xF06E: "■", 0xF0FC: "✓", 0xF0D8: "➢", 0xF09F: "•", 0xF0B7: "•", 0xF06C: "●",
+                 0xF071: "❑", 0xF0A8: "◻", 0xF0E0: "→", 0xF076: "❖"}
+
+
+def _fix_span(s: dict) -> dict:
+    """글자 조각 보정: (1) Symbol/Wingdings 사용자 정의 글자를 표준 글자로,
+    (2) 앞쪽 공백(스페이스로 들여쓴 줄, '•' 뒤의 공백)만큼 시작 위치를 오른쪽으로 옮긴다
+        → 번역문이 들여쓰기 없이 왼쪽으로 당겨지지 않게"""
+    t = s["text"]
+    if any(0xF000 <= ord(c) <= 0xF0FF for c in t):
+        table = WINGDINGS_PUA if "wingding" in (s.get("font") or "").lower() else SYMBOL_PUA
+        t = "".join(table.get(ord(c), SYMBOL_PUA.get(ord(c), c)) for c in t)
+    n = len(t) - len(t.lstrip(" \u00a0"))
+    if t.strip() and n:
+        x0, y0, x1, y1 = s["bbox"]
+        shift = min(n * 0.278 * s["size"], max(0.0, (x1 - x0) - 0.4 * s["size"] * len(t.strip())))
+        return dict(s, text=t[n:], bbox=(x0 + max(shift, 0.0), y0, x1, y1))
+    return dict(s, text=t) if t is not s["text"] else s
+
+
 BULLET_CH_RE = re.compile(r"^[•●▪■◦○‣·►▶➢✓□❑–—\-\uf0b7\uf0a7]$")
 
 
@@ -188,8 +218,15 @@ def split_line_segments(ln: dict, vedges: Optional[list] = None, cols: Optional[
       (기호 | 설명 범례에서 '⌀d₁ Raised face' 처럼 간격이 좁은 행)"""
     y0, y1 = ln["bbox"][1], ln["bbox"][3]
     walls = [x for x, a, b in (vedges or []) if a <= y0 + 1 and b >= y1 - 1]
+    spans_in = [_fix_span(s) for s in ln["spans"]]
+    # 양쪽 정렬 문장: 낱말 사이가 고르게 넓게 벌어진 줄은 표의 열이 아니다 → 간격으로 나누지 않는다
+    real = [s for s in spans_in if s["text"].strip()]
+    gaps = [b["bbox"][0] - a["bbox"][2] for a, b in zip(real, real[1:])]
+    wide = [g for g in gaps if g > max(6.0, 0.8 * max(real[0]["size"], 1.0))] if real else []
+    justified = ln.get("_justified") or (len(wide) >= 3 and max(wide) <= 1.8 * min(wide) and max(wide) < 2.5 * max(real[0]["size"], 1.0)
+                 and all(re.search(r"[A-Za-z]{2,}", s["text"]) for s in real))
     segs, cur, last = [], [], None
-    for s in ln["spans"]:
+    for s in spans_in:
         if not s["text"].strip():
             if cur:
                 cur.append(s)  # 글자 사이 공백
@@ -203,7 +240,7 @@ def split_line_segments(ln: dict, vedges: Optional[list] = None, cols: Optional[
             n_real = sum(1 for x in cur if x["text"].strip())
             bullet = not segs and n_real == 1 and bool(BULLET_CH_RE.match(last["text"].strip()))
             col = gap > 0.3 * size and sum(1 for c in (cols or []) if abs(nx - c) < 0.6) >= 2
-            hard = wall or bullet or col or gap > max(6.0, 0.8 * size)
+            hard = wall or bullet or col or (gap > max(6.0, 0.8 * size) and not justified)
             if hard or math_edge:
                 segs.append(cur)
                 cur = []
@@ -304,7 +341,10 @@ def _group_to_unit(page, g: list[dict], cell=None) -> Optional[Unit]:
                 bold=bold, origin_y=first["origin"][1], align=align, rotated=rotated,
                 cell=fitz.Rect(cell) if cell is not None else None, last_x1=g[-1]["bbox"][2],
                 bullet=bool(g[0].get("_marker") or BULLET_RE.match(text)),
-                lines=lines, uls=uls, segs=list(g), symbol=symbol)
+                lines=lines, uls=uls, segs=list(g), symbol=symbol,
+                hang=(g[1]["bbox"][0] - g[0]["bbox"][0]
+                      if len(g) > 1 and cell is None and 2.0 < g[1]["bbox"][0] - g[0]["bbox"][0] < 60.0
+                      and BULLET_RE.match(text) else 0.0))
 
 
 # 목차 점선: "Purpose of the manual ........" / "Title . . . . ." / "Title ……"
@@ -364,6 +404,40 @@ def merge_paragraphs(units: list[Unit], hedges: Optional[list] = None) -> list[U
         target.lines += b.lines
         target.uls += b.uls
         target.segs += b.segs
+    return out
+
+
+def merge_justified_rows(lines: list) -> list:
+    """양쪽 정렬로 낱말 사이가 넓게 벌어져 낱말마다 따로 저장된 줄을 한 줄로 되돌린다.
+    (같은 높이에 낱말 4개 이상이 고른 간격으로 놓인 경우만 - 표의 열은 간격이 고르지 않다)"""
+    out: list = []
+    i = 0
+    while i < len(lines):
+        row = [lines[i]]
+        j = i + 1
+        while j < len(lines) and abs(lines[j]["bbox"][1] - lines[i]["bbox"][1]) < 1.0 \
+                and lines[j]["bbox"][0] >= row[-1]["bbox"][2] - 0.5 and abs(lines[j]["dir"][0]) > 0.99:
+            row.append(lines[j])
+            j += 1
+        if len(row) >= 4:
+            size = max((sp["size"] for sp in row[0]["spans"]), default=10.0)
+            gaps = [b["bbox"][0] - a["bbox"][2] for a, b in zip(row, row[1:])]
+            words_ok = all(re.search(r"[A-Za-z]{2,}", "".join(sp["text"] for sp in ln["spans"])) for ln in row)
+            if words_ok and min(gaps) > 0 and max(gaps) <= 1.8 * min(gaps) and max(gaps) < 2.5 * size:
+                spans = []
+                for k, ln in enumerate(row):
+                    if k:
+                        ref = ln["spans"][0]
+                        spans.append(dict(ref, text=" ", bbox=(row[k - 1]["bbox"][2], ref["bbox"][1],
+                                                               ln["bbox"][0], ref["bbox"][3])))
+                    spans += ln["spans"]
+                bb = (row[0]["bbox"][0], min(ln["bbox"][1] for ln in row), row[-1]["bbox"][2],
+                      max(ln["bbox"][3] for ln in row))
+                out.append(dict(row[0], spans=spans, bbox=bb, _justified=True))
+                i = j
+                continue
+        out.append(lines[i])
+        i += 1
     return out
 
 
@@ -508,8 +582,9 @@ def extract_units(page, table_cells: Optional[list] = None) -> list[Unit]:
             continue
         seg_lines: list[dict] = []
         tabular = False
-        cols = [sp["bbox"][0] for ln in b.get("lines", []) for sp in ln["spans"][:1] if sp["text"].strip()]
-        for ln in b.get("lines", []):
+        b_lines = merge_justified_rows(b.get("lines", []))
+        cols = [sp["bbox"][0] for ln in b_lines for sp in ln["spans"][:1] if sp["text"].strip()]
+        for ln in b_lines:
             segs = split_line_segments(ln, vedges, cols)
             if len(segs) > 1:
                 tabular = True
@@ -966,11 +1041,14 @@ def insert_font(page, name: str, spec: dict):
 LINE_H = 1.22
 
 
-def wrap_text(text: str, font, size: float, width: float) -> list[str]:
+def wrap_text(text: str, font, size: float, width: float, hang: float = 0.0) -> list[str]:
+    """hang: 둘째 줄부터 줄 폭을 그만큼 줄인다 (내어쓰기 문단)"""
     lines: list[str] = []
+    full = width
     for para in text.split("\n"):
         cur = ""
         for w in para.split(" "):
+            width = full - hang if lines else full
             cand = w if not cur else cur + " " + w
             if font.text_length(cand, fontsize=size) <= width:
                 cur = cand
@@ -978,6 +1056,7 @@ def wrap_text(text: str, font, size: float, width: float) -> list[str]:
             if cur:
                 lines.append(cur)
                 cur = ""
+                width = full - hang
             if font.text_length(w, fontsize=size) <= width:
                 cur = w
             else:  # 한 단어가 너무 길면 글자 단위로 줄바꿈
@@ -994,20 +1073,20 @@ def wrap_text(text: str, font, size: float, width: float) -> list[str]:
     return lines
 
 
-def _shrink_fit(text, font, width, height, start, lo, tol=0.35):
+def _shrink_fit(text, font, width, height, start, lo, tol=0.35, hang=0.0):
     size = start
     words = [w for w in text.split() if w]
     while True:
-        lines = wrap_text(text, font, size, width)
+        lines = wrap_text(text, font, size, width, hang)
         ok = len(lines) * size * LINE_H <= height + size * tol
         if ok and words:  # 단어가 글자 단위로 쪼개지면(예: '개/정') 더 줄여 본다
-            ok = max(font.text_length(w, fontsize=size) for w in words) <= width + 0.5
+            ok = max(font.text_length(w, fontsize=size) for w in words) <= width - hang + 0.5
         if ok or size <= lo + 1e-6:
             return size, lines, ok
         size = max(lo, size - 0.25)
 
 
-def fit_text(text, font, w0, h0, box_w, box_h, orig_size, cfg: Config):
+def fit_text(text, font, w0, h0, box_w, box_h, orig_size, cfg: Config, hang: float = 0.0):
     """원래 박스 → 폭 확장 → 폭+높이 확장(셀 바닥/다음 글자 직전까지) 순서로 92%, 85%까지 축소해 시도,
     그래도 안 되면 확장 박스에서 하한(min_scale/min_size)까지 축소.
     반환: (크기, 줄 목록, 맞음여부, 사용폭)"""
@@ -1016,12 +1095,12 @@ def fit_text(text, font, w0, h0, box_w, box_h, orig_size, cfg: Config):
     for tier in (0.92, 0.85):  # 약간 축소 → 폭/높이 확장 → 조금 더 축소 순
         mid = max(lo, orig_size * tier)
         for w, h in ((w0, h0), (W, h0), (W, H)):
-            s, ls, ok = _shrink_fit(text, font, w, h, orig_size, mid)
+            s, ls, ok = _shrink_fit(text, font, w, h, orig_size, mid, hang=hang)
             if ok:
                 return s, ls, ok, w
-    s, ls, ok = _shrink_fit(text, font, W, H, orig_size, lo)
+    s, ls, ok = _shrink_fit(text, font, W, H, orig_size, lo, hang=hang)
     if not ok:  # 겹쳐 그리는 것보다 작은 글자가 낫다: 원래 크기의 45%(최소 4pt)까지 더 축소
-        s, ls, ok = _shrink_fit(text, font, W, H, s, max(4.0, orig_size * 0.45))
+        s, ls, ok = _shrink_fit(text, font, W, H, s, max(4.0, orig_size * 0.45), hang=hang)
     return s, ls, ok, W
 
 
@@ -1164,14 +1243,14 @@ def _place_lines(u: Unit, font, size: float, lines: list[str]):
             lines = lines[:-1] + [lines[-1] + " " + "." * (n - 1) + num]
         elif num:
             lines = lines[:-1] + [lines[-1] + num]
-    for ln in lines:
+    for k, ln in enumerate(lines):
         tw = font.text_length(ln, fontsize=size)
         if u.align == "center":
             x = u.rect.x0 + (u.rect.width - tw) / 2
         elif u.align == "right":
             x = u.rect.x1 - tw
         else:
-            x = u.rect.x0
+            x = u.rect.x0 + (u.hang if k and not u.leader else 0.0)
         if ln:
             placed.append((x, y, ln))
             r = fitz.Rect(x, y - asc * size, x + tw, y + 0.28 * size)
@@ -1355,8 +1434,9 @@ def render_page(page, units: list[Unit], fonts, cfg: Config) -> dict:
             bottom = u.rect.y1 + 0.15 * u.size
         # 번역 글자 크기: 원문 크기 × 설정 비율(기본 92%)에서 시작해 필요하면 더 줄인다
         base = max(3.5, u.size * getattr(cfg, "text_scale", 1.0))
+        hang = u.hang if u.align == "left" and not u.leader else 0.0
         size, lines, ok, _w = fit_text(u.ko, font, u.rect.width, u.rect.height, box_w,
-                                       bottom - u.rect.y0, base, cfg)
+                                       bottom - u.rect.y0, base, cfg, hang)
         u.used_size = size
         if not ok:
             u.notes.append("OVERFLOW(박스 초과, 글자 축소 한계)")
@@ -1369,7 +1449,7 @@ def render_page(page, units: list[Unit], fonts, cfg: Config) -> dict:
             sz = size
             while sz > 4.0 + 1e-6:
                 sz = max(4.0, sz - 0.25)
-                ls = wrap_text(u.ko, font, sz, box_w)
+                ls = wrap_text(u.ko, font, sz, box_w, hang)
                 pl, ar, ls = _place_lines(u, font, sz, ls)
                 if not _conflicts(u, pl, sz, font, others):
                     size, lines, placed, area, fixed = sz, ls, pl, ar, True
@@ -1535,6 +1615,13 @@ def prepare_units(doc, cfg: Config, protector: Protector, overrides: dict[str, s
             continue
         if cfg.scope == "om" and abs(page.rect) > A4_AREA * 1.6:
             scopes[pno] = (False, "대형 페이지(A3 이상) → 도면으로 판단")
+            continue
+        try:  # 그림 조각이 수천 개인 페이지(곡선·도면을 잘게 나눠 저장): 글자 지우기가 매우 느리고 위험 → 원본 그대로
+            n_img = len(page.get_image_info())
+        except Exception:  # noqa: BLE001
+            n_img = 0
+        if n_img > MAX_PAGE_IMAGES:
+            scopes[pno] = (False, f"그림 조각 {n_img}개로 이루어진 페이지(곡선/도면) → 원문 유지")
             continue
         if cls == "garbled":
             # 글자깨짐 페이지: 글자 위치/크기/굵기는 PDF 원본 그대로, 글자 내용만 OCR로 읽는다

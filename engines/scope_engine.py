@@ -82,8 +82,9 @@ def is_prose_page(units: list[Unit]) -> bool:
     body = [u for u in units if u.kind == "text" and u.cell is None]
     if len(body) < 3:
         return False
-    prose = [u for u in body if len(u.text.split()) >= 8]
-    return len(prose) >= 3 and len(prose) / len(body) >= 0.3
+    prose = [u for u in body if len(u.text.split()) >= 8 and not u.rotated]
+    # 표 칸이 대부분인 페이지(데이터시트)는 표 밖의 몇 문장만으로 '문장 위주'라고 보지 않는다
+    return len(prose) >= 3 and len(prose) / len(body) >= 0.3 and len(prose) >= 0.1 * len(units)
 
 
 TOC_LINE_RE = re.compile(r"(?:[.·…]\s*){4,}\s*\d*\s*$")
