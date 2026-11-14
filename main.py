@@ -89,8 +89,9 @@ from engines.glossary_engine import (  # noqa: E402
     Glossary, Protector, load_keep_patterns, missing_protected, restore_tokens,
 )
 from engines.pdf_engine import (  # noqa: E402
-    Unit, build_fonts, build_ocr_engine, classify_unit, clean_text, describe_classes, fitz,
-    draw_layout_debug, parse_pages, prepare_units, render_page, select_pages_safe, save_pdf_safe,
+    Unit, build_fonts, build_ocr_engine, classify_unit, clean_text, describe_classes, detach_annotations, fitz,
+    draw_layout_debug, parse_pages, prepare_units, render_page, restore_annotations, select_pages_safe,
+    save_pdf_safe,
 )
 from engines.qa_engine import load_overrides, verify_output, write_glossary_xlsx, write_log_xlsx  # noqa: E402
 from engines.translation_engine import (  # noqa: E402
@@ -261,7 +262,7 @@ def output_paths(src: Path) -> tuple[Path, Path]:
 
 
 # 레이아웃 코드가 바뀌면 이 값을 올린다 → 예전에 만든 결과도 자동으로 다시 만든다
-LAYOUT_VERSION = "2026-11-13b"
+LAYOUT_VERSION = "2026-11-14a"
 STAMP_FILE = ".om_stamps.json"
 _sha_memo: dict = {}
 
@@ -335,6 +336,10 @@ def process_pdf(src: Path, cfg: Config, backend, gloss: Glossary, protector: Pro
         pg = doc[pno]
         if pg.rotation and hasattr(pg, "remove_rotation"):
             pg.remove_rotation()
+        del pg
+    # 주석(Bluebeam Markup·스탬프·서명·링크)은 떼어 두었다가 저장 직전에 원본 그대로 다시 붙인다
+    # → 번역 과정에서 지워지거나 스탬프 글자가 번역되지 않는다
+    annot_stash = detach_annotations(doc)
 
     units, classes, n_fig, scopes = prepare_units(doc, cfg, protector, overrides, ocr, cache,
                                                   file_sha(src), label=src.stem[:20])
@@ -398,6 +403,7 @@ def process_pdf(src: Path, cfg: Config, backend, gloss: Glossary, protector: Pro
 
     # 렌더링
     translated_pages: set[int] = set()
+    draw_delta: dict[int, int] = {}  # 페이지별 선/도형 개수 변화 예상값 (밑줄 다시 그리기 등)
     if any(u.ko for u in units):
         fonts = build_fonts(cfg, units)
         by_page: dict[int, list[Unit]] = {}
@@ -405,7 +411,8 @@ def process_pdf(src: Path, cfg: Config, backend, gloss: Glossary, protector: Pro
             by_page.setdefault(u.page, []).append(u)
         for pno, us in by_page.items():
             try:
-                render_page(doc[pno], us, fonts, cfg)
+                st = render_page(doc[pno], us, fonts, cfg) or {}
+                draw_delta[pno] = st.get("drawn", 0) - st.get("ul_removed", 0)
                 if any(u.ko for u in us):
                     translated_pages.add(pno)
             except Exception as e:  # noqa: BLE001
@@ -413,6 +420,7 @@ def process_pdf(src: Path, cfg: Config, backend, gloss: Glossary, protector: Pro
                 for u in us:
                     if u.ko:
                         u.notes.append(f"RENDER_FAILED: {e}")
+    restore_annotations(doc, annot_stash)
     if toc_units and any(t.ko for t in toc_units):
         try:
             doc.set_toc([[lvl, (tu.ko or title), pg] for (lvl, title, pg), tu in zip(toc, toc_units)])
@@ -437,16 +445,18 @@ def process_pdf(src: Path, cfg: Config, backend, gloss: Glossary, protector: Pro
     doc.close()
 
     # 최종 검사 + 로그
-    warns, checks = verify_output(dst, len(pages), translated_pages, src, pages)
+    warns, checks = verify_output(dst, len(pages), translated_pages, src, pages, draw_delta)
     for w in warns:
         print(f"  ! 검사: {w}", file=sys.stderr)
     cnt = Counter(u.status for u in all_units)
     n_overlap = sum(1 for u in units if any(n.startswith(("TEXT_OVERLAP", "PAGE_OVER")) for n in u.notes))
     n_overflow = sum(1 for u in units if any(n.startswith("OVERFLOW") for n in u.notes))
     n_tag = sum(1 for u in units if any(n.startswith("TAG_CHANGED") for n in u.notes))
+    n_glyph = sum(1 for u in units if any(n.startswith("GLYPH_MISSING") for n in u.notes))
     checks.append(("텍스트 겹침", "OK" if not n_overlap else "확인필요", f"{n_overlap}건"))
     checks.append(("셀/박스 초과", "OK" if not n_overflow else "확인필요", f"{n_overflow}건 (글자 축소 한계)"))
     checks.append(("Tag/숫자/단위 유지", "OK" if not n_tag else "확인필요", f"변경 의심 {n_tag}건"))
+    checks.append(("글꼴에 없는 글자", "OK" if not n_glyph else "확인필요", f"{n_glyph}건 (깨짐 방지를 위해 원문 유지)"))
     checks.append(("번역 실패", "OK" if not cnt["FAILED"] else "확인필요", f"{cnt['FAILED']}건 (원문 유지)"))
     write_log_xlsx(log_path, src.name, all_units, classes, scopes, checks, pages)
     save_doc_terms(src, all_units)
@@ -632,6 +642,7 @@ class Runner:
                 if pg.rotation and hasattr(pg, "remove_rotation"):
                     pg.remove_rotation()
             self.cfg.pages = parse_pages(self.args.pages, len(doc)) if self.args.pages else None
+            detach_annotations(doc)  # 주석 속 글자는 번역 대상이 아님 (저장하지 않으므로 복원 불필요)
             units, classes, _, scopes = prepare_units(doc, self.cfg, self.protector, {}, ocr, self.cache,
                                                       file_sha(src), label=src.stem[:20])
             pages = self.cfg.pages if self.cfg.pages is not None else list(range(len(doc)))
@@ -656,6 +667,7 @@ class Runner:
             doc = fitz.open(src)
             self.cfg.pages = parse_pages(self.args.pages, len(doc)) if self.args.pages else None
             self.cfg.ocr_mode = "off"
+            detach_annotations(doc)
             units, classes, _, scopes = prepare_units(doc, self.cfg, self.protector, {}, None, None, "")
             pend = [u for u in units if u.status == "PENDING" and tm_get(self.cache, u.text) is None]
             for u in pend:

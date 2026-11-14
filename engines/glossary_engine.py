@@ -20,7 +20,7 @@ from typing import Optional
 
 _UNITS = [
     r"°\s?[CF]", r"[℃℉]",
-    r"kg/cm[²2](?:\s?\(?[ga]\)?)?",
+    r"kg/cm[²2](?:\s?\(?[ga]\)?)?", r"mmH[2₂]O", r"mmHg",
     r"(?:bar|kPa|MPa|Pa|psi|mbar)(?:\s?\(?[ga]\)?|[ga])?",
     r"N?m[³3]/(?:h|hr|min|s)", r"kg/(?:h|hr|s|m[³3])", r"[tT]/h(?:r)?",
     r"mg/N?(?:L|m[³3])", r"[kMG]?Wh?", r"k?VA?", r"m?A", r"Hz", r"rpm", r"%",
@@ -52,7 +52,7 @@ DEFAULT_KEEP_PATTERNS = [
     # 보팅 로직 / 계기 로직: 2oo3, 1oo2D
     r"\b\d\s?oo\s?\d[A-Z]?\b",
     # 화학식/단위 첨자: H2O, CO2, NOx, SO2, O2 (단독 사용)
-    r"\b(?:H2O|CO2|CO|NOx|NO2|SO2|SOx|O2|N2|NH3|CaCO3|HCl)\b",
+    r"\b(?:H[2₂]O|CO[2₂]|CO|NOx|NO[2₂]|SO[2₂]|SO[3₃]|SOx|O[2₂]|N[2₂]|NH[3₃]|CaCO[3₃]|HCl)(?![A-Za-z0-9])",
     # 날짜
     r"\b\d{4}[-./]\d{1,2}[-./]\d{1,2}\b",
     r"\b\d{1,2}[- ](?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[-, ]+\d{2,4}\b",
