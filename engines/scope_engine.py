@@ -26,7 +26,7 @@ if TYPE_CHECKING:  # 타입 표시 전용 (순환 import 방지)
     from engines.pdf_engine import Unit
 
 EXCLUDE_TITLE_KW = [
-    r"data\s*sheets?", r"technical\s+data", r"performance\s+data", r"design\s+data",
+    r"data\s*sheets?", r"instrument\s+specification", r"specification\s+sheet", r"technical\s+data", r"performance\s+data", r"design\s+data",
     r"equipment\s+list", r"valve\s+list", r"line\s+list", r"instrument\s+list", r"cable\s+list",
     r"i\s*/\s*o\s+list", r"(?:spare\s+)?parts?\s+list", r"bill\s+of\s+materials?", r"\bBOM\b",
     r"catalogu?e", r"brochure", r"ordering\s+information", r"material\s+specification",
@@ -108,8 +108,20 @@ def page_scope(page, units: list[Unit], drawings_count: int) -> tuple[bool, str]
         if is_prose_page(units):
             return True, f"제목에 '{m.group(0)}'가 있으나 문장 위주 페이지라 번역"
         return False, f"제외 문서 제목 '{m.group(0)}'"
-    if units and drawings_count > 1500 and not is_prose_page(units):
-        avg = sum(len(u.text) for u in units) / len(units)
-        if avg < 14:
-            return False, "도면/다이어그램으로 판단(선 많고 짧은 라벨 위주)"
+    if units and not is_prose_page(units):
+        # 양식형 데이터시트: 글이 거의 다 표 칸 안에 있고, 제목 칸(페이지 아래 표제란 포함)에 제외 키워드가 있음
+        in_cells = sum(1 for u in units if u.cell is not None)
+        if len(units) >= 30 and in_cells >= 0.7 * len(units):
+            for u in units:
+                if len(u.text) <= 60:
+                    m = EXCLUDE_TITLE_RE.search(REFERENCE_RE.sub(" ", u.text))
+                    if m:
+                        return False, f"데이터시트/양식 페이지 (표제 '{m.group(0)}')"
+        if drawings_count > 1500:
+            avg = sum(len(u.text) for u in units) / len(units)
+            short = sum(1 for u in units if len(u.text.split()) <= 4)
+            # 영어 문장(8단어 이상)이 3개 이상이면 그림이 많은 설명 페이지 → 번역
+            prose = sum(1 for u in units if len(re.findall(r"[A-Za-z]{2,}", u.text)) >= 8)
+            if avg < 14 or (short >= 0.5 * len(units) and prose < 3):
+                return False, "도면/다이어그램으로 판단(선 많고 짧은 라벨 위주)"
     return True, ""

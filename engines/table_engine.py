@@ -107,6 +107,8 @@ def continues(a: dict, b: dict, hedges=None) -> bool:
 
 def strong_continuation(a: dict, b: dict) -> bool:
     """글 내용으로 볼 때 이어지는 문장인가 (앞 줄이 문장 끝이 아니고, 다음 줄이 소문자로 시작)"""
+    if len(re.findall(r"[A-Za-z]{2,}", a["_text"])) < 2:
+        return False  # 기호/한 낱말(⌀D, c₄, 3)은 문장이 아니다
     return not TERMINAL_RE.search(a["_text"]) and _starts_like_continuation(b["_text"])
 
 

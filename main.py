@@ -262,7 +262,7 @@ def output_paths(src: Path) -> tuple[Path, Path]:
 
 
 # 레이아웃 코드가 바뀌면 이 값을 올린다 → 예전에 만든 결과도 자동으로 다시 만든다
-LAYOUT_VERSION = "2026-11-14a"
+LAYOUT_VERSION = "2026-11-14b"
 STAMP_FILE = ".om_stamps.json"
 _sha_memo: dict = {}
 

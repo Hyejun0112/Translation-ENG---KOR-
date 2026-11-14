@@ -142,10 +142,10 @@ def is_math_span(s: dict) -> bool:
     return any(0x1D400 <= ord(c) <= 0x1D7FF for c in t)
 
 
-_SUP = str.maketrans("0123456789+-\u2212n", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁻ⁿ")
+_SUP = str.maketrans("0123456789+-\u2212n()", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁻ⁿ⁽⁾")
 _SUB = str.maketrans("0123456789+-\u2212", "₀₁₂₃₄₅₆₇₈₉₊₋₋")
 # 한글 글꼴에 없을 때 되돌릴 글자 (모양은 조금 달라도 뜻은 같음)
-DENORM = {**{k: v for k, v in zip("⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻ⁿ", "0123456789+-n")},
+DENORM = {**{k: v for k, v in zip("⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻ⁿ⁽⁾", "0123456789+-n()")},
           **{k: v for k, v in zip("₀₁₂₃₄₅₆₇₈₉₊₋", "0123456789+-")},
           "\u2212": "-", "\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2015": "-", "\u00a0": " ",
           "\u2009": " ", "\u202f": " ", "\u2264": "<=", "\u2265": ">=", "\u2260": "!=", "\u2248": "~",
@@ -162,10 +162,10 @@ def seg_text(sg: list[dict]) -> str:
     for s in sg:
         t = s["text"]
         core = t.strip()
-        small = bool(main and core and s["size"] <= 0.8 * main and len(core) <= 3)
+        small = bool(main and core and s["size"] <= 0.8 * main and len(core) <= 6)
         if small and base_y is not None and out and re.search(r"[A-Za-z0-9)\]]$", out[-1]):
             dy = s["origin"][1] - base_y
-            if (s["flags"] & 1 or dy < -0.2 * main) and all(c in "0123456789+-\u2212n" for c in core):
+            if (s["flags"] & 1 or dy < -0.2 * main) and all(c in "0123456789+-\u2212n()" for c in core):
                 t = t.translate(_SUP)
             elif dy > -0.1 * main and all(c in "0123456789" for c in core) and re.search(r"[A-Za-z)]$", out[-1]):
                 t = t.translate(_SUB)
@@ -175,35 +175,53 @@ def seg_text(sg: list[dict]) -> str:
     return "".join(out).strip()
 
 
-def split_line_segments(ln: dict, vedges: Optional[list] = None) -> list[dict]:
+BULLET_CH_RE = re.compile(r"^[•●▪■◦○‣·►▶➢✓□❑–—\-\uf0b7\uf0a7]$")
+
+
+def split_line_segments(ln: dict, vedges: Optional[list] = None, cols: Optional[list] = None) -> list[dict]:
     """한 줄 안에서 열 간격이 크게 벌어진 텍스트(표의 셀 등)를 별도 세그먼트로 분리.
     - 세로 괘선을 사이에 둔 글자도 분리 (괘선 표인데 표 인식이 안 된 경우: 개정 이력 표 등)
     - 맨 앞이 글머리표/번호 기호만이면 기호는 원문 그대로 두고(번역 단위에서 제외),
-      다음 조각에 '_marker' 표시 → 표로 오인하지 않고 항목 시작으로 처리"""
-    spans = [s for s in ln["spans"] if s["text"].strip()]
+      다음 조각에 '_marker' 표시 → 표로 오인하지 않고 항목 시작으로 처리
+    - 공백만 있는 조각은 글자 사이의 공백으로 남긴다 ('•' + ' ' + 'Text' 가 '•Text' 로 붙지 않게)
+    - cols: 같은 블록에서 여러 줄이 시작하는 x 위치. 그 위치에서 시작하는 조각은 간격이 좁아도 열로 나눈다
+      (기호 | 설명 범례에서 '⌀d₁ Raised face' 처럼 간격이 좁은 행)"""
     y0, y1 = ln["bbox"][1], ln["bbox"][3]
     walls = [x for x, a, b in (vedges or []) if a <= y0 + 1 and b >= y1 - 1]
-    segs, cur = [], []
-    for s in spans:
-        if cur:
-            px, nx = cur[-1]["bbox"][2], s["bbox"][0]
+    segs, cur, last = [], [], None
+    for s in ln["spans"]:
+        if not s["text"].strip():
+            if cur:
+                cur.append(s)  # 글자 사이 공백
+            continue
+        if last is not None:
+            px, nx = last["bbox"][2], s["bbox"][0]
             gap = nx - px
+            size = max(s["size"], 1.0)
             wall = any(px - 0.5 <= x <= nx + 0.5 for x in walls)
-            math_edge = is_math_span(cur[-1]) != is_math_span(s)  # 수식 ↔ 일반 글자 경계
-            hard = wall or gap > max(6.0, 0.8 * max(s["size"], 1.0))
+            math_edge = is_math_span(last) != is_math_span(s)  # 수식 ↔ 일반 글자 경계
+            n_real = sum(1 for x in cur if x["text"].strip())
+            bullet = not segs and n_real == 1 and bool(BULLET_CH_RE.match(last["text"].strip()))
+            col = gap > 0.3 * size and sum(1 for c in (cols or []) if abs(nx - c) < 0.6) >= 2
+            hard = wall or bullet or col or gap > max(6.0, 0.8 * size)
             if hard or math_edge:
                 segs.append(cur)
                 cur = []
                 if not hard:
                     s = dict(s, _soft=True)  # 수식 경계로만 나뉨 (문장 중간 수식이면 다시 붙임)
         cur.append(s)
+        last = s
     if cur:
         segs.append(cur)
+    for sg in segs:  # 끝에 붙은 공백 조각 제거
+        while sg and not sg[-1]["text"].strip():
+            sg.pop()
     out = []
     for sg in segs:
         r = fitz.Rect(sg[0]["bbox"])
         for s in sg[1:]:
-            r |= fitz.Rect(s["bbox"])
+            if s["text"].strip():
+                r |= fitz.Rect(s["bbox"])
         text = seg_text(sg)
         if text:
             out.append({"bbox": tuple(r), "spans": sg, "dir": ln["dir"], "_text": text,
@@ -490,8 +508,9 @@ def extract_units(page, table_cells: Optional[list] = None) -> list[Unit]:
             continue
         seg_lines: list[dict] = []
         tabular = False
+        cols = [sp["bbox"][0] for ln in b.get("lines", []) for sp in ln["spans"][:1] if sp["text"].strip()]
         for ln in b.get("lines", []):
-            segs = split_line_segments(ln, vedges)
+            segs = split_line_segments(ln, vedges, cols)
             if len(segs) > 1:
                 tabular = True
             seg_lines += segs
