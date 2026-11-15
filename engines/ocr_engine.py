@@ -38,7 +38,7 @@ try:
 except ImportError:  # pragma: no cover
     pytesseract = None  # type: ignore
 
-OCR_VERSION = "6"  # OCR 로직이 바뀌면 올려서 캐시를 무효화
+OCR_VERSION = "14"  # OCR 로직이 바뀌면 올려서 캐시를 무효화
 
 DEFAULT_BULLET_RE = re.compile(
     r"^\s*(?:[•●▪■◦○‣·*\-–—]|\(?\d{1,3}[.)]|\(?[a-zA-Z][.)]|\d+(?:\.\d+)+\.?)\s+"
@@ -131,6 +131,7 @@ class OcrBlock:
     source: str = "ocr-page"   # ocr-page | ocr-figure
     n_lines: int = 1
     lines: list = field(default_factory=list)  # [(x0,y0,x1,y1,text), ...]
+    busy: bool = False         # 사진/무늬 배경 위의 짧은 글자 → 번역하지 않음(덧씌우면 그림이 망가짐). 제목 판단에는 사용
 
     def to_json(self) -> dict:
         return asdict(self)
@@ -262,39 +263,152 @@ def sample_colors(rgb: "np.ndarray", box: tuple[int, int, int, int]) -> tuple[tu
     return fg, bg, stroke / max(1.0, (y1 - y0))
 
 
+def em_factor(text: str) -> float:
+    """글자 상자 높이 ÷ 글자 크기(em). 낱말에 든 글자 모양에 따라 다르다:
+    'Optional:'(위·아래로 다 뻗음) ≈ 0.93, 'Supply'/'ISO'(위로만) ≈ 0.72, 'mm'(소문자 몸통만) ≈ 0.50.
+    평균값 하나로 나누면 낱말마다 글자 크기가 들쭉날쭉해진다."""
+    asc = bool(re.search(r"[A-Zbdfhklt0-9(){}\[\]/|!?%&$#@]", text))
+    desc = bool(re.search(r"[gjpqy(){}\[\],;|]", text))
+    if asc and desc:
+        return 0.93
+    if asc or desc:
+        return 0.72
+    return 0.50
+
+
+def bg_busyness(gray: "np.ndarray", box: tuple, pad: int) -> float:
+    """글자 주변 배경의 얼룩 정도(밝기 표준편차). 종이/단색 배경은 작고, 사진 위는 크다."""
+    H, W = gray.shape[:2]
+    x0, y0, x1, y1 = [int(round(v)) for v in box]
+    x0, y0, x1, y1 = max(0, x0 - pad), max(0, y0 - pad), min(W, x1 + pad), min(H, y1 + pad)
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return 0.0
+    crop = gray[y0:y1, x0:x1]
+    _, mask = cv2.threshold(crop, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    dark = mask > 0
+    if dark.mean() > 0.5:
+        dark = ~dark
+    bg = crop[~dark]
+    return float(bg.std()) if bg.size else 0.0
+
+
+def snap_sizes(blocks: list) -> None:
+    """한 페이지의 글자 크기를 몇 가지 대표값으로 맞춘다 (인쇄물은 본문/제목 등 몇 가지 크기만 쓴다).
+    OCR 로 잰 크기는 줄마다 ±10% 흔들리므로, 가까운 크기끼리 묶어 글자 수 기준 중앙값으로 통일한다."""
+    items = sorted(((b.size, max(1, len(b.text)), b) for b in blocks), key=lambda t: t[0])
+    group: list = []
+    def flush():
+        if len(group) < 2:
+            return
+        tot = sum(n for _, n, _ in group)
+        acc = 0
+        for s, n, _ in group:
+            acc += n
+            if acc * 2 >= tot:
+                for _, _, b in group:
+                    b.size = round(float(s), 2)
+                break
+    for it in items:
+        if group and it[0] > group[0][0] * 1.18:
+            flush()
+            group = []
+        group.append(it)
+    flush()
+
+
+def ink_band_height(gray: "np.ndarray", box: tuple) -> tuple[float, int]:
+    """줄 상자 안에서 글자가 실제로 차지하는 가로 띠의 높이(중앙값)와 띠 개수.
+    Tesseract 가 위아래 두 행을 한 줄로 묶으면 상자 높이가 실제 글자의 2~3배가 된다 → 글자 크기 과대 추정 방지."""
+    H, W = gray.shape[:2]
+    x0, y0, x1, y1 = [int(round(v)) for v in box]
+    x0, y0, x1, y1 = max(0, x0), max(0, y0), min(W, x1), min(H, y1)
+    if x1 - x0 < 4 or y1 - y0 < 6:
+        return 0.0, 0
+    crop = gray[y0:y1, x0:x1]
+    if crop.std() < 6:
+        return 0.0, 0
+    _, mask = cv2.threshold(crop, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    dark = mask > 0
+    if dark.mean() > 0.5:
+        dark = ~dark
+    rows = dark.mean(axis=1) > 0.02
+    bands: list[list[int]] = []
+    for i, on in enumerate(rows):
+        if on:
+            if bands and i - bands[-1][1] <= 1:
+                bands[-1][1] = i
+            else:
+                bands.append([i, i])
+    if not bands:
+        return 0.0, 0
+    tall = max(b[1] - b[0] + 1 for b in bands)
+    merged: list[list[int]] = []
+    for b in bands:  # i 의 점, 악센트처럼 가까운 띠는 합친다
+        if merged and b[0] - merged[-1][1] < 0.2 * tall:
+            merged[-1][1] = b[1]
+        else:
+            merged.append(list(b))
+    hs = [b[1] - b[0] + 1 for b in merged if b[1] - b[0] + 1 >= 4]
+    if not hs:
+        return 0.0, 0
+    return float(median(hs)), len(hs)
+
+
 # ----------------------------------------------------------------------------
 # 단어 → 줄 → 블록 묶기
 # ----------------------------------------------------------------------------
 def words_to_lines(words: list[Word], gap_factor: float) -> list[Line]:
-    rows: list[list[Word]] = []
-    for w in sorted(words, key=lambda w: (w.cy, w.x0)):
-        placed = False
-        for row in reversed(rows[-6:]):
-            ry0 = median([x.y0 for x in row])
-            ry1 = median([x.y1 for x in row])
-            ov = min(ry1, w.y1) - max(ry0, w.y0)
-            if ov >= 0.5 * min(ry1 - ry0, w.h):
-                row.append(w)
-                placed = True
-                break
-        if not placed:
-            rows.append([w])
-    lines: list[Line] = []
-    for row in rows:
-        row.sort(key=lambda w: w.x0)
-        hm = median([w.h for w in row])
-        cur = [row[0]]
-        for w in row[1:]:
-            if w.x0 - cur[-1].x1 > max(gap_factor * hm, 6):
-                lines.append(Line(cur))
-                cur = []
-            cur.append(w)
-        lines.append(Line(cur))
-    return lines
+    """단어를 줄로 묶는다. 왼쪽에서 오른쪽으로, 바로 왼쪽에 있는(세로로 겹치고 간격이 좁은) 단어 뒤에 이어 붙인다.
+    페이지 전체 폭으로 행을 만들지 않는다 → 2단 편집에서 옆 단의 글자(기준선이 조금 다름) 때문에
+    한 줄이 여러 조각으로 갈라지지 않는다. 간격이 넓으면(표의 열, 다른 단) 새 줄."""
+    chains: list[dict] = []
+    for w in sorted(words, key=lambda w: (w.x0, w.y0)):
+        best, best_gap = None, 0.0
+        for c in chains:
+            gap = w.x0 - c["x1"]
+            if gap > c["max_gap"] or gap < -0.5 * max(c["h"], w.h):
+                continue
+            ov = min(c["y1"], w.y1) - max(c["y0"], w.y0)
+            if ov < 0.5 * min(c["y1"] - c["y0"], w.h):
+                continue
+            if best is None or gap < best_gap:
+                best, best_gap = c, gap
+        if best is None:
+            chains.append({"words": [w], "x1": w.x1, "y0": w.y0, "y1": w.y1, "h": w.h,
+                           "max_gap": max(gap_factor * w.h, 6)})
+            continue
+        ws = best["words"]
+        ws.append(w)
+        tail = ws[-5:]  # 줄이 조금 기울어도 따라가도록 최근 단어 기준
+        best["x1"] = max(best["x1"], w.x1)
+        best["y0"] = median([x.y0 for x in tail])
+        best["y1"] = median([x.y1 for x in tail])
+        best["h"] = median([x.h for x in ws])
+        best["max_gap"] = max(gap_factor * best["h"], 6)
+    return [Line(c["words"]) for c in chains]
 
 
-def lines_to_blocks(lines: list[Line], bullet_re, merge_all: bool = False) -> list[list[Line]]:
-    """줄을 문단(블록)으로 묶는다. merge_all=True(표 셀)면 글머리표 외에는 모두 하나로."""
+def _line_break_intended(last: Line, ln: Line, right: float) -> bool:
+    """윗줄 끝에 다음 줄 첫 낱말이 들어갈 자리가 있었는데도 줄을 바꿨는가 (= 목록/표의 다른 항목).
+    문장이 끝나지 않았고 다음 줄이 소문자로 시작하면(이어지는 문장) 자리가 조금 남아도 이어진 것으로 본다."""
+    ws = sorted(ln.words, key=lambda w: w.x0)
+    if not ws:
+        return False
+    fw = ws[0].x1 - ws[0].x0
+    avail = right - last.x1
+    if fw * 1.15 + 0.3 * last.h > avail:
+        return False
+    t, n = last.text.rstrip(), ln.text.lstrip()
+    soft = (not re.search(r"[.:;!?]['\")\]]?$", t) and bool(re.match(r"[\"'(\[]*[a-z]", n))
+            and len(re.findall(r"[A-Za-z]{2,}", t)) >= 2)
+    filled = (last.x1 - last.x0) >= 0.6 * max(right - last.x0, 1.0)
+    return not (soft and (filled or avail < 2.0 * fw))
+
+
+def lines_to_blocks(lines: list[Line], bullet_re, merge_all: bool = False,
+                    right: Optional[float] = None) -> list[list[Line]]:
+    """줄을 문단(블록)으로 묶는다. merge_all=True(표 셀)면 글머리표 외에는 모두 하나로.
+    right: 줄이 쓸 수 있는 오른쪽 한계(표 셀의 오른쪽 변). 없으면 같은 시작점의 줄 중 가장 긴 줄의 끝."""
     lines = sorted(lines, key=lambda l: (l.y0, l.x0))
     blocks: list[list[Line]] = []
     for ln in lines:
@@ -314,12 +428,47 @@ def lines_to_blocks(lines: list[Line], bullet_re, merge_all: bool = False) -> li
                            or (xov > 0.5 * min(ln.x1 - ln.x0, last.x1 - last.x0)
                                and abs(ln.x0 - last.x0) <= 3.5 * last.h))
                 if -0.3 * last.h <= gap <= 0.9 * last.h and 0.7 <= hr <= 1.45 and xov > 0 and aligned:
+                    lim = right if right is not None else max(
+                        l.x1 for l in lines if abs(l.x0 - last.x0) <= 1.5 * last.h)
+                    if _line_break_intended(last, ln, lim):
+                        continue  # 목록의 다음 항목: 앞 문단에 붙이지 않는다
                     target = b
                     break
         if target is not None:
             target.append(ln)
         else:
             blocks.append([ln])
+    return blocks
+
+
+def absorb_row_fragments(blocks: list[list[Line]]) -> list[list[Line]]:
+    """양쪽 정렬 문단에서 낱말 사이가 넓게 벌어져 따로 떨어진 줄 조각을 원래 줄에 다시 붙인다.
+    조건: 여러 줄 문단의 어느 줄과 같은 높이에 있고, 그 줄 바로 오른쪽이며, 문단의 오른쪽 끝을 넘지 않는 한 줄짜리 조각.
+    (표의 옆 칸은 문단의 폭 밖에 있으므로 붙지 않는다)"""
+    changed = True
+    while changed:
+        changed = False
+        for b in blocks:
+            if len(b) < 2:
+                continue
+            right = max(l.x1 for l in b)
+            for f in blocks:
+                if f is b or len(f) != 1:
+                    continue
+                fl = f[0]
+                if fl.x1 > right + fl.h:
+                    continue
+                for k, l in enumerate(b):
+                    ov = min(l.y1, fl.y1) - max(l.y0, fl.y0)
+                    if ov >= 0.5 * min(l.y1 - l.y0, fl.y1 - fl.y0) and 0 <= fl.x0 - l.x1 <= 4.0 * l.h:
+                        b[k] = Line(l.words + fl.words)
+                        blocks.remove(f)
+                        changed = True
+                        break
+                if changed:
+                    break
+            if changed:
+                break
     return blocks
 
 
@@ -584,13 +733,13 @@ class OcrEngine:
             if ws:
                 cell_words[i] = ws
 
-        gap = 1.4 if mode == "page" else 1.0
+        gap = 1.8 if mode == "page" else 1.0  # 낱말 사이 줄표(—)가 빠져도 한 줄이 끊기지 않을 만큼
         groups: list[tuple[list[Line], Optional[tuple]]] = []
         for i, ws in cell_words.items():
             lns = words_to_lines(ws, gap_factor=3.0)  # 셀 안에서는 넓은 간격도 같은 줄
-            for b in lines_to_blocks(lns, self.bullet_re, merge_all=False):
+            for b in lines_to_blocks(lns, self.bullet_re, merge_all=False, right=cells[i][2] - 3):
                 groups.append((b, cells[i]))
-        for b in lines_to_blocks(words_to_lines(free, gap_factor=gap), self.bullet_re):
+        for b in absorb_row_fragments(lines_to_blocks(words_to_lines(free, gap_factor=gap), self.bullet_re)):
             groups.append((b, None))
 
         # 낮은 신뢰도 줄 재인식
@@ -622,10 +771,28 @@ class OcrEngine:
             y1 = max(l.y1 for l in lns)
             fg, bg, stroke = sample_colors(rgb, (x0 - 1, y0 - 1, x1 + 1, y1 + 1))
             # 줄 단위 획 두께 (블록 높이 대신 줄 높이 기준)
-            hmed = median([l.h for l in lns])
+            hs = []
+            for l in lns:
+                h = l.h
+                bh, nb = ink_band_height(gray, (l.x0, l.y0, l.x1, l.y1))
+                if nb >= 1 and bh < 0.75 * h:
+                    h = bh  # 상자가 실제 글자보다 큼(두 행이 묶였거나 괘선이 걸림): 글자 띠 높이를 쓴다
+                hs.append(h)
+            hmed = median(hs)
+            # 글자 크기(em, px): 낱말마다 글자 모양에 맞는 비율로 환산한 값의 중앙값
+            ems = []
+            for l, h in zip(lns, hs):
+                if h < 0.99 * l.h:  # 띠 높이로 바꾼 줄
+                    ems.append(h / em_factor(l.text))
+                else:
+                    ems += [w.h / em_factor(w.text) for w in l.words if len(w.text) >= 2] or [l.h / 0.78]
+            em_px = median(ems)
+            # 사진 위의 짧은 글자(간판, 명판, 로고): 덧씌우면 사진이 망가지므로 건드리지 않는다
+            n_words = sum(len(l.words) for l in lns)
+            busy = bool(mode == "page" and n_words <= 3 and bg_busyness(gray, (x0, y0, x1, y1), int(hmed)) > 28)
             stroke_ratio = stroke * max(1.0, (y1 - y0)) / max(1.0, hmed)
             strokes.append(stroke_ratio)
-            tmp.append((lns, cell, text, conf, (x0, y0, x1, y1), fg, bg, stroke_ratio, hmed))
+            tmp.append((lns, cell, text, conf, (x0, y0, x1, y1), fg, bg, stroke_ratio, em_px, busy))
         ref = median(strokes) if strokes else 0.0
 
         def to_pt(x, y):
@@ -647,10 +814,9 @@ class OcrEngine:
             ys = sorted(p[1] for p in pts)
             return (xs[1], ys[1], xs[2], ys[2])
 
-        for lns, cell, text, conf, box, fg, bg, stroke_ratio, hmed in tmp:
+        for lns, cell, text, conf, box, fg, bg, stroke_ratio, em_px, busy in tmp:
             rect = box_pt(*box)
-            h_pt = hmed / scale
-            size = h_pt / 0.78
+            size = em_px / scale
             if len(lns) > 1:
                 pitches = [lns[i + 1].y0 - lns[i].y0 for i in range(len(lns) - 1)]
                 pitch = median(pitches) / scale
@@ -667,7 +833,10 @@ class OcrEngine:
                 source="ocr-page" if mode == "page" else "ocr-figure",
                 n_lines=len(lns),
                 lines=[box_pt(l.x0, l.y0, l.x1, l.y1) + (l.text,) for l in lns],
+                busy=busy,
             ))
+        if mode == "page":
+            snap_sizes(blocks)
         blocks.sort(key=lambda b: (round(b.rect[1]), b.rect[0]))
         return blocks
 

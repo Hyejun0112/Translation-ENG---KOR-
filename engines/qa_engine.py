@@ -67,7 +67,8 @@ def verify_output(dst: Path, expect_pages: int, translated_pages: set[int],
                 try:  # 화면에 놓인 그림 개수 (스캔/사진/로고/스탬프)
                     def big(pg):  # 1~2pt 짜리 점(글자처럼 쓰인 그림)은 세지 않는다
                         return sum(1 for im in pg.get_image_info()
-                                   if im["bbox"][2] - im["bbox"][0] >= 4 and im["bbox"][3] - im["bbox"][1] >= 4)
+                                   if im["bbox"][2] - im["bbox"][0] >= 4 and im["bbox"][3] - im["bbox"][1] >= 4
+                                   and not (fitz.Rect(im["bbox"]) & pg.rect).is_empty)  # 페이지 밖 그림 제외
                     if big(a) != big(b):
                         img_bad.append(pno + 1)
                 except Exception:  # noqa: BLE001

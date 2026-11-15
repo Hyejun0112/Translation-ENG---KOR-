@@ -113,11 +113,31 @@ def page_scope(page, units: list[Unit], drawings_count: int) -> tuple[bool, str]
         # 양식형 데이터시트: 글이 거의 다 표 칸 안에 있고, 제목 칸(페이지 아래 표제란 포함)에 제외 키워드가 있음
         in_cells = sum(1 for u in units if u.cell is not None)
         if len(units) >= 30 and in_cells >= 0.7 * len(units):
+            sizes = sorted(u.size for u in units if u.size)
+            med = sizes[len(sizes) // 2] if sizes else 10
             for u in units:
                 if len(u.text) <= 60:
                     m = EXCLUDE_TITLE_RE.search(REFERENCE_RE.sub(" ", u.text))
-                    if m:
+                    # 표제처럼 보이는 글만 (대문자/굵게/큰 글자). 표의 한 행 이름('Wiring Diagram | 도면번호')은 제외
+                    caps = bool(m) and m.group(0).isupper()  # 'INSTRUMENT SPECIFICATION' (뒤에 부제가 붙어도 인정)
+                    if m and (caps or u.bold or u.size >= med * 1.12) and len(m.group(0)) >= 0.35 * len(u.text.strip()):
                         return False, f"데이터시트/양식 페이지 (표제 '{m.group(0)}')"
+        # 표제가 글자로 남아 있지 않은 양식(제목이 그림/윤곽선): 표 칸 안의 항목 이름이 거의 다 대문자 낱말이면
+        # 데이터시트 양식으로 본다 (예: 전동기 DATA SHEET 의 'ENCLOSURE', 'COOLING METHOD' …)
+        if len(units) >= 30 and in_cells >= 0.7 * len(units):
+            labels = [u.text for u in units if re.search(r"[A-Za-z]{3,}", u.text) and not re.search(r"\d", u.text)]
+            if len(labels) >= 25 and sum(1 for t in labels if t.isupper()) >= 0.85 * len(labels):
+                return False, "데이터시트/양식 페이지 (표 칸의 대문자 항목 위주)"
+        # 도면/데이터시트의 표제란: 페이지 어디에 있든, 짧은 글이 거의 제외 키워드로만 이루어져 있으면 제목으로 본다
+        # (예: 오른쪽 아래 표제란의 'DIMENSIONAL DRAWING FOR …'). 그림 설명문('Figure 3: Wiring diagram for …')은 제외
+        for u in units:
+            if len(u.text) <= 60 and not re.match(r"\s*(?:fig(?:ure)?\.?|table|see|refer)\b", u.text, re.I):
+                t = REFERENCE_RE.sub(" ", u.text)
+                m = EXCLUDE_TITLE_RE.search(t)
+                # 표제란 글은 보통 대문자. 표의 한 행 이름('Wiring Diagram | 도면번호')은 제목이 아니다
+                if m and m.group(0).isupper() and len(m.group(0)) >= 0.35 * len(u.text.strip()) and re.search(
+                        r"drawing|diagram|arrangement|P\s*&\s*I\s*D|PFD|hook", m.group(0), re.I):
+                    return False, f"도면 페이지 (표제 '{m.group(0)}')"
         if drawings_count > 1500:
             avg = sum(len(u.text) for u in units) / len(units)
             short = sum(1 for u in units if len(u.text.split()) <= 4)

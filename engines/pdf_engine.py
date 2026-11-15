@@ -134,11 +134,13 @@ def classify_page(page) -> str:
 
 
 # 글머리표/번호 기호만 있는 조각: "–", "•", "1.", "a)", "1.2.3"
-MARKER_RE = re.compile(r"^(?:[•●▪■◦○‣·*\-–—►▶➢✓□❑o]|\(?\d{1,3}[.)]|\(?[a-zA-Z][.)]|\d{1,2}(?:\.\d{1,2}){0,3}\.?)$")
+MARKER_RE = re.compile(r"^(?:[•●▪■◦○‣·*\-–—►▶➢✓□❑o]|[\u2460-\u24ff\u2776-\u2793]|\(?\d{1,3}[.)]|\(?[a-zA-Z][.)]|\d{1,2}(?:\.\d{1,2}){0,3}\.?)$")
 
 
 def is_math_span(s: dict) -> bool:
     """수식 글꼴(Cambria Math 등) 또는 수학용 기울임 문자(𝑃, 𝑚𝑒𝑎𝑠𝑢𝑟𝑒𝑑 …)로 된 글자 조각"""
+    if s.get("_icon"):
+        return True  # 글꼴 전용 아이콘(참조 표시 등): 수식처럼 원본 그대로 둔다
     f = (s.get("font") or "").lower()
     if "math" in f or "stix" in f or f.startswith("cmmi") or f.startswith("cmsy"):
         return True
@@ -189,6 +191,58 @@ WINGDINGS_PUA = {0xF0A7: "▪", 0xF06E: "■", 0xF0FC: "✓", 0xF0D8: "➢", 0xF
                  0xF071: "❑", 0xF0A8: "◻", 0xF0E0: "→", 0xF076: "❖"}
 
 
+ICON_RUN_RE = re.compile(r"[\ue000-\uf8ff]+(?:[ \u00a0]*\d{1,4}(?![\w.]))?")
+
+
+def _is_icon_char(c: str) -> bool:
+    o = ord(c)
+    return 0xE000 <= o <= 0xF8FF and o not in SYMBOL_PUA and o not in WINGDINGS_PUA
+
+
+def split_icon_spans(page, d: dict) -> None:
+    """제작사 글꼴 전용 아이콘(사용자 정의 영역 글자, 예: '→ [문서 아이콘] 8' 쪽 참조)이 든 글자 조각을
+    아이콘 앞/아이콘(+쪽번호)/뒤로 나눈다. 아이콘 조각은 수식처럼 원본 그대로 두고 나머지만 번역한다.
+    (한글 글꼴에는 이 글자가 없어서, 나누지 않으면 문구 전체를 영어로 남기게 된다)"""
+    blocks = [b for b in d.get("blocks", []) if b.get("type") == 0]
+    if not any(_is_icon_char(c) for b in blocks for ln in b["lines"] for sp in ln["spans"] for c in sp["text"]):
+        return
+    try:
+        raw = page.get_text("rawdict", flags=TEXT_FLAGS)
+    except Exception:  # noqa: BLE001
+        return
+    chars: dict[tuple, list] = {}
+    for b in raw.get("blocks", []):
+        for ln in b.get("lines", []) if b.get("type") == 0 else []:
+            for sp in ln["spans"]:
+                chars[tuple(round(v, 1) for v in sp["bbox"])] = sp.get("chars", [])
+    for b in blocks:
+        for ln in b["lines"]:
+            new = []
+            for sp in ln["spans"]:
+                t = sp["text"]
+                cs = chars.get(tuple(round(v, 1) for v in sp["bbox"]))
+                if not any(_is_icon_char(c) for c in t) or not cs or len(cs) != len(t):
+                    new.append(sp)
+                    continue
+                pos = 0
+                parts = []
+                for m in ICON_RUN_RE.finditer(t):
+                    if not any(_is_icon_char(c) for c in m.group(0)):
+                        continue
+                    if m.start() > pos:
+                        parts.append((pos, m.start(), False))
+                    parts.append((m.start(), m.end(), True))
+                    pos = m.end()
+                if pos < len(t):
+                    parts.append((pos, len(t), False))
+                for a, e, icon in parts:
+                    sub = dict(sp, text=t[a:e], bbox=(cs[a]["bbox"][0], sp["bbox"][1], cs[e - 1]["bbox"][2], sp["bbox"][3]))
+                    if icon:
+                        sub["_icon"] = True
+                    new.append(sub)
+            ln["spans"] = new
+
+
 def _fix_span(s: dict) -> dict:
     """글자 조각 보정: (1) Symbol/Wingdings 사용자 정의 글자를 표준 글자로,
     (2) 앞쪽 공백(스페이스로 들여쓴 줄, '•' 뒤의 공백)만큼 시작 위치를 오른쪽으로 옮긴다
@@ -205,7 +259,7 @@ def _fix_span(s: dict) -> dict:
     return dict(s, text=t) if t is not s["text"] else s
 
 
-BULLET_CH_RE = re.compile(r"^[•●▪■◦○‣·►▶➢✓□❑–—\-\uf0b7\uf0a7]$")
+BULLET_CH_RE = re.compile(r"^[•●▪■◦○‣·►▶➢✓□❑–—\-\uf0b7\uf0a7\u2460-\u24ff\u2776-\u2793]$")
 
 
 def split_line_segments(ln: dict, vedges: Optional[list] = None, cols: Optional[list] = None) -> list[dict]:
@@ -558,6 +612,7 @@ def annotate_segments(blocks: list, cells: list, vedges: list, thin: list) -> se
 def extract_units(page, table_cells: Optional[list] = None) -> list[Unit]:
     """네이티브(텍스트 레이어가 있는) 페이지에서 번역 단위를 추출."""
     d = page.get_text("dict", flags=TEXT_FLAGS)
+    split_icon_spans(page, d)
     vedges, hedges, thin = page_geometry(page)
     cells = merge_unruled_cells(find_table_cells(page) if table_cells is None else table_cells, hedges)
     units: list[Unit] = []
@@ -704,15 +759,47 @@ def figure_regions(page, min_w: float = 40, min_h: float = 20) -> list["fitz.Rec
         changed = False
         out: list = []
         for r in rects:
-            for o in out:
+            for k, o in enumerate(out):
                 if r.intersects(o):
-                    o |= r
+                    out[k] = o | r  # 목록의 항목을 직접 바꾼다 (지역 변수만 바꾸면 합쳐진 그림이 사라진다)
                     changed = True
                     break
             else:
                 out.append(fitz.Rect(r))
         rects = out
     return rects
+
+
+def photo_regions(page) -> list[tuple]:
+    """스캔 페이지에서 '사진'으로 보고 OCR 에서 뺄 그림 영역.
+    그림들이 페이지의 70% 이상을 덮으면 그 그림이 곧 페이지(스캔본, 여러 조각으로 잘라 저장한 스캔 포함)이므로
+    아무것도 빼지 않는다 → 빈 목록. (그 경우 사진 위의 짧은 글자는 OCR 엔진의 배경 검사로 걸러진다)"""
+    try:
+        infos = page.get_image_info()
+    except Exception:  # noqa: BLE001
+        return []
+    pr = page.rect
+    rects = []
+    for im in infos:
+        r = fitz.Rect(im["bbox"]) & pr
+        if not r.is_empty and r.width >= 40 and r.height >= 20:
+            rects.append(r)
+    if not rects:
+        return []
+    gw, gh = 60, 84  # 겹친 그림을 두 번 세지 않도록 격자에 칠해서 덮인 비율을 잰다
+    grid = [[False] * gw for _ in range(gh)]
+    for r in rects:
+        x0 = max(0, int((r.x0 - pr.x0) / pr.width * gw))
+        x1 = min(gw, int((r.x1 - pr.x0) / pr.width * gw + 0.999))
+        y0 = max(0, int((r.y0 - pr.y0) / pr.height * gh))
+        y1 = min(gh, int((r.y1 - pr.y0) / pr.height * gh + 0.999))
+        for y in range(y0, y1):
+            row = grid[y]
+            for x in range(x0, x1):
+                row[x] = True
+    if sum(sum(row) for row in grid) >= 0.7 * gw * gh:
+        return []
+    return [tuple(r) for r in rects if abs(r) < 0.6 * abs(pr)]
 
 
 def build_ocr_engine(cfg: Config):
@@ -819,6 +906,8 @@ def block_to_unit(pno: int, b) -> Unit:
              color=0, bold=b.bold, origin_y=b.origin_y, align=b.align, ocr=True,
              source=b.source, conf=b.conf, cell=fitz.Rect(b.cell) if b.cell else None,
              fg=tuple(b.fg), bg=tuple(b.bg))
+    if getattr(b, "busy", False):
+        u.scope_keep = "사진/무늬 배경 위의 글자 → 원문 유지"
     if b.conf < 80:
         u.notes.append(f"OCR_LOW_CONF({b.conf:.0f}) 원문 확인")
     return u
@@ -1405,6 +1494,14 @@ def render_page(page, units: list[Unit], fonts, cfg: Config) -> dict:
         if miss:  # 어느 글꼴에도 없는 글자: 같은 뜻의 기본 글자로 바꿔 본다 (− → -, ₂ → 2 …)
             u.ko = "".join(DENORM.get(c, c) if c in miss else c for c in u.ko)
             miss = sorted({c for c in u.ko if not c.isspace() and not font.has_glyph(ord(c))})
+        if miss and all(0xE000 <= ord(c) <= 0xF8FF for c in miss):
+            # 문장 중간의 글꼴 전용 아이콘: 아이콘만 빼고 번역문을 넣는다 (문구 전체를 영어로 남기지 않음)
+            u.ko = re.sub(r"[ ]{2,}", " ", "".join("" if c in miss else c for c in u.ko)).strip()
+            u.notes.append("ICON_DROPPED(글꼴 전용 아이콘 " + str(len(miss)) + "종 생략 - 원본 확인)")
+            miss = []
+            if not u.ko:
+                todo.remove(u)
+                continue
         if miss:  # 그래도 없으면 그리면 □□□ 로 깨짐 → 원문 유지
             todo.remove(u)
             u.notes.append("GLYPH_MISSING(글꼴에 없는 글자 " + "".join(miss[:8]) + " → 원문 유지)")
@@ -1639,7 +1736,10 @@ def prepare_units(doc, cfg: Config, protector: Protector, overrides: dict[str, s
             continue
         if cls in ("scanned", "invisible", "forced"):
             if ocr_ok:
-                jobs.append((pno, "page", fitz.Rect(page.rect), []))
+                # 글자는 도형(윤곽선)으로, 사진은 그림으로 들어 있는 페이지(카탈로그): 사진 속 간판·명판 글자는 읽지 않는다
+                # (사진 위에 번역문을 덧씌우면 그림이 망가진다). 페이지 대부분을 덮는 그림(스캔본)은 제외하지 않는다
+                photos = [] if cfg.ocr_figures else photo_regions(page)
+                jobs.append((pno, "page", fitz.Rect(page.rect), photos))
             continue
         try:
             units = extract_units(page)
@@ -1663,6 +1763,13 @@ def prepare_units(doc, cfg: Config, protector: Protector, overrides: dict[str, s
                 assign_ocr_words(per_page.get(pno, []), res.get(i, []))
                 continue
             for b in res.get(i, []):
+                # 신뢰도가 낮은 짧은 조각(그림·로고·괘선을 글자로 잘못 읽은 것)은 버린다
+                # (모음이 든 3글자 이상 낱말이 2개 미만이면서 신뢰도 78 미만 → 원본 그림 그대로 둔다)
+                good = [w for w in re.findall(r"[A-Za-z]{3,}", b.text) if re.search(r"[aeiouyAEIOUY]", w)]
+                if b.conf < 78 and len(good) < 2:
+                    continue
+                if b.cell is None and b.conf < 90 and len(re.sub(r"[^A-Za-z]", "", b.text)) < 3:
+                    continue  # 표 밖에 홀로 있는 한두 글자 조각
                 per_page.setdefault(pno, []).append(block_to_unit(pno, b))
     all_units: list[Unit] = []
     for pno in pages:
