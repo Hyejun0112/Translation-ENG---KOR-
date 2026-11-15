@@ -38,7 +38,7 @@ try:
 except ImportError:  # pragma: no cover
     pytesseract = None  # type: ignore
 
-OCR_VERSION = "14"  # OCR 로직이 바뀌면 올려서 캐시를 무효화
+OCR_VERSION = "15"  # OCR 로직이 바뀌면 올려서 캐시를 무효화
 
 DEFAULT_BULLET_RE = re.compile(
     r"^\s*(?:[•●▪■◦○‣·*\-–—]|\(?\d{1,3}[.)]|\(?[a-zA-Z][.)]|\d+(?:\.\d+)+\.?)\s+"
@@ -366,13 +366,16 @@ def words_to_lines(words: list[Word], gap_factor: float) -> list[Line]:
         best, best_gap = None, 0.0
         for c in chains:
             gap = w.x0 - c["x1"]
-            if gap > c["max_gap"] or gap < -0.5 * max(c["h"], w.h):
+            if gap > c["max_gap"]:
                 continue
             ov = min(c["y1"], w.y1) - max(c["y0"], w.y0)
-            if ov < 0.5 * min(c["y1"] - c["y0"], w.h):
+            # 앞 단어 상자가 너무 넓게 잡혀 이 단어를 덮은 경우(gap < 0)도 같은 줄로 잇되, 세로 겹침을 더 엄격히 본다
+            need = 0.5 if gap >= -0.5 * max(c["h"], w.h) else 0.7
+            if ov < need * min(c["y1"] - c["y0"], w.h):
                 continue
-            if best is None or gap < best_gap:
-                best, best_gap = c, gap
+            g = max(gap, 0.0)
+            if best is None or g < best_gap:
+                best, best_gap = c, g
         if best is None:
             chains.append({"words": [w], "x1": w.x1, "y0": w.y0, "y1": w.y1, "h": w.h,
                            "max_gap": max(gap_factor * w.h, 6)})
