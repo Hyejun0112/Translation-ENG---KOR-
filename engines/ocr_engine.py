@@ -38,7 +38,7 @@ try:
 except ImportError:  # pragma: no cover
     pytesseract = None  # type: ignore
 
-OCR_VERSION = "15"  # OCR 로직이 바뀌면 올려서 캐시를 무효화
+OCR_VERSION = "19"  # OCR 로직이 바뀌면 올려서 캐시를 무효화
 
 DEFAULT_BULLET_RE = re.compile(
     r"^\s*(?:[•●▪■◦○‣·*\-–—]|\(?\d{1,3}[.)]|\(?[a-zA-Z][.)]|\d+(?:\.\d+)+\.?)\s+"
@@ -84,6 +84,7 @@ class Word:
 @dataclass
 class Line:
     words: list
+    marker: bool = False   # 줄 맨 앞의 글머리표/로고 조각을 떼어낸 줄 (새 문단의 시작)
 
     @property
     def x0(self):
@@ -357,6 +358,22 @@ def ink_band_height(gray: "np.ndarray", box: tuple) -> tuple[float, int]:
 # ----------------------------------------------------------------------------
 # 단어 → 줄 → 블록 묶기
 # ----------------------------------------------------------------------------
+LABEL_RE = re.compile(r"^\(?\d{1,2}[.)]$|^\(?[A-Za-z][.)]$")  # '1.' '(2)' 'a)' - 번호/기호 목록은 글에 포함
+
+
+def is_junk_marker(t: str, conf: float = 100.0) -> bool:
+    """줄 맨 앞의 글머리표 조각 또는 로고/아이콘을 글자로 잘못 읽은 것 (')' '}' '»' ':Q)' 'Q)' …).
+    번호 목록('1.', 'a)')은 글의 일부이므로 해당 없음. 단 신뢰도가 낮은(70 미만) 짧은 기호 섞인 조각은 로고로 본다."""
+    if len(t) > 4:
+        return False
+    alnum = sum(c.isalnum() for c in t)
+    if alnum < len(t) and len(t) <= 3 and conf < 70 and not re.fullmatch(r"\(?\d{1,2}[.)]", t):
+        return True  # 낮은 신뢰도 + 기호 포함: 로고/아이콘
+    if LABEL_RE.match(t):
+        return False
+    return alnum == 0 or (alnum <= 1 and len(t) - alnum >= 2)
+
+
 def words_to_lines(words: list[Word], gap_factor: float) -> list[Line]:
     """단어를 줄로 묶는다. 왼쪽에서 오른쪽으로, 바로 왼쪽에 있는(세로로 겹치고 간격이 좁은) 단어 뒤에 이어 붙인다.
     페이지 전체 폭으로 행을 만들지 않는다 → 2단 편집에서 옆 단의 글자(기준선이 조금 다름) 때문에
@@ -388,7 +405,23 @@ def words_to_lines(words: list[Word], gap_factor: float) -> list[Line]:
         best["y1"] = median([x.y1 for x in tail])
         best["h"] = median([x.h for x in ws])
         best["max_gap"] = max(gap_factor * best["h"], 6)
-    return [Line(c["words"]) for c in chains]
+    out: list[Line] = []
+    for c in chains:
+        ws = sorted(c["words"], key=lambda w: w.x0)
+        marker = False
+        # 맨 앞 조각이 글머리표/아이콘이면 글에서 떼어 낸다 → 원본 그림에 그대로 남고(덮지 않음) 번역문에 잡음이 끼지 않는다
+        for _ in range(2):  # 로고가 두 조각('Q)' 'aN')으로 읽히기도 한다
+            if len(ws) < 2 or ws[1].x0 - ws[0].x1 > 3.5 * max(ws[1].h, 1.0):
+                break
+            w0 = ws[0]
+            if is_junk_marker(w0.text, w0.conf) or (marker and len(w0.text) <= 2 and w0.conf <= 60):
+                # 로고 상자 안에 들어 있는 작은 조각들(로고의 일부를 글자로 읽은 것)도 함께 뗀다
+                ws = [w for w in ws[1:] if not (w.x0 >= w0.x0 - 1 and w.x1 <= w0.x1 + 1 and w.h < 0.8 * w0.h)]
+                marker = True
+            else:
+                break
+        out.append(Line(ws, marker))
+    return out
 
 
 def _line_break_intended(last: Line, ln: Line, right: float) -> bool:
@@ -415,7 +448,7 @@ def lines_to_blocks(lines: list[Line], bullet_re, merge_all: bool = False,
     lines = sorted(lines, key=lambda l: (l.y0, l.x0))
     blocks: list[list[Line]] = []
     for ln in lines:
-        is_bullet = bool(bullet_re.match(ln.text))
+        is_bullet = bool(bullet_re.match(ln.text)) or ln.marker
         target = None
         if not is_bullet:
             for b in reversed(blocks[-6:]):

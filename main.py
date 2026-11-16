@@ -113,6 +113,7 @@ if __name__ == "__main__":
 import argparse  # noqa: E402
 import json  # noqa: E402
 import logging  # noqa: E402
+import re  # noqa: E402
 import shutil  # noqa: E402
 import traceback  # noqa: E402
 from collections import Counter  # noqa: E402
@@ -122,11 +123,11 @@ from typing import Optional  # noqa: E402
 import config  # noqa: E402
 from config import Config  # noqa: E402
 from engines.glossary_engine import (  # noqa: E402
-    Glossary, Protector, load_keep_patterns, missing_protected, restore_tokens,
+    Glossary, Protector, fix_particles, load_keep_patterns, missing_protected, restore_tokens,
 )
 from engines.pdf_engine import (  # noqa: E402
     Unit, build_fonts, build_ocr_engine, classify_unit, clean_text, describe_classes, detach_annotations, fitz,
-    draw_layout_debug, parse_pages, prepare_units, render_page, restore_annotations, select_pages_safe,
+    draw_layout_debug, parse_pages, prepare_units, remap_toc, render_page, restore_annotations, select_pages_safe,
     save_pdf_safe,
 )
 from engines.qa_engine import load_overrides, verify_output, write_glossary_xlsx, write_log_xlsx  # noqa: E402
@@ -298,7 +299,7 @@ def output_paths(src: Path) -> tuple[Path, Path]:
 
 
 # 레이아웃 코드가 바뀌면 이 값을 올린다 → 예전에 만든 결과도 자동으로 다시 만든다
-LAYOUT_VERSION = "2026-11-16a"
+LAYOUT_VERSION = "2026-11-17a"
 STAMP_FILE = ".om_stamps.json"
 _sha_memo: dict = {}
 
@@ -386,7 +387,9 @@ def process_pdf(src: Path, cfg: Config, backend, gloss: Glossary, protector: Pro
               f"(p.{', '.join(str(p + 1) for p in need_ocr[:10])}) → Tesseract 설치 필요")
 
     # 북마크(목차) 번역 - 전체 페이지 처리 시
-    toc = doc.get_toc(simple=True) if cfg.pages is None else []
+    # 북마크(목차): 전체 번역이면 모두, 일부 페이지만 번역하면 그 페이지의 북마크만 (새 쪽 번호로 다시 연결)
+    sel = set(pages)
+    toc = [t for t in doc.get_toc(simple=True) if cfg.pages is None or (t[2] - 1) in sel]
     toc_units = []
     for lvl, title, pg in toc:
         tu = Unit(page=pg - 1, idx=-1, rect=fitz.Rect(), text=clean_text(title), size=0, color=0,
@@ -401,6 +404,8 @@ def process_pdf(src: Path, cfg: Config, backend, gloss: Glossary, protector: Pro
     if use_tm:
         for u in all_units:
             if u.status == "PENDING":
+                if re.search(r"\b\d{1,2}[.)][A-Z]{3,}", u.text):
+                    continue  # '1.FUSES:' 처럼 번호+대문자 제목: 예전 보호 규칙으로 저장된 번역은 다시 번역
                 hit = tm_get(cache, u.text)
                 if hit is not None:
                     u.ko, u.status = hit, "FROM_TM"
@@ -419,12 +424,14 @@ def process_pdf(src: Path, cfg: Config, backend, gloss: Glossary, protector: Pro
                 u.status = "FAILED"
                 u.notes.append("번역 실패/보호 토큰 불일치 → 원문 영어 유지")
                 continue
-            u.ko = restore_tokens(ko, u.tokens)
+            u.ko = fix_particles(restore_tokens(ko, u.tokens))  # 'PUB002-041을(를)' → 'PUB002-041을'
             if use_tm:
                 tm_put(cache, u.text, u.ko)
         elif u.status == "OVERRIDE":
             tm_put(cache, u.text, u.ko)
         if u.status in ("PENDING", "FROM_TM", "OVERRIDE") and u.ko is not None:
+            if u.status == "FROM_TM":
+                u.ko = fix_particles(u.ko)  # 예전에 저장된 번역 메모리 항목도 조사 보정
             if clean_text(u.ko) == u.text:
                 u.ko, u.status = None, "UNCHANGED"
                 continue
@@ -457,16 +464,25 @@ def process_pdf(src: Path, cfg: Config, backend, gloss: Glossary, protector: Pro
                     if u.ko:
                         u.notes.append(f"RENDER_FAILED: {e}")
     restore_annotations(doc, annot_stash)
-    if toc_units and any(t.ko for t in toc_units):
+    toc_new = [[lvl, (tu.ko or title), pg] for (lvl, title, pg), tu in zip(toc, toc_units)]
+    if cfg.pages is None and toc_units and any(t.ko for t in toc_units):
         try:
-            doc.set_toc([[lvl, (tu.ko or title), pg] for (lvl, title, pg), tu in zip(toc, toc_units)])
+            doc.set_toc(toc_new)
         except Exception as e:  # noqa: BLE001
             print(f"  ! 북마크 번역 반영 실패: {e}", file=sys.stderr)
 
     config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     if cfg.pages is not None:
+        src_meta = dict(doc.metadata or {})
         out_doc = select_pages_safe(doc, cfg.pages)
         translated_pages = {pages.index(p) for p in translated_pages}
+        try:  # 문서 정보(제목/작성 프로그램 …)와 북마크를 새 문서에 이어 준다
+            out_doc.set_metadata({k: v for k, v in src_meta.items()
+                                  if k in ("title", "author", "subject", "keywords", "creator", "producer",
+                                           "creationDate", "modDate", "trapped") and v})
+            out_doc.set_toc(remap_toc(toc_new, cfg.pages))
+        except Exception as e:  # noqa: BLE001
+            print(f"  ! 문서 정보/북마크 복원 실패: {e}", file=sys.stderr)
     else:
         out_doc = doc
     try:

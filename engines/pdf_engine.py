@@ -34,7 +34,7 @@ except ImportError:  # pragma: no cover
 
 from config import Config
 from engines.glossary_engine import BULLET_RE, Protector, clean_text, needs_translation
-from engines.scope_engine import A4_AREA, load_scope_keywords, page_scope
+from engines.scope_engine import A4_AREA, load_scope_keywords, page_scope, smooth_scopes
 from engines.table_engine import (
     cell_merge, column_merge, continues, find_table_cells, is_tabular, line_merge, mark_keep_columns,
     merge_unruled_cells, x_ok,
@@ -1822,6 +1822,10 @@ def prepare_units(doc, cfg: Config, protector: Protector, overrides: dict[str, s
                 scopes[pno] = page_scope(doc[pno], us, drawing_counts.get(pno, 0))
             else:
                 scopes[pno] = (True, "")
+    if cfg.scope == "om":
+        smooth_scopes(pages, scopes, per_page)  # 앞뒤가 모두 데이터시트/도면인데 혼자 번역되는 쪽 바로잡기
+    for pno in pages:
+        us = per_page[pno]
         ok, why = scopes[pno]
         for i, u in enumerate(us):
             u.idx = i
@@ -1830,9 +1834,70 @@ def prepare_units(doc, cfg: Config, protector: Protector, overrides: dict[str, s
             elif cfg.scope != "om":
                 u.scope_keep = ""
             all_units.append(u)
+    extra = ""
+    if any(u.ocr for u in all_units):
+        # 문서 전체의 글자층(OCR 하지 않은 쪽 포함)도 철자 참고로 쓴다 - 일부 쪽만 번역해도 'PUB002-…' 같은 계열을 알 수 있게
+        try:
+            extra = " ".join(doc[i].get_text()[:30000] for i in range(len(doc)) if i not in per_page or
+                             not any(u.ocr for u in per_page.get(i, [])))
+        except Exception:  # noqa: BLE001
+            extra = ""
+    fix_ocr_tokens(all_units, extra)
     for u in all_units:
         classify_unit(u, protector, overrides)
     return all_units, classes, n_fig, scopes
+
+
+TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9\-_/.]*[A-Za-z0-9]")
+LEAD_DIGIT_RE = re.compile(r"^([10])([A-Z]{1,4}\d[\w.\-]*)$")           # 1Q3, 1QT3 (모델명이 숫자로 시작)
+ZERO_O_RE = re.compile(r"^([A-Z]{2,4}?)(O{1,3})(\d{1,4})((?:-[\w.]+)*)$")  # PUBOO2-137, PUBO02-040
+
+
+def fix_ocr_tokens(units: list[Unit], extra_text: str = "") -> int:
+    """OCR 이 잘못 읽은 식별자(모델명·문서번호)를 바로잡는다. '철자가 많이 나오는 쪽'이 아니라 식별자의 모양으로 판단한다
+    (스캔 쪽에서는 오독된 철자가 더 많이 나올 수 있다) - 정상 철자는 절대 바꾸지 않는다.
+      1) 숫자로 시작하는 모델명 '1Q3' → 'IQ3' (같은 문서 어딘가에 'IQ3' 가 이미 있을 때)
+      2) 글자 뒤의 'O' 가 0 인 번호 'PUBOO2-137' → 'PUB002-137' (같은 문서에 'PUB002-…' 형태가 있을 때)"""
+    cnt: Counter = Counter()
+    fam: Counter = Counter()
+    for text in [u.text for u in units] + ([extra_text] if extra_text else []):
+        for t in TOKEN_RE.findall(text):
+            if re.search(r"\d", t) and re.search(r"[A-Za-z]", t):
+                cnt[t] += 1
+                fam[re.split(r"[-.]", t)[0]] += 1  # 'PUB002-041' → 'PUB002'
+
+    def fix(tok: str) -> str:
+        m = LEAD_DIGIT_RE.match(tok)
+        if m:
+            cand = ("I" if m.group(1) == "1" else "O") + m.group(2)
+            base = re.sub(r"[A-Z]+$", "", re.split(r"[-.]", cand)[0])  # 'IQ3M' → 'IQ3'
+            if cnt[cand] >= 1 or fam[re.split(r"[-.]", cand)[0]] >= 1 or (len(base) >= 3 and fam[base] >= 1):
+                return cand
+        m = ZERO_O_RE.match(tok)
+        if m:
+            head = m.group(1) + "0" * len(m.group(2)) + m.group(3)
+            if fam[head] >= 1:  # 'PUB002' 계열이 문서에 있음
+                return head + m.group(4)
+        return tok
+
+    n = 0
+    for u in units:
+        if not (u.ocr or u.source in ("native-ocr", "ocr-page", "ocr-figure")):
+            continue
+        changes = []
+
+        def rep(m):
+            new = fix(m.group(0))
+            if new != m.group(0):
+                changes.append(f"{m.group(0)}→{new}")
+            return new
+
+        txt = TOKEN_RE.sub(rep, u.text)
+        if changes:
+            u.text = txt
+            u.notes.append("OCR_FIXED(" + ", ".join(changes[:4]) + ")")
+            n += len(changes)
+    return n
 
 
 def classify_unit(u: Unit, protector: Protector, overrides: dict[str, str]):
@@ -1860,6 +1925,21 @@ def classify_unit(u: Unit, protector: Protector, overrides: dict[str, str]):
 def describe_classes(classes: dict[int, str]) -> str:
     c = Counter(classes.values())
     return ", ".join(f"{PAGE_CLASS_KO.get(k, k)} {v}p" for k, v in c.most_common())
+
+
+def remap_toc(toc: list, pages: list[int]) -> list:
+    """북마크 [[수준, 제목, 원본 쪽번호(1부터)], …] 를 '지정 페이지만 남긴 문서'의 쪽번호로 바꾼다.
+    남기지 않은 쪽의 북마크는 버리고, 수준이 갑자기 깊어지지 않게(set_toc 조건) 정리한다."""
+    pos = {p: i + 1 for i, p in enumerate(pages)}
+    out = []
+    prev = 0
+    for lvl, title, pg in toc:
+        if (pg - 1) not in pos:
+            continue
+        lvl = 1 if not out else min(max(1, lvl), prev + 1)
+        out.append([lvl, title, pos[pg - 1]])
+        prev = lvl
+    return out
 
 
 def select_pages_safe(doc, pages: list[int]):

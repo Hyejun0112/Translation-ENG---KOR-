@@ -34,6 +34,8 @@ EXCLUDE_TITLE_KW = [
     r"fuel\s+specification", r"certificates?", r"inspection\s+report", r"test\s+report",
     r"packing\s+list", r"shipping\s+list", r"P\s*&\s*I\s*D", r"piping\s+(?:and|&)\s+instrument(?:ation)?\s+diagram",
     r"process\s+flow\s+diagram", r"\bPFD\b", r"logic\s+diagram", r"wiring\s+diagram",
+    r"circuit\s+diagram", r"basic\s+diagram", r"connection\s+diagram", r"schematic\s+diagram",
+    r"terminal\s+(?:connection\s+)?diagram", r"block\s+diagram",
     r"single\s+line\s+diagram", r"loop\s+diagram", r"general\s+arrangement", r"\bGA\s+drawing",
     r"arrangement\s+drawing", r"dimension(?:al)?\s+drawing", r"hook[\s-]*up", r"DCS\s+screen",
     r"PLC\s+screen", r"HMI\s+screen",
@@ -126,6 +128,33 @@ def cover_page_reason(page, units: list[Unit]) -> str:
     return ""
 
 
+# 도면 표제란의 항목 이름 ('Circuit Diagram Number 100B0010'): 회로도 쪽은 어디에 있든 이 글이 있다
+DIAGRAM_NO_RE = re.compile(r"circuit\s+diagram\s+(?:number|no\b)", re.I)
+
+KEPT_TITLE_REASONS = ("제외 문서 제목", "데이터시트/양식", "도면")
+
+
+def smooth_scopes(pages: list[int], scopes: dict, units_by_page: dict) -> None:
+    """같은 문서(데이터시트·회로도)의 쪽인데 제목이 없어서 혼자 번역 대상이 된 쪽을 바로잡는다.
+    바로 앞 쪽과 바로 뒤 쪽이 모두 '제목 때문에' 원문 유지이고, 이 쪽은 문장 위주도 목차도 아니면 원문 유지.
+    (예: 제작사 데이터시트 6쪽 중 가운데 한 쪽만 제목 머리글이 없어 번역되던 문제)"""
+    before = dict(scopes)
+    have = set(pages)
+    for p in pages:
+        if (p - 1) not in have or (p + 1) not in have:
+            continue
+        ok, why = before.get(p, (True, ""))
+        if not ok or why:
+            continue
+        (oa, wa), (ob, wb) = before.get(p - 1, (True, "")), before.get(p + 1, (True, ""))
+        if oa or ob or not (wa.startswith(KEPT_TITLE_REASONS) and wb.startswith(KEPT_TITLE_REASONS)):
+            continue
+        us = units_by_page.get(p, [])
+        if not us or is_prose_page(us) or is_toc_page(us):
+            continue
+        scopes[p] = (False, "앞뒤 쪽이 모두 원문 유지(데이터시트/도면) → 같은 문서의 쪽으로 보고 원문 유지")
+
+
 def page_scope(page, units: list[Unit], drawings_count: int) -> tuple[bool, str]:
     """(번역 여부, 사유)"""
     area = abs(page.rect)
@@ -161,6 +190,9 @@ def page_scope(page, units: list[Unit], drawings_count: int) -> tuple[bool, str]
             labels = [u.text for u in units if re.search(r"[A-Za-z]{3,}", u.text) and not re.search(r"\d", u.text)]
             if len(labels) >= 25 and sum(1 for t in labels if t.isupper()) >= 0.85 * len(labels):
                 return False, "데이터시트/양식 페이지 (표 칸의 대문자 항목 위주)"
+        for u in units:
+            if len(u.text) <= 40 and DIAGRAM_NO_RE.search(u.text):
+                return False, "회로도/도면 페이지 (표제란 'Circuit Diagram Number')"
         # 도면/데이터시트의 표제란: 페이지 어디에 있든, 짧은 글이 거의 제외 키워드로만 이루어져 있으면 제목으로 본다
         # (예: 오른쪽 아래 표제란의 'DIMENSIONAL DRAWING FOR …'). 그림 설명문('Figure 3: Wiring diagram for …')은 제외
         for u in units:

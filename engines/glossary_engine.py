@@ -59,6 +59,9 @@ DEFAULT_KEEP_PATTERNS = [
 ]
 
 
+NUMBERED_WORD_RE = re.compile(r"^(\d{1,2}[.)])[A-Z][A-Z]{2,}$")
+
+
 NUM_RE = re.compile(r"(?<![\w.])\d+(?:[.,]\d+)*(?![\w])")
 
 
@@ -219,6 +222,12 @@ class Protector:
         spans += self.glossary.keep_spans(text)
         if tokenize_numbers:
             spans += [(m.start(), m.end()) for m in NUM_RE.finditer(text)]
+        # '1.FUSES:' '2.REMOTE' 처럼 번호에 낱말이 바로 붙은 제목은 Tag 가 아니다 → 번호만 보호하고 낱말은 번역
+        fixed = []
+        for s, e in spans:
+            m = NUMBERED_WORD_RE.match(text[s:e])
+            fixed.append((s, s + len(m.group(1))) if m else (s, e))
+        spans = fixed
         spans.sort()
         merged: list[list[int]] = []
         for s, e in spans:
@@ -242,6 +251,91 @@ def restore_tokens(ko: str, tokens: list[str]) -> str:
         return tokens[i] if 0 <= i < len(tokens) else m.group(0)
 
     return TOKEN_RE.sub(rep, ko)
+
+
+# ----------------------------------------------------------------------------
+# 한국어 조사 보정: Tag/숫자/영문 약어(보호 토큰) 뒤의 '은(는)', '을(를)' 같은 병기 형태를 올바른 조사로 바꾼다
+# (번역 모델은 보호 토큰의 실제 글자를 볼 수 없어서 받침을 알 수 없다)
+# ----------------------------------------------------------------------------
+# (받침 있음, 받침이 ㄹ)  - 한국어로 읽을 때의 마지막 소리 기준
+_DIGIT_JONG = {"0": (True, False), "1": (True, True), "2": (False, False), "3": (True, False), "4": (False, False),
+               "5": (False, False), "6": (True, False), "7": (True, True), "8": (True, True), "9": (False, False)}
+# 영문 대문자 읽기: 엘, 엠, 엔, 알 만 받침이 있다 (에이, 비, 씨, 디, 이, 에프, 지, 에이치, 아이, 제이, 케이, 오, 피, 큐,
+# 에스, 티, 유, 브이, 더블유, 엑스, 와이, 제트 는 받침 없음)
+_LETTER_JONG = {"L": (True, True), "R": (True, True), "M": (True, False), "N": (True, False)}
+
+PARTICLES = [  # (병기 형태들, 받침 있을 때, 받침 없을 때, ㄹ받침일 때(다르면))
+    (("은(는)", "는(은)"), "은", "는", None),
+    (("을(를)", "를(을)"), "을", "를", None),
+    (("이(가)", "가(이)"), "이", "가", None),
+    (("과(와)", "와(과)"), "과", "와", None),
+    (("이나(나)", "(이)나"), "이나", "나", None),
+    (("이란(란)", "(이)란"), "이란", "란", None),
+    (("이며(며)", "(이)며"), "이며", "며", None),
+    (("이라(라)", "(이)라"), "이라", "라", None),
+    (("으로(로)", "로(으로)", "(으)로"), "으로", "로", "로"),
+]
+_PARTICLE_RE = re.compile("(" + "|".join(re.escape(f) for ps, *_ in PARTICLES for f in ps) + ")")
+_SKIP_BACK = set(")]}\"'”’»>*,.;:")
+
+
+# 단위는 한국어로 읽는 소리 기준 (킬로그램, 밀리미터, 파스칼, 바 …)
+_UNIT_JONG = {"kg": (True, False), "mm": (False, False), "cm": (False, False), "km": (False, False),
+              "m": (False, False), "bar": (False, False), "psi": (False, False), "Pa": (True, True),
+              "kPa": (True, True), "MPa": (True, True), "Hz": (False, False), "rpm": (True, False),
+              "ppm": (True, False), "g": (True, False), "kW": (False, False), "kV": (False, False),
+              "kA": (False, False), "mA": (False, False), "Vac": (False, False), "Vdc": (False, False),
+              "%": (False, False), "℃": (False, False), "°C": (False, False), "mmH2O": (False, False)}
+_UNITS_BY_LEN = sorted(_UNIT_JONG, key=len, reverse=True)
+
+
+def _jong_of(prev: str):
+    """prev: 조사 바로 앞 글자들. 반환 (받침 있음, ㄹ받침) 또는 알 수 없으면 None"""
+    i = len(prev) - 1
+    while i >= 0 and prev[i] in _SKIP_BACK:  # 닫는 괄호/따옴표/문장부호는 건너뜀
+        i -= 1
+    if i < 0:
+        return None
+    head = prev[:i + 1]
+    for u in _UNITS_BY_LEN:  # 숫자나 공백 바로 뒤의 단위
+        if head.endswith(u) and (len(head) == len(u) or not head[-len(u) - 1].isalpha()):
+            if len(head) > len(u) and (head[-len(u) - 1].isdigit() or head[-len(u) - 1] in " /"):
+                return _UNIT_JONG[u]
+    c = prev[i]
+    if "가" <= c <= "힣":
+        j = (ord(c) - 0xAC00) % 28
+        return (j != 0, j == 8)
+    if c in _DIGIT_JONG:
+        return _DIGIT_JONG[c]
+    if c.isascii() and c.isalpha():
+        if c.isupper():
+            return _LETTER_JONG.get(c, (False, False))
+        # 소문자: 단위(mm, kg, bar …)는 읽는 법이 갈려 판단하지 않는다. 단, 앞이 숫자+Vac/Vdc 같은 끝이 c/d/e/a 등이면 받침 없음
+        return (False, False) if c in "acdefghijkopqstuvwxyz" else None
+    return None
+
+
+def fix_particles(ko: str) -> str:
+    """'PUB002-041을(를)' → 'PUB002-041을', '5A을(를)' → '5A를', '-PS1은(는)' → '-PS1은' (한글/숫자/영문 대문자 기준)"""
+    if not ko or "(" not in ko and "로" not in ko:
+        return ko
+    table = {}
+    for forms, yes, no, rieul in PARTICLES:
+        for f in forms:
+            table[f] = (yes, no, rieul)
+
+    def rep(m: "re.Match") -> str:
+        form = m.group(1)
+        j = _jong_of(ko[:m.start()])
+        if j is None:
+            return form
+        yes, no, rieul = table[form]
+        has, is_r = j
+        if not has:
+            return no
+        return rieul if (rieul and is_r) else yes
+
+    return _PARTICLE_RE.sub(rep, ko)
 
 
 def tokens_ok(src_ptxt: str, ko: str) -> bool:
