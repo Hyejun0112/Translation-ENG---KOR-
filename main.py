@@ -52,13 +52,39 @@ REQUIRED_MODULES = {
 }
 
 
+def _missing_packages(python: str | None = None) -> list[str]:
+    """지금 실행 중인 python(또는 지정한 python)에 없는 필수 패키지 목록."""
+    if python is None:
+        return [pip for mod, pip in REQUIRED_MODULES.items() if importlib.util.find_spec(mod) is None]
+    code = ("import importlib.util,sys;"
+            "print(' '.join(p for m,p in %r if importlib.util.find_spec(m) is None))" % list(REQUIRED_MODULES.items()))
+    try:
+        r = subprocess.run([python, "-c", code], capture_output=True, text=True, timeout=60,
+                           creationflags=0x08000000 if os.name == "nt" else 0)
+        return r.stdout.split() if r.returncode == 0 else list(REQUIRED_MODULES.values())
+    except Exception:  # noqa: BLE001
+        return list(REQUIRED_MODULES.values())
+
+
 def ensure_packages() -> None:
-    missing = [pip for mod, pip in REQUIRED_MODULES.items() if importlib.util.find_spec(mod) is None]
+    missing = _missing_packages()
     if not missing:
         return
+    # 필요한 패키지는 프로젝트 전용 .venv 에 설치되어 있다. 다른 Python(시스템 Python, VS Code F5, python main.py)으로
+    # 실행되었으면 .venv 의 python 으로 다시 실행한다 (프로그램 창의 출력 파이프는 그대로 이어진다)
+    venv_py = os.environ.get("OM_VENV_PYTHON") or _venv_python()
+    here = os.path.normcase(os.path.abspath(sys.executable))
+    if venv_py and os.path.normcase(os.path.abspath(venv_py)) != here and not os.environ.get("OM_REEXEC"):
+        if not _missing_packages(venv_py):
+            env = dict(os.environ, OM_REEXEC="1")
+            sys.exit(subprocess.call([venv_py, *sys.argv], env=env))
     if os.environ.get("OM_PACKAGES_INSTALLED"):
-        sys.exit("필요한 패키지를 설치하지 못했습니다: " + ", ".join(missing) +
-                 f"\n직접 실행: \"{sys.executable}\" -m pip install -r requirements.txt")
+        sys.exit("필요한 패키지가 없는 Python 으로 실행되었습니다: " + sys.executable +
+                 "\n  없는 패키지: " + ", ".join(missing) +
+                 ("\n  → 프로그램 전용 환경(.venv)이 아직 없습니다. 탐색기에서 OM_Translator.pyw 를 더블클릭해서 실행하면"
+                  " 자동으로 만들어집니다." if not venv_py else
+                  "\n  → .venv 가 손상된 것 같습니다. .venv 폴더를 지우고 OM_Translator.pyw 를 다시 더블클릭하세요.") +
+                 f"\n  (직접 설치: \"{sys.executable}\" -m pip install -r requirements.txt)")
     print(f"[준비] 필요한 패키지 설치 중 (처음 한 번, 1~3분): {', '.join(missing)}", flush=True)
     subprocess.call([sys.executable, "-m", "pip", "install", "--upgrade", "pip", "-q"])
     rc = subprocess.call([sys.executable, "-m", "pip", "install", "-r", str(BASE_DIR / "requirements.txt")])
@@ -66,6 +92,16 @@ def ensure_packages() -> None:
         sys.exit("패키지 설치 실패. 인터넷/회사 프록시 설정을 확인하세요.")
     env = dict(os.environ, OM_PACKAGES_INSTALLED="1")
     sys.exit(subprocess.call([sys.executable, *sys.argv], env=env))
+
+
+def _venv_python() -> str | None:
+    """프로젝트 .venv 의 python (표준 라이브러리만으로 찾는다 - config 는 아직 import 하지 않음)"""
+    cands = ([BASE_DIR / ".venv" / "Scripts" / "python.exe"] if os.name == "nt"
+             else [BASE_DIR / ".venv" / "bin" / "python"])
+    for c in cands:
+        if c.exists():
+            return str(c)
+    return None
 
 
 if __name__ == "__main__":

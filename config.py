@@ -14,6 +14,7 @@ API 키는 이 파일이 아니라 프로젝트 폴더의 .env 파일에 저장�
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -168,6 +169,31 @@ def glossary_path() -> Optional[Path]:
     if GLOSSARY_FILE.exists():
         return GLOSSARY_FILE
     return None
+
+
+# ----------------------------------------------------------------------------
+# 프로그램 전용 Python (.venv)
+# ----------------------------------------------------------------------------
+VENV_DIR = BASE_DIR / ".venv"   # OM_Translator.pyw 가 처음 실행 때 만들고 필요한 패키지를 여기에 설치한다
+
+
+def venv_python(gui: bool = False) -> Optional[str]:
+    """프로젝트 .venv 의 python 경로. 없으면 None. gui=True 면 콘솔 창이 없는 pythonw(Windows)."""
+    if os.name == "nt":
+        cands = [VENV_DIR / "Scripts" / ("pythonw.exe" if gui else "python.exe"), VENV_DIR / "Scripts" / "python.exe"]
+    else:
+        cands = [VENV_DIR / "bin" / "python"]
+    for c in cands:
+        if c.exists():
+            return str(c)
+    return None
+
+
+def project_python(gui: bool = False) -> str:
+    """번역 엔진(main.py)을 실행할 python.
+    필요한 패키지는 .venv 에 설치되어 있으므로, 프로그램 창이 다른 Python(시스템 Python, VS Code 의 F5 등)으로
+    열렸더라도 엔진은 항상 .venv 의 python 으로 실행한다. .venv 가 없으면 지금 실행 중인 python."""
+    return venv_python(gui) or sys.executable
 
 
 def ensure_dirs() -> None:

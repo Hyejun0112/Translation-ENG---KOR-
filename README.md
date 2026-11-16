@@ -136,6 +136,7 @@ python tools\check_layout.py 원본.pdf output\원본_KR_O&M.pdf --png logs\chec
 | `.pyw` 더블클릭해도 반응 없음 | 우클릭 → 연결 프로그램 → Python. 또는 Python 3.12 재설치(PATH 체크) |
 | "API 키가 올바르지 않습니다" | console.anthropic.com 에서 키를 다시 복사해 [붙여넣기] → [저장] |
 | "크레딧(잔액)이 부족합니다" | console.anthropic.com → Billing 에서 충전 |
+| "필요한 패키지가 없는 Python 으로 실행되었습니다" | 프로그램 창을 VS Code(F5)나 `python gui.py` 로 열면 시스템 Python 이 쓰입니다. 엔진은 자동으로 `.venv` 의 Python 으로 다시 실행되며, `.venv` 가 없으면 **OM_Translator.pyw 더블클릭**으로 한 번 만들어 주세요 |
 | 목차/스캔 페이지가 영어로 남음 | [Tesseract(OCR) 설치] 후 [이미 번역된 파일도 다시 만들기] 체크하고 다시 번역 |
 | 결과 PDF 저장 실패 | Bluebeam 등에서 결과 PDF를 닫거나, 자동으로 `_시간` 붙은 이름으로 저장됨 |
 | 그 밖의 오류 | 진행 기록의 빨간 줄, 또는 [로그 폴더]의 로그 파일 확인 |

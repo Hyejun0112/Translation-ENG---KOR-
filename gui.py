@@ -369,7 +369,7 @@ class App(tk.Tk):
 
     # ================================================================== 실행
     def _base_args(self) -> list[str]:
-        a = [sys.executable, "-u", str(BASE_DIR / "main.py"), "--once", "--no-open",
+        a = [config.project_python(), "-u", str(BASE_DIR / "main.py"), "--once", "--no-open",
              "--model", label_to_model(self.v_model.get())]
         if self.v_pages.get().strip():
             a += ["--pages", self.v_pages.get().strip()]
@@ -609,11 +609,11 @@ class App(tk.Tk):
 
     def check_env(self):
         if not self.running:
-            self._run([sys.executable, "-u", str(BASE_DIR / "main.py"), "--check"], "check")
+            self._run([config.project_python(), "-u", str(BASE_DIR / "main.py"), "--check"], "check")
 
     def install_tesseract(self):
         if not self.running:
-            self._run([sys.executable, "-u", str(config.TOOLS_DIR / "install_tesseract.py")], "tools")
+            self._run([config.project_python(), "-u", str(config.TOOLS_DIR / "install_tesseract.py")], "tools")
 
     def on_close(self):
         if self.running and not messagebox.askyesno("종료", "번역이 진행 중입니다. 중지하고 닫을까요?\n"

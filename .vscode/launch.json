@@ -1,20 +1,25 @@
 {
   // 보통은 탐색기에서 OM_Translator.pyw 더블클릭으로 실행합니다. (F5 는 개발/확인용)
   "version": "0.2.0",
+  // 필요한 패키지는 프로젝트 전용 .venv 에 설치되므로 F5 도 .venv 의 Python 을 쓴다
+  // (.venv 가 없으면 먼저 OM_Translator.pyw 를 한 번 더블클릭해서 만든다)
   "configurations": [
     {
       "name": "OM 번역기 (프로그램 창)",
       "type": "debugpy", "request": "launch", "console": "integratedTerminal",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
       "program": "${workspaceFolder}/gui.py"
     },
     {
       "name": "설치 점검 (--check)",
       "type": "debugpy", "request": "launch", "console": "integratedTerminal",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
       "program": "${workspaceFolder}/main.py", "args": ["--check"]
     },
     {
       "name": "콘솔로 input\\pdf 한 번 처리 (--once)",
       "type": "debugpy", "request": "launch", "console": "integratedTerminal",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
       "program": "${workspaceFolder}/main.py", "args": ["--once"]
     }
   ]
