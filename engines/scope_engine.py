@@ -9,6 +9,7 @@ O&M 대상(운전/정비/점검/절차/고장진단/안전 등)만 번역하고 
   P&ID, PFD, Logic/Wiring/Single Line/Loop Diagram, GA/Arrangement/Dimensional Drawing,
   Hook-up, DCS/PLC/HMI Screen, A3 이상 대형 도면 페이지, 선이 많고 짧은 라벨 위주의 도면 페이지.
 본문 속 'P&ID No. 0061' 같은 참조 표현은 판단에서 제외하고, 문장 위주 페이지는 번역한다.
+표지·문서 송부 양식·문서 목록 페이지는 제목에 위 키워드가 있어도 번역한다 (cover_page_reason).
 추가 키워드: data/scope_keywords.txt (한 줄에 하나, 정규식 가능)
 """
 from __future__ import annotations
@@ -96,6 +97,35 @@ def is_toc_page(units: list[Unit]) -> bool:
     return n >= 4 or (units and n >= 0.3 * len(units) and n >= 2)
 
 
+# 표지 / 문서 송부 양식 / 문서 목록에 나오는 항목 이름 (데이터시트 양식에는 잘 나오지 않는 것들)
+COVER_MARKERS = [re.compile(p, re.I) for p in (
+    r"job\s*title", r"job\s*no", r"p\.?\s*o\.?\s*no", r"doc(?:ument)?\.?\s*no", r"item\s*no", r"\bvendor\b", r"\bowner\b",
+    r"document\s+(?:code|type|status|title)", r"customer\s+code", r"\bsubject\s*:", r"\bproject\s*:", r"\bcustomer\s*:",
+    r"revision\s+remarks", r"checked\s+by", r"approved\s+by", r"vendor'?s\s+document", r"transmittal",
+    r"approved\s+as\s+noted|returned\s+for\s+correction", r"contractor\s+job\s+no",
+)]
+INDEX_PAGE_RE = re.compile(
+    r"table\s+of\s+contents|document\s+list|list\s+of\s+documents|description\s+of\s+document|index\s+of\s+documents", re.I)
+
+
+def cover_page_reason(page, units: list[Unit]) -> str:
+    """표지·문서 송부 양식·문서 목록 페이지이면 사유를, 아니면 빈 문자열.
+    문서 제목에 'Data sheets', 'Catalogue', 'P&ID' 같은 말이 들어 있어도 표지는 번역한다.
+    - 문서 앞쪽 3쪽: 표지 항목(JOB TITLE, DOC NO., VENDOR, Subject:, Checked by …)이 3가지 이상
+    - 그 뒤쪽(합본 안의 하위 문서 표지): 5가지 이상이고 글이 많지 않은 페이지 (칸이 빽빽한 데이터시트 양식과 구분)
+    - 문서 목록: 'Table of Contents' / 'Document List' 가 있고 글이 많지 않은 페이지"""
+    if not units:
+        return ""
+    text = " | ".join(u.text for u in units)
+    n = sum(1 for rx in COVER_MARKERS if rx.search(text))
+    front = getattr(page, "number", 99) < 3
+    if (front and n >= 3 and len(units) <= 120) or (n >= 5 and len(units) <= 90):
+        return "표지/문서 송부 양식 페이지"
+    if len(units) <= 40 and any(len(u.text) <= 60 and INDEX_PAGE_RE.search(u.text) for u in units):
+        return "문서 목록 페이지"
+    return ""
+
+
 def page_scope(page, units: list[Unit], drawings_count: int) -> tuple[bool, str]:
     """(번역 여부, 사유)"""
     area = abs(page.rect)
@@ -103,6 +133,9 @@ def page_scope(page, units: list[Unit], drawings_count: int) -> tuple[bool, str]
         return False, "대형 페이지(A3 이상) → 도면으로 판단"
     if is_toc_page(units):
         return True, "목차 페이지"
+    why = cover_page_reason(page, units)
+    if why:
+        return True, why
     title = REFERENCE_RE.sub(" ", page_title_text(page, units))
     m = EXCLUDE_TITLE_RE.search(title)
     if m and not re.search(r"contents|목차", title, re.I):

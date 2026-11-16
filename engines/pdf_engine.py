@@ -371,7 +371,7 @@ def _group_to_unit(page, g: list[dict], cell=None) -> Optional[Unit]:
         C = [(ln["bbox"][0] + ln["bbox"][2]) / 2 for ln in g]
         if max(L) - min(L) < 1.5:
             align = "left"
-        elif max(C) - min(C) < 1.5:
+        elif max(C) - min(C) < max(1.5, 0.25 * size):  # 줄 끝 공백 때문에 가운데가 조금 어긋나는 것까지 허용
             align = "center"
         elif max(R) - min(R) < 1.5:
             align = "right"
@@ -452,9 +452,13 @@ def merge_paragraphs(units: list[Unit], hedges: Optional[list] = None) -> list[U
             target.text = t[:-1] + b.text  # 줄끝 하이픈 연결
         else:
             target.text = t + " " + b.text
+        # 가운데 맞춘 두 줄 제목(표지 제목 등)은 합친 뒤에도 가운데 정렬
+        ca, cb = (target.rect.x0 + target.rect.x1) / 2, (b.rect.x0 + b.rect.x1) / 2
+        centered = (target.align == "center" or len(target.lines) == 1) and \
+            abs(ca - cb) < max(1.5, 0.25 * target.size) and abs(target.rect.x0 - b.rect.x0) > 2.0
         target.rect |= b.rect
         target.last_x1 = b.last_x1
-        target.align = "left"
+        target.align = "center" if centered else "left"
         target.lines += b.lines
         target.uls += b.uls
         target.segs += b.segs
@@ -493,6 +497,42 @@ def merge_justified_rows(lines: list) -> list:
         out.append(lines[i])
         i += 1
     return out
+
+
+def mark_centered_lines(units: list[Unit], vedges: list, page_rect) -> None:
+    """한 줄짜리 글(표지 제목, 그림 제목, 상자 안 표제)이 틀(좌우 세로선) 또는 페이지의 가운데에 놓여 있으면
+    가운데 정렬로 표시한다 → 번역문이 원문보다 짧아도 왼쪽으로 치우치지 않고 가운데에 놓인다.
+    왼쪽 정렬된 본문과 구분: 같은 왼쪽 시작점을 쓰는 다른 글이 있거나, 같은 높이에 다른 글이 있으면(표의 행) 제외."""
+    for u in units:
+        if (u.cell is not None or u.align != "left" or len(u.lines) != 1 or u.bullet or u.rotated or u.symbol
+                or not u.size or LEADER_RE.match(u.text)):
+            continue
+        raw = "".join(sp["text"] for sg in u.segs for sp in sg["spans"]).strip()
+        if re.search(r"\s{3,}", raw):
+            continue  # 공백으로 양쪽 끝에 벌려 놓은 줄(머리글/바닥글)은 가운데 정렬이 아니다
+        cy = (u.rect.y0 + u.rect.y1) / 2
+        lefts = [x for x, y0, y1 in vedges if y0 < cy < y1 and x <= u.rect.x0 + 0.5]
+        rights = [x for x, y0, y1 in vedges if y0 < cy < y1 and x >= u.rect.x1 - 0.5]
+        if not lefts and not rights:
+            left, right = page_rect.x0, page_rect.x1
+        elif lefts and rights:
+            left, right = max(lefts), min(rights)
+        else:
+            continue
+        lm, rm = u.rect.x0 - left, right - u.rect.x1
+        if lm < 3 or rm < 3:
+            continue
+        if abs(lm - rm) > max(2.0, 0.015 * (right - left), 0.45 * u.size):
+            continue
+        # 같은 왼쪽 시작점을 쓰는 글이 여럿이거나 바로 위아래에 있으면 왼쪽 정렬된 본문/목록
+        shared = [o for o in units if o is not u and abs(o.rect.x0 - u.rect.x0) <= 2.0]
+        near = 2.5 * u.size
+        if len(shared) >= 2 or any(abs(o.rect.y0 - u.rect.y1) < near or abs(u.rect.y0 - o.rect.y1) < near
+                                   for o in shared):
+            continue
+        if any(o is not u and o.rect.y1 > u.rect.y0 + 1 and o.rect.y0 < u.rect.y1 - 1 for o in units):
+            continue  # 같은 높이에 다른 글 = 표의 행
+        u.align = "center"
 
 
 def _seg_style(sg: dict) -> tuple:
@@ -738,6 +778,7 @@ def extract_units(page, table_cells: Optional[list] = None) -> list[Unit]:
                     if len(g) == 1:
                         u.align = "left"
             add(u, bool(u is not None and u.tab))
+    mark_centered_lines(units, vedges, page.rect)
     mark_keep_columns(units)
     return units
 

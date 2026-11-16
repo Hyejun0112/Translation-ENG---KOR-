@@ -114,7 +114,8 @@ def strong_continuation(a: dict, b: dict) -> bool:
 
 def _centered(a: dict, b: dict) -> bool:
     ab, bb = a["bbox"], b["bbox"]
-    return abs((ab[0] + ab[2]) / 2 - (bb[0] + bb[2]) / 2) < 1.5 and abs(ab[0] - bb[0]) > 2.0
+    tol = max(1.5, 0.25 * max(a.get("_size", 0.0), b.get("_size", 0.0)))  # 줄 끝 공백만큼의 어긋남 허용
+    return abs((ab[0] + ab[2]) / 2 - (bb[0] + bb[2]) / 2) < tol and abs(ab[0] - bb[0]) > 2.0
 
 
 def x_ok(group: list[dict], b: dict) -> bool:

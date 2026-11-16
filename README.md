@@ -54,6 +54,8 @@ OM_Translator.pyw 더블클릭 → API 키 저장(처음 한 번) → [PDF 추�
 - **페이지 전체 원문 유지 (Drawing / Datasheet 제외)**: 제목이 Datasheet, Technical Data, Parts List, Bill of Material,
   Certificate, P&ID, PFD, Logic/Wiring/Single Line Diagram, GA/Arrangement/Dimensional Drawing 등인 페이지, A3 이상 도면 페이지
   (본문 속 "P&ID No. 0061" 같은 참조는 무시하고, 문장 위주 페이지는 번역)
+- **표지·문서 송부 양식·문서 목록은 항상 번역**: 문서 제목에 "Data sheets", "Catalogue" 같은 말이 들어 있어도
+  표지(JOB TITLE / DOC NO. / VENDOR …, Subject / Document code / Checked by …)와 Table of Contents, Document List 페이지는 번역합니다.
 - **표**: 셀 단위 번역, 셀 안에서 줄바꿈. 머리글이 Tag/Model/Parameter/Code/Value/Unit 인 **열은 원문 유지**
 - **항상 원문 유지 (Tag 보호)**: Tag No., 모델/부품/도면/문서번호, Rev., 수치+단위, 2oo3, 화학식, 규격, 약어, URL.
   번역 결과에서 보호 값이 빠지면 잘못된 번역을 넣지 않고 원문을 유지
