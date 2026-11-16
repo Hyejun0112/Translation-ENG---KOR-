@@ -26,7 +26,7 @@ if TYPE_CHECKING:  # 타입 표시 전용 (순환 import 방지)
     from engines.pdf_engine import Unit
 
 EXCLUDE_TITLE_KW = [
-    r"data\s*sheets?", r"technical\s+data", r"performance\s+data", r"design\s+data",
+    r"data\s*sheets?", r"instrument\s+specification", r"specification\s+sheet", r"technical\s+data", r"performance\s+data", r"design\s+data",
     r"equipment\s+list", r"valve\s+list", r"line\s+list", r"instrument\s+list", r"cable\s+list",
     r"i\s*/\s*o\s+list", r"(?:spare\s+)?parts?\s+list", r"bill\s+of\s+materials?", r"\bBOM\b",
     r"catalogu?e", r"brochure", r"ordering\s+information", r"material\s+specification",
@@ -82,8 +82,9 @@ def is_prose_page(units: list[Unit]) -> bool:
     body = [u for u in units if u.kind == "text" and u.cell is None]
     if len(body) < 3:
         return False
-    prose = [u for u in body if len(u.text.split()) >= 8]
-    return len(prose) >= 3 and len(prose) / len(body) >= 0.3
+    prose = [u for u in body if len(u.text.split()) >= 8 and not u.rotated]
+    # 표 칸이 대부분인 페이지(데이터시트)는 표 밖의 몇 문장만으로 '문장 위주'라고 보지 않는다
+    return len(prose) >= 3 and len(prose) / len(body) >= 0.3 and len(prose) >= 0.1 * len(units)
 
 
 TOC_LINE_RE = re.compile(r"(?:[.·…]\s*){4,}\s*\d*\s*$")
@@ -108,8 +109,40 @@ def page_scope(page, units: list[Unit], drawings_count: int) -> tuple[bool, str]
         if is_prose_page(units):
             return True, f"제목에 '{m.group(0)}'가 있으나 문장 위주 페이지라 번역"
         return False, f"제외 문서 제목 '{m.group(0)}'"
-    if units and drawings_count > 1500 and not is_prose_page(units):
-        avg = sum(len(u.text) for u in units) / len(units)
-        if avg < 14:
-            return False, "도면/다이어그램으로 판단(선 많고 짧은 라벨 위주)"
+    if units and not is_prose_page(units):
+        # 양식형 데이터시트: 글이 거의 다 표 칸 안에 있고, 제목 칸(페이지 아래 표제란 포함)에 제외 키워드가 있음
+        in_cells = sum(1 for u in units if u.cell is not None)
+        if len(units) >= 30 and in_cells >= 0.7 * len(units):
+            sizes = sorted(u.size for u in units if u.size)
+            med = sizes[len(sizes) // 2] if sizes else 10
+            for u in units:
+                if len(u.text) <= 60:
+                    m = EXCLUDE_TITLE_RE.search(REFERENCE_RE.sub(" ", u.text))
+                    # 표제처럼 보이는 글만 (대문자/굵게/큰 글자). 표의 한 행 이름('Wiring Diagram | 도면번호')은 제외
+                    caps = bool(m) and m.group(0).isupper()  # 'INSTRUMENT SPECIFICATION' (뒤에 부제가 붙어도 인정)
+                    if m and (caps or u.bold or u.size >= med * 1.12) and len(m.group(0)) >= 0.35 * len(u.text.strip()):
+                        return False, f"데이터시트/양식 페이지 (표제 '{m.group(0)}')"
+        # 표제가 글자로 남아 있지 않은 양식(제목이 그림/윤곽선): 표 칸 안의 항목 이름이 거의 다 대문자 낱말이면
+        # 데이터시트 양식으로 본다 (예: 전동기 DATA SHEET 의 'ENCLOSURE', 'COOLING METHOD' …)
+        if len(units) >= 30 and in_cells >= 0.7 * len(units):
+            labels = [u.text for u in units if re.search(r"[A-Za-z]{3,}", u.text) and not re.search(r"\d", u.text)]
+            if len(labels) >= 25 and sum(1 for t in labels if t.isupper()) >= 0.85 * len(labels):
+                return False, "데이터시트/양식 페이지 (표 칸의 대문자 항목 위주)"
+        # 도면/데이터시트의 표제란: 페이지 어디에 있든, 짧은 글이 거의 제외 키워드로만 이루어져 있으면 제목으로 본다
+        # (예: 오른쪽 아래 표제란의 'DIMENSIONAL DRAWING FOR …'). 그림 설명문('Figure 3: Wiring diagram for …')은 제외
+        for u in units:
+            if len(u.text) <= 60 and not re.match(r"\s*(?:fig(?:ure)?\.?|table|see|refer)\b", u.text, re.I):
+                t = REFERENCE_RE.sub(" ", u.text)
+                m = EXCLUDE_TITLE_RE.search(t)
+                # 표제란 글은 보통 대문자. 표의 한 행 이름('Wiring Diagram | 도면번호')은 제목이 아니다
+                if m and m.group(0).isupper() and len(m.group(0)) >= 0.35 * len(u.text.strip()) and re.search(
+                        r"drawing|diagram|arrangement|P\s*&\s*I\s*D|PFD|hook", m.group(0), re.I):
+                    return False, f"도면 페이지 (표제 '{m.group(0)}')"
+        if drawings_count > 1500:
+            avg = sum(len(u.text) for u in units) / len(units)
+            short = sum(1 for u in units if len(u.text.split()) <= 4)
+            # 영어 문장(8단어 이상)이 3개 이상이면 그림이 많은 설명 페이지 → 번역
+            prose = sum(1 for u in units if len(re.findall(r"[A-Za-z]{2,}", u.text)) >= 8)
+            if avg < 14 or (short >= 0.5 * len(units) and prose < 3):
+                return False, "도면/다이어그램으로 판단(선 많고 짧은 라벨 위주)"
     return True, ""

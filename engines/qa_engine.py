@@ -27,7 +27,8 @@ from engines.glossary_engine import STOP, Glossary, clean_text, optional_path, r
 from engines.pdf_engine import PAGE_CLASS_KO, Unit
 
 def verify_output(dst: Path, expect_pages: int, translated_pages: set[int],
-                  src: Optional[Path] = None, pages: Optional[list[int]] = None) -> tuple[list[str], list]:
+                  src: Optional[Path] = None, pages: Optional[list[int]] = None,
+                  draw_delta: Optional[dict] = None) -> tuple[list[str], list]:
     """출력 PDF를 다시 열어 최종 검사. 반환: (경고 목록, [(항목, 결과, 상세)])"""
     warn: list[str] = []
     checks: list = []
@@ -55,20 +56,53 @@ def verify_output(dst: Path, expect_pages: int, translated_pages: set[int],
         try:
             o = fitz.open(src)
             pl = pages if pages is not None else list(range(len(o)))
-            size_bad, img_bad, order_bad = [], [], []
+            size_bad, img_bad, order_bad, annot_bad, draw_bad = [], [], [], [], []
+            n_annot = 0
             for i, pno in enumerate(pl):
                 if i >= len(d):
                     break
                 a, b = o[pno], d[i]
                 if abs(a.rect.width - b.rect.width) > 1 or abs(a.rect.height - b.rect.height) > 1:
                     size_bad.append(pno + 1)
-                if len(a.get_images(full=True)) != len(b.get_images(full=True)):
-                    img_bad.append(pno + 1)
+                try:  # 화면에 놓인 그림 개수 (스캔/사진/로고/스탬프)
+                    def big(pg):  # 1~2pt 짜리 점(글자처럼 쓰인 그림)은 세지 않는다
+                        return sum(1 for im in pg.get_image_info()
+                                   if im["bbox"][2] - im["bbox"][0] >= 4 and im["bbox"][3] - im["bbox"][1] >= 4
+                                   and not (fitz.Rect(im["bbox"]) & pg.rect).is_empty)  # 페이지 밖 그림 제외
+                    if big(a) != big(b):
+                        img_bad.append(pno + 1)
+                except Exception:  # noqa: BLE001
+                    pass
+                # 선/도형(표 괘선·그림의 선·박스)이 하나도 빠지지 않았는지: 개수 변화는 다시 그린 밑줄만큼만 허용
+                if draw_delta is not None:
+                    try:
+                        na, nb = len(a.get_cdrawings()), len(b.get_cdrawings())
+                        if nb - na != draw_delta.get(pno, 0):
+                            draw_bad.append(pno + 1)
+                    except Exception:  # noqa: BLE001
+                        pass
+                # 주석(Markup/스탬프/서명)과 링크가 원본 그대로 남아 있는지
+                ka = sorted(x.type[1] for x in (a.annots() or []))
+                kb = sorted(x.type[1] for x in (b.annots() or []))
+                n_annot += len(ka)
+                if ka != kb or len(a.get_links()) != len(b.get_links()):
+                    annot_bad.append(pno + 1)
             checks.append(("페이지 순서", "OK" if not order_bad else "확인필요", "원본과 같은 순서로 저장"))
             checks.append(("페이지 크기/방향", "OK" if not size_bad else "확인필요",
                            "원본과 동일 (회전 페이지는 보이는 모습 그대로 정규화)" if not size_bad else f"다름: {size_bad[:20]}"))
             checks.append(("그림/사진 유지", "OK" if not img_bad else "확인필요",
                            "페이지별 이미지 개수 동일" if not img_bad else f"이미지 개수 다름: {img_bad[:20]}"))
+            if draw_delta is not None:
+                checks.append(("표 괘선/도형 유지", "OK" if not draw_bad else "확인필요",
+                               "페이지별 선·도형 개수 동일 (밑줄은 번역문 폭에 맞춰 다시 그림)" if not draw_bad
+                               else f"선/도형 개수 다름: {draw_bad[:20]}"))
+                if draw_bad:
+                    warn.append(f"선/도형 개수가 달라진 페이지(표·그림 확인): {draw_bad[:20]}")
+            checks.append(("주석/링크 유지", "OK" if not annot_bad else "확인필요",
+                           f"Markup·스탬프 {n_annot}개 원본 그대로 (주석 안의 글자는 번역하지 않음)" if not annot_bad
+                           else f"주석/링크 개수 다름: {annot_bad[:20]}"))
+            if annot_bad:
+                warn.append(f"주석(Markup/스탬프)·링크가 달라진 페이지: {annot_bad[:20]}")
             o.close()
         except Exception as e:  # noqa: BLE001
             checks.append(("원본 비교", "확인필요", str(e)))
@@ -86,12 +120,16 @@ STATUS_KO = {
 SOURCE_KO = {"native": "본문", "native-ocr": "본문(글자깨짐→OCR)", "ocr-page": "OCR(스캔)", "ocr-figure": "OCR(그림)", "toc": "북마크"}
 
 
+_ILLEGAL_XLSX = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
 def _xlsx_sheet(wb, title, header, rows, widths, wrap_cols=()):
     from openpyxl.styles import Alignment, Font, PatternFill
     ws = wb.create_sheet(title)
     ws.append(header)
     for r in rows:
-        ws.append(r)
+        # 엑셀에 넣을 수 없는 제어문자는 지운다 (한 글자 때문에 로그 전체 저장이 실패하지 않게)
+        ws.append([_ILLEGAL_XLSX.sub("", c) if isinstance(c, str) else c for c in r])
     fill = PatternFill("solid", fgColor="1F4E78")
     for c in ws[1]:
         c.font = Font(bold=True, color="FFFFFF")
