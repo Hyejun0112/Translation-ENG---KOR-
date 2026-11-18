@@ -299,7 +299,7 @@ def output_paths(src: Path) -> tuple[Path, Path]:
 
 
 # 레이아웃 코드가 바뀌면 이 값을 올린다 → 예전에 만든 결과도 자동으로 다시 만든다
-LAYOUT_VERSION = "2026-11-18a"
+LAYOUT_VERSION = "2026-11-18b"
 STAMP_FILE = ".om_stamps.json"
 _sha_memo: dict = {}
 
@@ -714,14 +714,15 @@ class Runner:
             doc.close()
             print(" " * 100, end="\r")
             dst = config.LOG_DIR / f"{src.stem}_LAYOUT_CHECK.pdf"
-            draw_layout_debug(str(src), units, pages, str(dst))
+            draw_layout_debug(str(src), units, pages, str(dst), scopes)
             print(f"{src.name}: 레이아웃 점검 PDF → {dst}")
             for pno in pages[:30]:
                 pu = [u for u in units if u.page == pno]
                 n_ov = sum(1 for i, a in enumerate(pu) for b in pu[i + 1:]
                            if not (a.rect & b.rect).is_empty and (a.rect & b.rect).height > 1.0)
+                ok, why = scopes.get(pno, (True, ""))
                 print(f"  p.{pno + 1}: {classes.get(pno, '?')}, 문구 {len(pu)}개, 상자 겹침 {n_ov}쌍, "
-                      f"{'번역' if scopes.get(pno, (True, ''))[0] else '원문유지'}")
+                      f"{'번역' if ok else '원문유지'}" + (f" ({why})" if why else ""))
             if os.name == "nt":
                 open_folder(dst)
 
@@ -776,7 +777,7 @@ def main(argv=None) -> int:
     ap.add_argument("--text-scale", type=int, help="번역 글자 크기 %% (원문 대비, 60~100, 기본 92)")
     ap.add_argument("--check", action="store_true", help="설치 상태 점검")
     ap.add_argument("--set-key", action="store_true", help="Claude API 키 다시 입력")
-    ap.add_argument("--estimate", action="store_true", help="번역 분량/토큰 추정만")
+    ap.add_argument("--estimate", action="store_true", help="비용 추정만 (번역할 문구 수·토큰·모델별 예상 비용, API 사용 안 함)")
     ap.add_argument("--debug-layout", action="store_true",
                     help="레이아웃 점검 PDF만 만들기 (API 사용 안 함, logs 폴더에 *_LAYOUT_CHECK.pdf)")
     ap.add_argument("--no-open", action="store_true", help="완료 후 결과 폴더 열지 않기")

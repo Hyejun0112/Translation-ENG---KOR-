@@ -1685,7 +1685,7 @@ def render_page(page, units: list[Unit], fonts, cfg: Config) -> dict:
     return stats
 
 
-def draw_layout_debug(src: str, units: list[Unit], pages: list[int], dst: str) -> int:
+def draw_layout_debug(src: str, units: list[Unit], pages: list[int], dst: str, scopes: Optional[dict] = None) -> int:
     """레이아웃 점검용 PDF: 인식한 문구 상자를 원본 위에 번호와 함께 표시 (API 사용 안 함).
     빨강=번역 대상, 회색=원문 유지, 초록=표 칸. 상자끼리 겹치거나 한 문장이 여러 상자로 쪼개졌는지 확인."""
     doc = fitz.open(src)
@@ -1703,9 +1703,17 @@ def draw_layout_debug(src: str, units: list[Unit], pages: list[int], dst: str) -
             page.draw_rect(u.rect, color=col, width=0.6, overlay=True)
             page.insert_text(fitz.Point(u.rect.x0, max(u.rect.y0 - 0.8, 5)), f"{k}",
                              fontsize=5, color=(0, 0, 0.9), overlay=True)
-        y = 8
-        page.insert_text(fitz.Point(4, y), f"p.{pno + 1}  units={len(by_page.get(pno, []))}  "
-                         "red=translate grey=keep green=table-cell", fontsize=6, color=(0, 0, 0.9))
+        ok, why = (scopes or {}).get(pno, (True, ""))
+        n_tr = sum(1 for u in by_page.get(pno, []) if u.status == "PENDING")
+        head = (f"p.{pno + 1}  {'번역' if ok else '원문 유지'}" + (f" - {why}" if why else "")
+                + f"   |  번역할 문구 {n_tr}개 / 전체 {len(by_page.get(pno, []))}개"
+                + "   |  빨강=번역  회색=원문 유지  초록=표 칸")
+        try:  # 한글 안내 (PyMuPDF 내장 한글 글꼴)
+            page.insert_text(fitz.Point(4, 9), head, fontname="korea", fontsize=7,
+                             color=(0.8, 0, 0) if ok else (0.35, 0.35, 0.35))
+        except Exception:  # noqa: BLE001
+            page.insert_text(fitz.Point(4, 8), f"p.{pno + 1} {'TRANSLATE' if ok else 'KEEP'}  red=translate "
+                             "grey=keep green=table-cell", fontsize=6, color=(0, 0, 0.9))
     select_pages_safe(doc, pages)
     save_pdf_safe(doc, Path(dst))
     doc.close()
@@ -1823,7 +1831,30 @@ def prepare_units(doc, cfg: Config, protector: Protector, overrides: dict[str, s
             else:
                 scopes[pno] = (True, "")
     if cfg.scope == "om":
-        smooth_scopes(pages, scopes, per_page)  # 앞뒤가 모두 데이터시트/도면인데 혼자 번역되는 쪽 바로잡기
+        # 앞뒤가 모두 데이터시트/도면인데 혼자 번역되는 쪽 바로잡기.
+        # 일부 페이지만 처리할 때도 전체 번역과 판단이 같도록, 범위 바로 바깥 쪽(글자층 있는 쪽만)도 판단에 참고한다
+        sel = set(pages)
+        nb_pages, nb_scopes, nb_units = list(pages), dict(scopes), dict(per_page)
+        for q in sorted({x for p_ in pages for x in (p_ - 1, p_ + 1)} - sel):
+            if not (0 <= q < len(doc)):
+                continue
+            try:
+                pg = doc[q]
+                if classify_page(pg) != "native":
+                    continue
+                if abs(pg.rect) > A4_AREA * 1.6:
+                    nb_scopes[q] = (False, "대형 페이지(A3 이상) → 도면으로 판단")
+                    us_q = []
+                else:
+                    us_q = merge_paragraphs([u for u in extract_units(pg) if u.text], page_edges(pg)[1])
+                    nb_scopes[q] = page_scope(pg, us_q, len(pg.get_cdrawings()) if hasattr(pg, "get_cdrawings") else 0)
+                nb_units[q] = us_q
+                nb_pages.append(q)
+            except Exception:  # noqa: BLE001
+                continue
+        smooth_scopes(sorted(nb_pages), nb_scopes, nb_units)
+        for p_ in pages:
+            scopes[p_] = nb_scopes[p_]
     for pno in pages:
         us = per_page[pno]
         ok, why = scopes[pno]

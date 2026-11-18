@@ -7,7 +7,7 @@ OM_Translator.pyw 를 더블클릭하면 이 창이 열립니다.
 
   1) Claude API 키 입력 → [저장] (처음 한 번. 이 PC의 .env 파일에만 저장, GitHub에 올라가지 않음)
   2) [PDF 추가] / [폴더 추가] 로 번역할 PDF 선택 (input\\pdf 폴더의 PDF는 자동으로 목록에 표시)
-  3) 옵션 확인 (모델, 페이지 범위)  →  [분량 추정] 으로 미리 확인 (선택)
+  3) 옵션 확인 (모델, 페이지 범위)  →  [비용 추정] 으로 예상 비용 미리 확인 (선택, 무료)
   4) [▶ 번역 시작] → 진행률 / 남은 시간
   5) [한국어 PDF 열기] / [번역 로그 열기] / [결과 폴더]
 
@@ -210,7 +210,7 @@ class App(tk.Tk):
         self.btn_run.pack(side="left")
         self.btn_stop = ttk.Button(f3, text="■ 중지", command=self.stop, state="disabled")
         self.btn_stop.pack(side="left", padx=8)
-        self.btn_est = ttk.Button(f3, text="분량 추정", command=self.estimate)
+        self.btn_est = ttk.Button(f3, text="비용 추정", command=self.estimate)
         self.btn_est.pack(side="left")
         self.btn_dbg = ttk.Button(f3, text="레이아웃 점검", command=self.debug_layout)
         self.btn_dbg.pack(side="left", padx=8)
