@@ -132,7 +132,8 @@ from engines.pdf_engine import (  # noqa: E402
 )
 from engines.qa_engine import load_overrides, verify_output, write_glossary_xlsx, write_log_xlsx  # noqa: E402
 from engines.translation_engine import (  # noqa: E402
-    AnthropicBackend, Cache, MockBackend, file_sha, tm_get, tm_put, translate_texts,
+    MODEL_PRICES, AnthropicBackend, Cache, FatalAPIError, MockBackend, file_sha, make_client, tm_get, tm_put,
+    translate_texts,
 )
 
 logging.getLogger("fontTools").setLevel(logging.ERROR)  # 폰트 서브셋 시 무해한 경고 숨김
@@ -203,8 +204,7 @@ def is_interactive() -> bool:
 def validate_api_key(key: str) -> tuple[bool, str]:
     """API 키 확인 (모델 목록 조회 - 번역 비용 없음)."""
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=key)
+        client = make_client(key, max_retries=1)  # 회사망 인증서(truststore) 적용
         client.models.list(limit=1)
         return True, ""
     except Exception as e:  # noqa: BLE001
@@ -299,7 +299,7 @@ def output_paths(src: Path) -> tuple[Path, Path]:
 
 
 # 레이아웃 코드가 바뀌면 이 값을 올린다 → 예전에 만든 결과도 자동으로 다시 만든다
-LAYOUT_VERSION = "2026-11-17a"
+LAYOUT_VERSION = "2026-11-18a"
 STAMP_FILE = ".om_stamps.json"
 _sha_memo: dict = {}
 
@@ -625,14 +625,16 @@ class Runner:
         self.cache = Cache(config.CACHE_FILE)
         self.backend = None
         self.ocr = None
-        self.failed: dict[str, float] = {}  # 실패한 파일(수정 시각) - 감시 모드에서 무한 재시도 방지
+        self.failed: dict[str, float] = {}
+        self.fatal = False  # 키/잔액/네트워크 문제로 번역을 멈춤  # 실패한 파일(수정 시각) - 감시 모드에서 무한 재시도 방지
 
     def prepare(self):
         if self.cfg.backend == "mock":
             self.backend = MockBackend()
         else:
             os.environ["ANTHROPIC_API_KEY"] = ensure_api_key()
-            self.backend = AnthropicBackend(self.cfg.model)
+            self.backend = AnthropicBackend(self.cfg.model, effort=config.TRANSLATION_EFFORT,
+                                            max_tokens=config.MAX_OUTPUT_TOKENS)
         self.ocr = ensure_tesseract(self.cfg, build_ocr_engine(self.cfg))
         ocr_desc = ("꺼짐" if self.ocr is None else
                     (f"사용 ({self.ocr.dpi}dpi)" if self.ocr.available else "사용 불가"))
@@ -674,6 +676,12 @@ class Runner:
                     shutil.move(str(src), str(done / src.name))
             except KeyboardInterrupt:
                 raise
+            except FatalAPIError as e:
+                # 키/잔액/모델/네트워크 문제: 다음 파일도 똑같이 실패하므로 여기서 멈춘다 (번역된 문구는 저장되어 이어서 진행 가능)
+                print(f"  ✘ 번역 중지: {e}", file=sys.stderr)
+                print("    (지금까지 번역된 문구는 저장되어 있어, 문제를 해결하고 다시 시작하면 이어서 진행합니다)")
+                self.fatal = True
+                break
             except Exception as e:  # noqa: BLE001
                 self.failed[str(src)] = src.stat().st_mtime if src.exists() else 0
                 print(f"  ✘ 실패: {type(e).__name__}: {e}", file=sys.stderr)
@@ -681,8 +689,13 @@ class Runner:
                 print("    (원본 파일을 다시 저장하거나 교체하면 다시 시도합니다)")
         if n_ok:
             update_glossary_xlsx(self.gloss)
-            if self.backend is not None and getattr(self.backend, "in_tokens", 0):
-                print(f"  API 사용량 누적: 입력 {self.backend.in_tokens:,} / 출력 {self.backend.out_tokens:,} 토큰")
+        b = self.backend
+        if b is not None and (getattr(b, "in_tokens", 0) or getattr(b, "cache_read", 0)):
+            cost = b.cost_usd() if hasattr(b, "cost_usd") else None
+            print(f"  API 사용량 누적: 입력 {b.in_tokens + b.cache_read + b.cache_write:,} / 출력 {b.out_tokens:,} 토큰"
+                  f" (호출 {b.calls}회, 캐시 재사용 {b.cache_read:,})"
+                  + (f" · 예상 비용 약 ${cost:.2f}" if cost is not None else "")
+                  + (f" · 번역 거절 {b.refusals}건" if b.refusals else ""))
         return n_ok
 
     def debug_layout(self, files: Optional[list[Path]] = None):
@@ -736,6 +749,9 @@ class Runner:
         print(f"\n파일 {tot_files}개 | 번역 문구 {tot_items}개 (중복 제거 {len(uniq)}개, {tot_chars:,}자)")
         print(f"예상 API 사용량: 입력 약 {in_tok:,} 토큰 / 출력 약 {out_tok:,} 토큰 "
               f"(스캔 페이지 OCR 분량은 제외)")
+        for m, (pin, pout) in MODEL_PRICES.items():  # 시스템 프롬프트는 캐시되므로 입력 비용은 이보다 적게 나온다
+            print(f"  {m:<20} 예상 비용 약 ${(in_tok * pin + out_tok * pout) / 1e6:,.2f}"
+                  + ("  ← 현재 선택" if m == self.cfg.model else ""))
 
 
 def open_folder(p: Path):
@@ -801,6 +817,8 @@ def main(argv=None) -> int:
         print(f"이미 같은 원본·같은 설정으로 번역된 파일 {len(skipped)}개는 건너뛰었습니다. "
               "(다시 만들려면 '이미 번역된 파일도 다시 만들기' 체크)")
 
+    if runner.fatal:
+        return 1
     if args.once or args.pages:
         return 0
 

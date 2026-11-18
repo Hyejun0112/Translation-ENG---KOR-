@@ -16,6 +16,8 @@
 ## 검증 방법
 - 여기(클라우드)에는 API 키·맑은 고딕이 없다. 가짜 한글(길이 비슷한 pseudo 텍스트) 백엔드로 전체 문서를 돌려
   레이아웃만 검증한다. 실제 번역문 품질은 사용자 PC 에서 확인한다.
+- API 비용 없이 실제 번역 경로(API 호출·재시도·오류 처리 포함) 전체 시험: `python tools/selftest_fake_api.py 결과폴더 원본.pdf --mode chaos`
+  (모드: normal/chaos/credit/oldsdk/nostruct/auth/ssl). 번역 내용 대조: `python tools/check_translation.py 원본.pdf 결과.pdf`
 - 원본 ↔ 결과를 페이지별로 자동 대조: `python tools/check_layout.py 원본.pdf 결과.pdf --png 폴더`
 - 결과 `Translation_Log.xlsx` 의 **최종검사** 시트(그림/괘선/주석/링크/글꼴/겹침)가 모두 OK 인지 본다.
 - 코드를 고친 뒤에는 종류가 다른 문서(본문 위주 매뉴얼, 데이터시트 합본, 스캔 카탈로그)를 함께 다시 돌려

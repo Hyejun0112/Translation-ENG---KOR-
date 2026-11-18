@@ -20,7 +20,7 @@ from typing import Optional
 
 _UNITS = [
     r"°\s?[CF]", r"[℃℉]",
-    r"kg/cm[²2](?:\s?\(?[ga]\)?)?", r"mmH[2₂]O", r"mmHg",
+    r"kg/cm[²2](?:\s?\(?[ga]\)?)?", r"[Kk][Gg][Ff]/[Cc][Mm][²2]?(?:\s?\(?[ga]\)?|[ga])?", r"mmH[2₂]O", r"mmHg",
     r"(?:bar|kPa|MPa|Pa|psi|mbar)(?:\s?\(?[ga]\)?|[ga])?",
     r"N?m[³3]/(?:h|hr|min|s)", r"kg/(?:h|hr|s|m[³3])", r"[tT]/h(?:r)?",
     r"mg/N?(?:L|m[³3])", r"[kMG]?Wh?", r"k?VA?", r"m?A", r"Hz", r"rpm", r"%",
@@ -49,6 +49,13 @@ DEFAULT_KEEP_PATTERNS = [
     r"\b(?=[A-Z0-9\-_/.]*\d)(?=[A-Z0-9\-_/.]*[A-Z])[A-Z0-9][A-Z0-9\-_/.]*[A-Z0-9]\b",
     # 수치 + 단위
     _UNIT_RX,
+    # 숫자에 바로 붙은 단위/기호 (14.0Kgf/cm, 100L/hr, 1.27kW, 80Nm, 60lb.ft): 소수점이 갈라지지 않게 한 덩어리로 보호
+    # (서수 1st/2nd/7th 는 제외 - 번역문에서 '첫째/일곱째' 등으로 쓰일 수 있음)
+    r"(?<![\w.])\d+(?:[.,]\d+)*(?!(?:st|nd|rd|th)\b)[A-Za-zµμΩ°][A-Za-z0-9µμΩ°²³]*(?:[./][A-Za-z²³][A-Za-z0-9²³]*)*",
+    # 점 세 개/말줄임표 범위 (4...20mA, 0…10 V)
+    r"(?<![\w.])\d+(?:[.,]\d+)?\s?(?:\.{2,3}|…)\s?\d+(?:[.,]\d+)?(?:\s?[A-Za-z%°µ][A-Za-z0-9/%°µ]*)?",
+    # 하이픈/슬래시로 이어진 번호 (부품번호 397802-0042, 그림 13-5, 분수 1/4, 범위 10-40, 날짜 09/2022) → 한 덩어리로 보호
+    r"(?<![\w.])\d+(?:[.,]\d+)?(?:[-/]\d+(?:[.,]\d+)?)+(?![\w/])",
     # 보팅 로직 / 계기 로직: 2oo3, 1oo2D
     r"\b\d\s?oo\s?\d[A-Z]?\b",
     # 화학식/단위 첨자: H2O, CO2, NOx, SO2, O2 (단독 사용)
@@ -285,8 +292,21 @@ _UNIT_JONG = {"kg": (True, False), "mm": (False, False), "cm": (False, False), "
               "kPa": (True, True), "MPa": (True, True), "Hz": (False, False), "rpm": (True, False),
               "ppm": (True, False), "g": (True, False), "kW": (False, False), "kV": (False, False),
               "kA": (False, False), "mA": (False, False), "Vac": (False, False), "Vdc": (False, False),
-              "%": (False, False), "℃": (False, False), "°C": (False, False), "mmH2O": (False, False)}
+              "%": (False, False), "℃": (False, False), "°C": (False, False), "mmH2O": (False, False),
+              "Nm": (False, False), "lb.ft": (False, False), "lbf": (False, False), "ft": (False, False),
+              "in": (False, False), "L/hr": (False, False), "l/hr": (False, False), "L/h": (False, False),
+              "m3/h": (False, False), "°F": (False, False), "rpm.": (True, False)}
+# 기호: 도(°), 제곱/세제곱 미터(²³ → '…미터'), 아래첨자 숫자(O₂ '오투', H₂O)
+_SYMBOL_JONG = {"°": (False, False), "²": (False, False), "³": (False, False), "℉": (False, False),
+                "Ω": (False, False), "µ": (False, False), "μ": (False, False)}
+_SUB_DIGIT = str.maketrans("₀₁₂₃₄₅₆₇₈₉⁰¹⁴⁵⁶⁷⁸⁹", "0123456789" "0145678" "9")
 _UNITS_BY_LEN = sorted(_UNIT_JONG, key=len, reverse=True)
+
+
+# 인터넷 주소 끝 (읽는 소리): 닷컴, 닷넷, 닷오알지, 닷케이알 …
+_DOMAIN_JONG = {".com": (True, False), ".net": (True, False), ".org": (False, False), ".kr": (True, True),
+                ".de": (False, False), ".fi": (False, False), ".jp": (False, False), ".uk": (False, False),
+                ".gov": (False, False), ".edu": (False, False), ".info": (False, False), ".pdf": (False, False)}
 
 
 def _jong_of(prev: str):
@@ -297,11 +317,18 @@ def _jong_of(prev: str):
     if i < 0:
         return None
     head = prev[:i + 1]
+    low = head.lower()
+    for dom, j in _DOMAIN_JONG.items():  # 이메일/URL 뒤
+        if low.endswith(dom):
+            return j
     for u in _UNITS_BY_LEN:  # 숫자나 공백 바로 뒤의 단위
         if head.endswith(u) and (len(head) == len(u) or not head[-len(u) - 1].isalpha()):
             if len(head) > len(u) and (head[-len(u) - 1].isdigit() or head[-len(u) - 1] in " /"):
                 return _UNIT_JONG[u]
     c = prev[i]
+    if c in _SYMBOL_JONG:
+        return _SYMBOL_JONG[c]
+    c = c.translate(_SUB_DIGIT)
     if "가" <= c <= "힣":
         j = (ord(c) - 0xAC00) % 28
         return (j != 0, j == 8)

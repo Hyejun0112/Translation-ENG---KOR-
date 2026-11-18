@@ -1860,18 +1860,24 @@ def fix_ocr_tokens(units: list[Unit], extra_text: str = "") -> int:
       2) 글자 뒤의 'O' 가 0 인 번호 'PUBOO2-137' → 'PUB002-137' (같은 문서에 'PUB002-…' 형태가 있을 때)"""
     cnt: Counter = Counter()
     fam: Counter = Counter()
+    alpha: Counter = Counter()  # 모델 계열 머리글자: 'IQT125' → 'IQT', 'IQ3' → 'IQ'
     for text in [u.text for u in units] + ([extra_text] if extra_text else []):
         for t in TOKEN_RE.findall(text):
             if re.search(r"\d", t) and re.search(r"[A-Za-z]", t):
                 cnt[t] += 1
                 fam[re.split(r"[-.]", t)[0]] += 1  # 'PUB002-041' → 'PUB002'
+                m = re.match(r"([A-Z]{2,5})\d", t)
+                if m:
+                    alpha[m.group(1)] += 1
 
     def fix(tok: str) -> str:
         m = LEAD_DIGIT_RE.match(tok)
         if m:
             cand = ("I" if m.group(1) == "1" else "O") + m.group(2)
             base = re.sub(r"[A-Z]+$", "", re.split(r"[-.]", cand)[0])  # 'IQ3M' → 'IQ3'
-            if cnt[cand] >= 1 or fam[re.split(r"[-.]", cand)[0]] >= 1 or (len(base) >= 3 and fam[base] >= 1):
+            head = re.match(r"[A-Z]+", cand).group(0)
+            if (cnt[cand] >= 1 or fam[re.split(r"[-.]", cand)[0]] >= 1 or (len(base) >= 3 and fam[base] >= 1)
+                    or (len(head) >= 2 and alpha[head] >= 2)):  # '1QT100' → 'IQT100' (IQT125, IQT3 … 가 문서에 있음)
                 return cand
         m = ZERO_O_RE.match(tok)
         if m:

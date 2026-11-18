@@ -24,6 +24,26 @@ OM_Translator.pyw 더블클릭 → API 키 저장(처음 한 번) → [PDF 추�
 
 > `.pyw` 파일이 더블클릭으로 열리지 않으면: 파일 우클릭 → 연결 프로그램 → **Python** 선택.
 
+## 1-1. API 결제 후 첫 실행 (점검 순서)
+
+1. `git pull` 로 최신 코드 받기 → **`OM_Translator.pyw` 더블클릭** (부품 목록이 바뀌었으면 처음 실행 준비 창이 떠서 자동 업데이트)
+2. API 키 붙여넣기 → [저장] → 오른쪽 위에 **"API 키 확인됨"** 이 뜨는지 확인
+   - "키가 올바르지 않습니다" → 키를 다시 복사. "연결 확인 불가" → 회사망 문제일 수 있음 (아래 문제 해결 표)
+3. 번역할 PDF 추가 → **[분량 추정]** → 모델별 예상 비용(USD) 확인
+4. **페이지 `1-5`** 로 먼저 번역 → 결과 PDF 와 `Translation_Log.xlsx` 의 최종검사 확인
+5. 이상 없으면 페이지 칸을 비우고 전체 번역. 진행 기록 마지막 줄에 **API 사용량과 예상 비용**이 표시됩니다
+6. (선택) `python tools\check_translation.py 원본.pdf output\원본_KR_O&M.pdf` 로 숫자/Tag/조사 점검
+
+**API 호출 방식** (비용·안정성)
+- 번역 깊이(effort)는 `low` (번역에는 깊은 추론이 필요 없음 → 비용·시간 절약). `config.py` 의 `TRANSLATION_EFFORT` 또는
+  `.env` 의 `OM_EFFORT=medium` 으로 바꿀 수 있습니다
+- 시스템 프롬프트는 캐시되어 두 번째 호출부터 그 부분 입력 비용이 약 1/10
+- 결과는 JSON 형식이 보장되는 구조화 출력으로 받고, 응답이 잘리거나 형식이 깨지면 묶음을 반으로 나눠 다시 요청
+- 과부하(529)·속도 제한(429)·일시적 연결 오류는 자동 재시도
+- **키 오류 / 잔액 부족 / 모델 없음 / 회사망 인증서 문제**는 즉시 번역을 멈추고 원인을 알려 줍니다
+  (그때까지 번역한 문구는 저장되어, 해결 후 다시 시작하면 이어서 진행 - 같은 문구는 다시 비용이 들지 않음)
+- 회사망(SSL 검사 프록시)에서는 Windows 인증서 저장소를 사용합니다 (truststore)
+
 ## 2. 사용 방법
 
 1. **[PDF 추가…]** 또는 **[폴더 추가…]** 로 번역할 PDF 선택 (여러 개 가능, `input\pdf` 폴더의 PDF는 자동 표시)
@@ -157,6 +177,8 @@ python tools\check_layout.py 원본.pdf output\원본_KR_O&M.pdf --png logs\chec
 | 증상 | 해결 |
 |---|---|
 | `.pyw` 더블클릭해도 반응 없음 | 우클릭 → 연결 프로그램 → Python. 또는 Python 3.12 재설치(PATH 체크) |
+| "보안 인증서 확인에 실패했습니다" / "연결할 수 없습니다" | 회사망(SSL 검사 프록시·방화벽) 문제. `.venv\Scripts\python -m pip install truststore` 확인, 그래도 안 되면 IT 담당자에게 `api.anthropic.com` (HTTPS 443) 허용 요청 |
+| "API 크레딧(잔액)이 부족하거나 사용 한도에 도달" | console.anthropic.com → Billing 에서 잔액/월 사용 한도 확인. 충전 후 다시 시작하면 이어서 진행 |
 | "API 키가 올바르지 않습니다" | console.anthropic.com 에서 키를 다시 복사해 [붙여넣기] → [저장] |
 | "크레딧(잔액)이 부족합니다" | console.anthropic.com → Billing 에서 충전 |
 | "필요한 패키지가 없는 Python 으로 실행되었습니다" | 프로그램 창을 VS Code(F5)나 `python gui.py` 로 열면 시스템 Python 이 쓰입니다. 엔진은 자동으로 `.venv` 의 Python 으로 다시 실행되며, `.venv` 가 없으면 **OM_Translator.pyw 더블클릭**으로 한 번 만들어 주세요 |

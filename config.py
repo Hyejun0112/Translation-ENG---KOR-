@@ -76,6 +76,9 @@ MODEL_CHOICES = [
     ("claude-haiku-5-5", "Haiku - 빠르고 저렴"),
     ("claude-opus-5-5", "Opus - 최고 품질, 비용 높음"),
 ]
+# 번역 깊이(effort): low 면 충분 (번역은 깊은 추론이 필요 없음). 품질이 아쉬우면 "medium" 으로
+TRANSLATION_EFFORT = os.environ.get("OM_EFFORT", "low")
+MAX_OUTPUT_TOKENS = 16000       # 한 번 호출의 출력 한도 (넘으면 묶음을 나눠 다시 요청)
 API_WORKERS = 4                 # 동시 API 호출 수 (속도 제한 오류가 나면 2로)
 MAX_CHUNK_CHARS = 4500          # 한 번 호출에 보내는 최대 글자 수
 MAX_CHUNK_ITEMS = 40            # 한 번 호출에 보내는 최대 문구 수

@@ -1,6 +1,6 @@
 # Plant O&M Translator v2.0 - Python 3.12
 pymupdf>=1.24.3              # PDF 읽기/편집 (레이아웃 유지 텍스트 교체, 표 인식)
-anthropic>=0.40.0            # Claude API 번역
+anthropic>=2.8.0             # Claude API 번역 (구조화 출력/effort/대체 모델 지원 버전)
 pytesseract>=0.3.10          # OCR (Tesseract 실행파일은 tools\install_tesseract.py 가 설치)
 opencv-python-headless>=4.8  # OCR 전처리 (기울기 보정, 표 괘선 인식)
 numpy>=1.24

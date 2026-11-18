@@ -44,7 +44,7 @@ RE_FILE = re.compile(r"^\[(\d+)/(\d+)\]\s+(.+?)\s*$")
 RE_PAGE = re.compile(r"페이지 분석 (\d+)/(\d+)")
 RE_OCR = re.compile(r"OCR (\d+)/(\d+)")
 RE_TR = re.compile(r"번역 (\d+)/(\d+) 묶음 \((\d+)%\).*?남은 시간 약 (.+?)\s*$")
-RE_USAGE = re.compile(r"API 사용량 누적: 입력 ([\d,]+) / 출력 ([\d,]+) 토큰")
+RE_USAGE = re.compile(r"API 사용량 누적: 입력 ([\d,]+) / 출력 ([\d,]+) 토큰(?:.*?예상 비용 약 (\$[\d.,]+))?")
 
 
 def open_path(p: Path):
@@ -286,6 +286,11 @@ class App(tk.Tk):
             ok, msg = True, ""
             try:
                 import anthropic
+                try:  # 회사망(SSL 검사 프록시)에서 Windows 인증서 사용
+                    import truststore  # type: ignore
+                    truststore.inject_into_ssl()
+                except Exception:  # noqa: BLE001
+                    pass
                 anthropic.Anthropic(api_key=key, max_retries=1, timeout=20).models.list(limit=1)
                 msg = "API 키 확인됨"
             except ImportError:
@@ -523,7 +528,7 @@ class App(tk.Tk):
             self.done_files.append(s[1:].strip())
         mu = RE_USAGE.search(s)
         if mu:
-            self.usage = f"입력 {mu.group(1)} / 출력 {mu.group(2)} 토큰"
+            self.usage = f"입력 {mu.group(1)} / 출력 {mu.group(2)} 토큰" + (f" (약 {mu.group(3)})" if mu.group(3) else "")
         tag = "err" if (s.startswith(("!", "✘", "Traceback")) or "Error" in s) else ("ok" if s.startswith("✔") else "")
         self._log(line.rstrip(), tag)
 
