@@ -19,6 +19,7 @@ pdf_engine 에서 사용합니다. 단독 실행으로 한 페이지 OCR 결과�
 from __future__ import annotations
 
 import os
+import math
 import re
 import shutil
 import sys
@@ -38,7 +39,7 @@ try:
 except ImportError:  # pragma: no cover
     pytesseract = None  # type: ignore
 
-OCR_VERSION = "19"  # OCR 로직이 바뀌면 올려서 캐시를 무효화
+OCR_VERSION = "20"  # OCR 로직이 바뀌면 올려서 캐시를 무효화
 
 DEFAULT_BULLET_RE = re.compile(
     r"^\s*(?:[•●▪■◦○‣·*\-–—]|\(?\d{1,3}[.)]|\(?[a-zA-Z][.)]|\d+(?:\.\d+)+\.?)\s+"
@@ -67,6 +68,7 @@ class Word:
     y1: float
     text: str
     conf: float
+    grp: int = -1  # Tesseract 의 (블록, 문단, 줄) 번호 → 중복 인식 판별용
 
     @property
     def h(self) -> float:
@@ -133,6 +135,7 @@ class OcrBlock:
     n_lines: int = 1
     lines: list = field(default_factory=list)  # [(x0,y0,x1,y1,text), ...]
     busy: bool = False         # 사진/무늬 배경 위의 짧은 글자 → 번역하지 않음(덧씌우면 그림이 망가짐). 제목 판단에는 사용
+    uls: list = field(default_factory=list)  # 줄 전체 밑줄 [(x0, y0, x1, y1), ...] pt → 번역문 폭에 맞춰 다시 그림
 
     def to_json(self) -> dict:
         return asdict(self)
@@ -264,11 +267,58 @@ def sample_colors(rgb: "np.ndarray", box: tuple[int, int, int, int]) -> tuple[tu
     return fg, bg, stroke / max(1.0, (y1 - y0))
 
 
-def em_factor(text: str) -> float:
+def strip_rule_bars(w: Word) -> Word:
+    """표의 세로 괘선을 '|' 로 읽은 것은 글자가 아니다. 남겨 두면 옆 칸 글자와 한 줄로 이어지고
+    (예: '500 | 1000 | 2000'), 그 줄을 지우고 다시 쓸 때 괘선까지 지워진다.
+    '|' 만으로 된 낱말은 text='' (버림), 앞뒤에 붙은 '|' 는 뗀다 ('|125' → '125', 상자는 글자 수 비율만큼 줄임)."""
+    t = w.text
+    a = len(t) - len(t.lstrip("|¦‖"))
+    if a and t[a:a + 1].isupper():
+        a = 0  # '|Q3' '|P68': 대문자 I 를 '|' 로 읽은 것 (pdf_engine.fix_ocr_tokens 가 I 로 고친다)
+    b = len(t) - len(t.rstrip("|¦‖"))
+    if not (a or b) or a + b >= len(t):
+        return w if not (a or b) else Word(w.x0, w.y0, w.x1, w.y1, "", w.conf, w.grp)
+    cw = (w.x1 - w.x0) / len(t)
+    return Word(w.x0 + a * cw, w.y0, w.x1 - b * cw, w.y1, t[a:len(t) - b], w.conf, w.grp)
+
+
+def dedupe_words(words: list[Word]) -> list[Word]:
+    """Tesseract 가 한 줄을 두 번(서로 다른 줄 번호로) 인식해 같은 자리에 단어가 겹쳐 나오는 경우가 있다
+    (예: 'tailored to hen the needs of f our our clients'). 다른 줄 번호의 단어끼리
+    상자가 많이 겹치거나(작은 쪽 폭의 절반 이상), 맞닿아 있으면서 한쪽 글자가 다른 쪽에 들어 있으면('f'⊂'of')
+    신뢰도가 높은 쪽 하나만 남긴다. 같은 줄 안의 단어, 맞닿기만 한 다른 낱말('Pp' 'inion')은 건드리지 않는다."""
+    def core(t: str) -> str:
+        return re.sub(r"[^0-9a-z]", "", t.lower())
+    ws = sorted(words, key=lambda w: (-w.conf, -(w.x1 - w.x0)))
+    kept: list[Word] = []
+    for w in ws:
+        dup = False
+        for k in kept:
+            if k.grp == w.grp and w.grp != -1:
+                continue
+            hmin = max(1.0, min(k.h, w.h))
+            if min(k.y1, w.y1) - max(k.y0, w.y0) < 0.5 * hmin:
+                continue
+            ov = min(k.x1, w.x1) - max(k.x0, w.x0)
+            if ov >= 0.5 * max(1.0, min(k.x1 - k.x0, w.x1 - w.x0)):
+                dup = True
+                break
+            a, b = core(k.text), core(w.text)
+            if ov > -0.15 * hmin and a and b and (a in b or b in a):
+                dup = True
+                break
+        if not dup:
+            kept.append(w)
+    return kept
+
+
+def em_factor(text: str, dots: bool = True) -> float:
     """글자 상자 높이 ÷ 글자 크기(em). 낱말에 든 글자 모양에 따라 다르다:
     'Optional:'(위·아래로 다 뻗음) ≈ 0.93, 'Supply'/'ISO'(위로만) ≈ 0.72, 'mm'(소문자 몸통만) ≈ 0.50.
     평균값 하나로 나누면 낱말마다 글자 크기가 들쭉날쭉해진다."""
-    asc = bool(re.search(r"[A-Zbdfhklt0-9(){}\[\]/|!?%&$#@]", text))
+    # i/j 의 점은 대문자 높이까지 올라간다 ('size' 를 'mm' 처럼 보면 글자 크기를 1.4배로 잰다).
+    # dots=False: 점을 뺀 글자 띠 높이로 잴 때
+    asc = bool(re.search(r"[A-Zbdfhklt0-9(){}\[\]/|!?%&$#@" + ("ij" if dots else "") + "]", text))
     desc = bool(re.search(r"[gjpqy(){}\[\],;|]", text))
     if asc and desc:
         return 0.93
@@ -295,19 +345,21 @@ def bg_busyness(gray: "np.ndarray", box: tuple, pad: int) -> float:
 
 def snap_sizes(blocks: list) -> None:
     """한 페이지의 글자 크기를 몇 가지 대표값으로 맞춘다 (인쇄물은 본문/제목 등 몇 가지 크기만 쓴다).
-    OCR 로 잰 크기는 줄마다 ±10% 흔들리므로, 가까운 크기끼리 묶어 글자 수 기준 중앙값으로 통일한다."""
+    OCR 로 잰 크기는 줄마다 ±10% 흔들리므로, 가까운 크기끼리 묶어 글자 수 기준 중앙값을 대표값으로 정한 뒤
+    각 문구를 가장 가까운 대표값(18% 이내)으로 맞춘다. 묶음 경계에 걸린 값이 옆 묶음 대표값으로 끌려가지 않게 한다."""
     items = sorted(((b.size, max(1, len(b.text)), b) for b in blocks), key=lambda t: t[0])
+    reps: list[float] = []
     group: list = []
+
     def flush():
         if len(group) < 2:
             return
         tot = sum(n for _, n, _ in group)
         acc = 0
-        for s, n, _ in group:
+        for s_, n, _ in group:
             acc += n
             if acc * 2 >= tot:
-                for _, _, b in group:
-                    b.size = round(float(s), 2)
+                reps.append(float(s_))
                 break
     for it in items:
         if group and it[0] > group[0][0] * 1.18:
@@ -315,6 +367,55 @@ def snap_sizes(blocks: list) -> None:
             group = []
         group.append(it)
     flush()
+    if not reps:
+        return
+    for s_, _, b in items:
+        r = min(reps, key=lambda r: abs(math.log(r / max(s_, 0.1))))
+        if max(r, s_) <= min(r, s_) * 1.18:
+            b.size = round(r, 2)
+
+
+def find_underline(gray: "np.ndarray", box: tuple, h: float) -> Optional[tuple]:
+    """줄 상자 바로 아래(또는 상자 아래쪽 디센더 영역)의 밑줄: 글자 폭의 85% 이상을 덮는 가는 가로선.
+    양옆으로 글자보다 훨씬 길게 이어지면 표 괘선/구분선이므로 밑줄이 아니다. 반환: (x0, y0, x1, y1) px"""
+    H, W = gray.shape[:2]
+    x0, y0, x1, y1 = [int(round(v)) for v in box]
+    if x1 - x0 < 8 or h < 4:
+        return None
+    pad = int(0.6 * h)
+    ya, yb = max(0, int(y1 - 0.3 * h)), min(H, int(y1 + 0.45 * h) + 1)
+    xa, xb = max(0, x0 - pad), min(W, x1 + pad)
+    if yb - ya < 2:
+        return None
+    crop = gray[ya:yb, xa:xb]
+    thr = min(140, float(np.percentile(gray[max(0, y0):min(H, y1 + 1), max(0, x0):min(W, x1)], 5)) + 60) \
+        if y1 > y0 and x1 > x0 else 140
+    dark = crop < thr
+    width = x1 - x0
+    rows = []
+    for i in range(dark.shape[0]):
+        r = dark[i]
+        if r[pad:pad + width].mean() < 0.85:
+            continue
+        rows.append(i)
+    if not rows:
+        return None
+    # 연속된 행 묶음 중 가장 아래쪽(글자 몸통과 떨어진) 묶음
+    groups: list[list[int]] = []
+    for i in rows:
+        if groups and i - groups[-1][-1] <= 1:
+            groups[-1].append(i)
+        else:
+            groups.append([i])
+    g = groups[-1]
+    if len(g) > max(2, 0.15 * h):
+        return None  # 두꺼운 띠 = 글자 몸통/배경
+    band = dark[g[0]:g[-1] + 1].any(axis=0)
+    # 글자 폭 밖으로도 이어지면 표 괘선
+    if band[:max(1, pad // 2)].mean() > 0.6 or band[-max(1, pad // 2):].mean() > 0.6:
+        return None
+    on = np.where(band)[0]
+    return (xa + int(on[0]), ya + g[0], xa + int(on[-1]) + 1, ya + g[-1] + 1)
 
 
 def ink_band_height(gray: "np.ndarray", box: tuple) -> tuple[float, int]:
@@ -349,7 +450,9 @@ def ink_band_height(gray: "np.ndarray", box: tuple) -> tuple[float, int]:
             merged[-1][1] = b[1]
         else:
             merged.append(list(b))
-    hs = [b[1] - b[0] + 1 for b in merged if b[1] - b[0] + 1 >= 4]
+    # i 점·악센트·밑줄처럼 낮은 띠(가장 높은 띠의 35% 미만)는 글자 행이 아니다 → 행 수/높이 계산에서 뺀다
+    tall = max(b[1] - b[0] + 1 for b in merged)
+    hs = [b[1] - b[0] + 1 for b in merged if b[1] - b[0] + 1 >= max(4, 0.35 * tall)]
     if not hs:
         return 0.0, 0
     return float(median(hs)), len(hs)
@@ -361,11 +464,15 @@ def ink_band_height(gray: "np.ndarray", box: tuple) -> tuple[float, int]:
 LABEL_RE = re.compile(r"^\(?\d{1,2}[.)]$|^\(?[A-Za-z][.)]$")  # '1.' '(2)' 'a)' - 번호/기호 목록은 글에 포함
 
 
-def is_junk_marker(t: str, conf: float = 100.0) -> bool:
+def is_junk_marker(t: str, conf: float = 100.0, nxt: str = "") -> bool:
     """줄 맨 앞의 글머리표 조각 또는 로고/아이콘을 글자로 잘못 읽은 것 (')' '}' '»' ':Q)' 'Q)' …).
-    번호 목록('1.', 'a)')은 글의 일부이므로 해당 없음. 단 신뢰도가 낮은(70 미만) 짧은 기호 섞인 조각은 로고로 본다."""
+    번호 목록('1.', 'a)')은 글의 일부이므로 해당 없음. 단 신뢰도가 낮은(70 미만) 짧은 기호 섞인 조각은 로고로 본다.
+    nxt: 바로 뒤 낱말. 꺾쇠/동그라미 글머리표를 'y' 'e' 'o' 같은 소문자 한 글자로 읽는 경우가 많다 →
+    대문자로 시작하는 낱말 앞의 외톨이 소문자 한 글자(관사 a 제외)는 글머리표로 본다."""
     if len(t) > 4:
         return False
+    if len(t) == 1 and t.islower() and t != "a" and nxt[:1].isupper():
+        return True
     alnum = sum(c.isalnum() for c in t)
     if alnum < len(t) and len(t) <= 3 and conf < 70 and not re.fullmatch(r"\(?\d{1,2}[.)]", t):
         return True  # 낮은 신뢰도 + 기호 포함: 로고/아이콘
@@ -414,7 +521,7 @@ def words_to_lines(words: list[Word], gap_factor: float) -> list[Line]:
             if len(ws) < 2 or ws[1].x0 - ws[0].x1 > 3.5 * max(ws[1].h, 1.0):
                 break
             w0 = ws[0]
-            if is_junk_marker(w0.text, w0.conf) or (marker and len(w0.text) <= 2 and w0.conf <= 60):
+            if is_junk_marker(w0.text, w0.conf, ws[1].text) or (marker and len(w0.text) <= 2 and w0.conf <= 60):
                 # 로고 상자 안에 들어 있는 작은 조각들(로고의 일부를 글자로 읽은 것)도 함께 뗀다
                 ws = [w for w in ws[1:] if not (w.x0 >= w0.x0 - 1 and w.x1 <= w0.x1 + 1 and w.h < 0.8 * w0.h)]
                 marker = True
@@ -422,6 +529,11 @@ def words_to_lines(words: list[Word], gap_factor: float) -> list[Line]:
                 break
         out.append(Line(ws, marker))
     return out
+
+
+CONT_WORD_RE = re.compile(r"(?:of|and|or|for|to|in|on|at|by|with|from|when|where|which|that|the|as|into|"
+                          r"than|while|during|under|over|between|via|per|without|within)\b")
+CONT_END_RE = re.compile(r"(?:\b(?:of|and|or|for|to|in|on|at|by|with|from|the|a|an)|[,&/-])$", re.I)
 
 
 def _line_break_intended(last: Line, ln: Line, right: float) -> bool:
@@ -438,7 +550,28 @@ def _line_break_intended(last: Line, ln: Line, right: float) -> bool:
     soft = (not re.search(r"[.:;!?]['\")\]]?$", t) and bool(re.match(r"[\"'(\[]*[a-z]", n))
             and len(re.findall(r"[A-Za-z]{2,}", t)) >= 2)
     filled = (last.x1 - last.x0) >= 0.6 * max(right - last.x0, 1.0)
+    if soft and (CONT_WORD_RE.match(n) or CONT_END_RE.search(t)):
+        return False  # 'Low cost / of ownership' 처럼 일부러 줄을 나눈 제목: 새 항목이 of/and… 로 시작하지 않는다
+    if CONT_END_RE.search(t) and re.match(r"[\"'(\[]*[a-z]", n):
+        return False
     return not (soft and (filled or avail < 2.0 * fw))
+
+
+def _subheader_row(ln: Line, last: Line, lines: list[Line]) -> bool:
+    """ln 이 표 머리글 아래의 '소제목 행'(예: 'IQ (3-Phase)' 아래의 'Min   Max')의 한 칸인가.
+    같은 높이에 짧은 낱말이 크게 떨어져 나란히 있고, 그 옆 칸도 윗줄 아래에 들어 있으면 윗줄의 이어진 글이 아니다."""
+    if len(ln.words) > 2:
+        return False
+    for m in lines:
+        if m is ln or m is last or len(m.words) > 2:
+            continue
+        ov = min(m.y1, ln.y1) - max(m.y0, ln.y0)
+        if ov < 0.5 * min(m.y1 - m.y0, ln.y1 - ln.y0):
+            continue
+        gap = m.x0 - ln.x1 if m.x0 >= ln.x1 else ln.x0 - m.x1
+        if gap >= 2.0 * ln.h and m.x0 < last.x1 and m.x1 > last.x0:
+            return True
+    return False
 
 
 def lines_to_blocks(lines: list[Line], bullet_re, merge_all: bool = False,
@@ -463,9 +596,12 @@ def lines_to_blocks(lines: list[Line], bullet_re, merge_all: bool = False,
                            or abs((ln.x0 + ln.x1) / 2 - (last.x0 + last.x1) / 2) <= 1.5 * last.h
                            or (xov > 0.5 * min(ln.x1 - ln.x0, last.x1 - last.x0)
                                and abs(ln.x0 - last.x0) <= 3.5 * last.h))
-                if -0.3 * last.h <= gap <= 0.9 * last.h and 0.7 <= hr <= 1.45 and xov > 0 and aligned:
+                if -0.3 * last.h <= gap <= 0.9 * last.h and 0.7 <= hr <= 1.45 and xov > 0 and aligned \
+                        and not _subheader_row(ln, last, lines):
+                    # 오른쪽 한계: 같은 시작점의 줄 중 가장 긴 줄. 더 작은 글자 줄(제목 아래 본문)은 제목의 폭 기준이 아님
                     lim = right if right is not None else max(
-                        l.x1 for l in lines if abs(l.x0 - last.x0) <= 1.5 * last.h)
+                        [l.x1 for l in lines if abs(l.x0 - last.x0) <= 1.5 * last.h
+                         and l.h >= 0.8 * min(last.h, ln.h)] + [last.x1, ln.x1])
                     if _line_break_intended(last, ln, lim):
                         continue  # 목록의 다음 항목: 앞 문단에 붙이지 않는다
                     target = b
@@ -618,7 +754,10 @@ class OcrEngine:
             if not t or c < 0:
                 continue
             x, y, w, h = d["left"][i], d["top"][i], d["width"][i], d["height"][i]
-            out.append(Word(x, y, x + w, y + h, t, c))
+            grp = (d["block_num"][i] * 1000 + d["par_num"][i]) * 1000 + d["line_num"][i] if "line_num" in d else -1
+            wd = strip_rule_bars(Word(x, y, x + w, y + h, t, c, grp))  # 표 괘선 '|' 는 글자가 아니다
+            if wd.text:
+                out.append(wd)
         return out
 
     def _ocr_crop(self, crop, psm: int) -> list[Word]:
@@ -719,6 +858,7 @@ class OcrEngine:
         # 표 괘선/그림 잡음 제거
         words = [w for w in words if not (NOISE_RE.match(w.text) and w.conf < 85)]
         words = [w for w in words if w.h >= 5 and w.h < Hh * 0.2]
+        words = dedupe_words(words)
 
         # 복구 패스: Tesseract 레이아웃 분석이 '그림'으로 보고 건너뛴 글자(색 배경 표 헤더 등)를
         # 찾기 위해, 이미 인식한 단어를 지운 이미지를 희소 텍스트 모드(psm 11)로 한 번 더 OCR
@@ -819,7 +959,7 @@ class OcrEngine:
             ems = []
             for l, h in zip(lns, hs):
                 if h < 0.99 * l.h:  # 띠 높이로 바꾼 줄
-                    ems.append(h / em_factor(l.text))
+                    ems.append(h / em_factor(l.text, dots=False))
                 else:
                     ems += [w.h / em_factor(w.text) for w in l.words if len(w.text) >= 2] or [l.h / 0.78]
             em_px = median(ems)
@@ -828,7 +968,19 @@ class OcrEngine:
             busy = bool(mode == "page" and n_words <= 3 and bg_busyness(gray, (x0, y0, x1, y1), int(hmed)) > 28)
             stroke_ratio = stroke * max(1.0, (y1 - y0)) / max(1.0, hmed)
             strokes.append(stroke_ratio)
-            tmp.append((lns, cell, text, conf, (x0, y0, x1, y1), fg, bg, stroke_ratio, em_px, busy))
+            # 줄마다 밑줄 (표 셀 안은 괘선과 헷갈리므로 보지 않음)
+            uls_px = []
+            if mode == "page" and cell is None and not busy:
+                for l, h in zip(lns, hs):
+                    # 짧은 글자('2' 'e' '44')는 글자 자체의 아래 획을 밑줄로 오인하기 쉽다 → 3글자 이상, 폭 2.5×높이 이상만
+                    if len(re.findall(r"[A-Za-z0-9]", l.text)) < 3 or (l.x1 - l.x0) < 2.5 * h:
+                        continue
+                    ul = find_underline(gray, (l.x0, l.y0, l.x1, l.y1), h)
+                    if ul:
+                        uls_px.append(ul)
+                if uls_px and len(uls_px) < len(lns):
+                    uls_px = []  # 일부 줄만 밑줄: 위치를 옮겨 그릴 수 없으므로 원본 그대로 두는 쪽이 안전 → 생략
+            tmp.append((lns, cell, text, conf, (x0, y0, x1, y1), fg, bg, stroke_ratio, em_px, busy, uls_px))
         ref = median(strokes) if strokes else 0.0
 
         def to_pt(x, y):
@@ -850,18 +1002,20 @@ class OcrEngine:
             ys = sorted(p[1] for p in pts)
             return (xs[1], ys[1], xs[2], ys[2])
 
-        for lns, cell, text, conf, box, fg, bg, stroke_ratio, em_px, busy in tmp:
+        for lns, cell, text, conf, box, fg, bg, stroke_ratio, em_px, busy, uls_px in tmp:
             rect = box_pt(*box)
             size = em_px / scale
             if len(lns) > 1:
-                pitches = [lns[i + 1].y0 - lns[i].y0 for i in range(len(lns) - 1)]
+                # 윗변/아랫변 차이 중 큰 값: 한쪽 상자가 위·아래로 늘어나도(어센더/디센더, 이웃 줄 조각) 줄 간격을 작게 재지 않는다
+                pitches = [max(lns[i + 1].y0 - lns[i].y0, lns[i + 1].y1 - lns[i].y1) for i in range(len(lns) - 1)]
                 pitch = median(pitches) / scale
                 if pitch > 0:
                     size = min(size, pitch / 1.15)
             size = max(4.0, min(size, 40.0))
             first = lns[0]
             origin_y = to_pt(first.x0, first.y1)[1] - 0.05 * size
-            bold = bool(ref > 0 and stroke_ratio > ref * 1.3)
+            # 굵기: 짧은 낱말('Max')은 획 두께 측정이 흔들려 잘못 굵게 잡히기 쉽다 → 4글자 이상에서만 판단
+            bold = bool(ref > 0 and stroke_ratio > ref * 1.3 and len(re.sub(r"\W", "", text)) >= 4)
             blocks.append(OcrBlock(
                 rect=rect, text=text, conf=round(float(conf), 1), size=round(float(size), 2),
                 origin_y=float(origin_y), align=detect_align(lns), bold=bold, fg=fg, bg=bg,
@@ -870,6 +1024,7 @@ class OcrEngine:
                 n_lines=len(lns),
                 lines=[box_pt(l.x0, l.y0, l.x1, l.y1) + (l.text,) for l in lns],
                 busy=busy,
+                uls=[box_pt(*ul) for ul in uls_px],
             ))
         if mode == "page":
             snap_sizes(blocks)

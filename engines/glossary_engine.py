@@ -52,6 +52,10 @@ DEFAULT_KEEP_PATTERNS = [
     # 숫자에 바로 붙은 단위/기호 (14.0Kgf/cm, 100L/hr, 1.27kW, 80Nm, 60lb.ft): 소수점이 갈라지지 않게 한 덩어리로 보호
     # (서수 1st/2nd/7th 는 제외 - 번역문에서 '첫째/일곱째' 등으로 쓰일 수 있음)
     r"(?<![\w.])\d+(?:[.,]\d+)*(?!(?:st|nd|rd|th)\b)[A-Za-zµμΩ°][A-Za-z0-9µμΩ°²³]*(?:[./][A-Za-z²³][A-Za-z0-9²³]*)*",
+    # 숫자 없이 홀로 쓴 복합 단위 (표 머리글 'kgf/cm2', '(MPa)', 'm3/h', 'N/mm2'): 영어 낱말이 아니므로 그대로 둔다
+    r"(?<![\w/])(?:[Kk][Gg][Ff]?/[Cc][Mm][²2]?(?:[ga]|\s?\([ga]\))?|N/mm[²2]?|N?m[³3]/(?:h|hr|min|s)|kg/(?:h|hr|s|m[³3])"
+    r"|[lL]/(?:min|hr|h|s)|(?:mm|in|m)H[2₂]O|mmHg|ft[²³23](?:/(?:h|s|min))?|(?:in|mm|cm|dm|m)[²³23]"
+    r"|kcal/(?:kg|Nm[³3]|h)|kPa|MPa|kVA|kW|rpm|psi[ga]?|bar[ga]|kN|MN|kNm|Nm|lbf(?:\.ft|·ft)?|lb\.?ft|ft\.?lbf?)(?![\w/])",
     # 점 세 개/말줄임표 범위 (4...20mA, 0…10 V)
     r"(?<![\w.])\d+(?:[.,]\d+)?\s?(?:\.{2,3}|…)\s?\d+(?:[.,]\d+)?(?:\s?[A-Za-z%°µ][A-Za-z0-9/%°µ]*)?",
     # 하이픈/슬래시로 이어진 번호 (부품번호 397802-0042, 그림 13-5, 분수 1/4, 범위 10-40, 날짜 09/2022) → 한 덩어리로 보호
@@ -321,9 +325,9 @@ def _jong_of(prev: str):
     for dom, j in _DOMAIN_JONG.items():  # 이메일/URL 뒤
         if low.endswith(dom):
             return j
-    for u in _UNITS_BY_LEN:  # 숫자나 공백 바로 뒤의 단위
+    for u in _UNITS_BY_LEN:  # 숫자·공백·여는 괄호 바로 뒤(또는 맨 앞)의 단위: '10 Nm', '(Nm)', 'kN'
         if head.endswith(u) and (len(head) == len(u) or not head[-len(u) - 1].isalpha()):
-            if len(head) > len(u) and (head[-len(u) - 1].isdigit() or head[-len(u) - 1] in " /"):
+            if len(head) == len(u) or head[-len(u) - 1].isdigit() or head[-len(u) - 1] in " /([{<":
                 return _UNIT_JONG[u]
     c = prev[i]
     if c in _SYMBOL_JONG:

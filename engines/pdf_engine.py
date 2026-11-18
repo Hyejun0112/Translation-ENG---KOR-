@@ -177,6 +177,8 @@ def seg_text(sg: list[dict]) -> str:
                 t = t.translate(_SUB)
         elif main and s["size"] >= 0.95 * main:
             base_y = s["origin"][1]
+        if s.get("_lsp") and out and out[-1] and not out[-1][-1].isspace():
+            t = " " + t
         out.append(t)
     return "".join(out).strip()
 
@@ -255,7 +257,8 @@ def _fix_span(s: dict) -> dict:
     if t.strip() and n:
         x0, y0, x1, y1 = s["bbox"]
         shift = min(n * 0.278 * s["size"], max(0.0, (x1 - x0) - 0.4 * s["size"] * len(t.strip())))
-        return dict(s, text=t[n:], bbox=(x0 + max(shift, 0.0), y0, x1, y1))
+        # _lsp: 앞 공백을 뗐다는 표시 → 줄 중간 조각이면 seg_text 가 낱말 사이 공백을 되살린다 ('mm' '²' ' or' → 'mm² or')
+        return dict(s, text=t[n:], bbox=(x0 + max(shift, 0.0), y0, x1, y1), _lsp=True)
     return dict(s, text=t) if t is not s["text"] else s
 
 
@@ -949,6 +952,10 @@ def block_to_unit(pno: int, b) -> Unit:
              fg=tuple(b.fg), bg=tuple(b.bg))
     if getattr(b, "busy", False):
         u.scope_keep = "사진/무늬 배경 위의 글자 → 원문 유지"
+    for ul in getattr(b, "uls", None) or []:  # 스캔 글자의 밑줄 (줄 전체) → 번역문 폭에 맞춰 다시 그림
+        r = fitz.Rect(ul)
+        u.uls.append({"rect": r, "x0": b.rect[0], "x1": b.rect[2], "oy": b.origin_y, "size": b.size,
+                      "color": tuple(b.fg), "ocr_full": True})
     if b.conf < 80:
         u.notes.append(f"OCR_LOW_CONF({b.conf:.0f}) 원문 확인")
     return u
@@ -1304,6 +1311,67 @@ def free_span(u: Unit, units: list[Unit], vedges, page_rect) -> tuple[float, flo
     return min(left, u.rect.x0), max(right, u.rect.x1)
 
 
+class InkMap:
+    """스캔 페이지의 잉크(글자·그림·로고·선) 지도. 스캔 쪽에는 벡터 도형이 없어서 번역문이 옆의 로고/그림 위로
+    번지는지 알 수 없다 → 원본 이미지를 저해상도로 그려 배경과 다른 점이 있는 곳을 '막힌 곳'으로 본다."""
+    DPI = 100
+
+    def __init__(self, page):
+        pix = page.get_pixmap(dpi=self.DPI, colorspace=fitz.csGRAY, alpha=False)
+        self.w, self.h = pix.width, pix.height
+        self.buf = pix.samples
+        self.k = self.DPI / 72.0
+        self.x0, self.y0 = page.rect.x0, page.rect.y0
+
+    def _px(self, x: float, y: float) -> tuple[int, int]:
+        return int((x - self.x0) * self.k), int((y - self.y0) * self.k)
+
+    def _dark_cols(self, r: "fitz.Rect", bg: int) -> list[int]:
+        a, b = self._px(r.x0, r.y0)
+        c, d = self._px(r.x1, r.y1)
+        a, b, c, d = max(0, a), max(0, b), min(self.w, c), min(self.h, d)
+        cols = []
+        for x in range(a, c):
+            n = 0
+            for y in range(b, d):
+                if abs(self.buf[y * self.w + x] - bg) > 70:
+                    n += 1
+                    if n >= 2:
+                        cols.append(x)
+                        break
+        return cols
+
+    def free_right(self, u: "Unit", right: float, bgv: int) -> float:
+        """u 의 오른쪽 끝부터 right 사이에서 처음 잉크가 나오는 x (없으면 right). 글자 끝 1pt 는 자기 글자로 본다."""
+        if right <= u.rect.x1 + 1.5:
+            return right
+        cols = self._dark_cols(fitz.Rect(u.rect.x1 + 1.0, u.rect.y0 + 0.15 * u.size, right, u.rect.y1 - 0.1 * u.size), bgv)
+        if not cols:
+            return right
+        return max(u.rect.x1, self.x0 + cols[0] / self.k - 0.35 * u.size)
+
+    def free_left(self, u: "Unit", left: float, bgv: int) -> float:
+        if left >= u.rect.x0 - 1.5:
+            return left
+        cols = self._dark_cols(fitz.Rect(left, u.rect.y0 + 0.15 * u.size, u.rect.x0 - 1.0, u.rect.y1 - 0.1 * u.size), bgv)
+        if not cols:
+            return left
+        return min(u.rect.x0, self.x0 + (cols[-1] + 1) / self.k + 0.35 * u.size)
+
+    def free_bottom(self, u: "Unit", x0: float, x1: float, bottom: float, bgv: int) -> float:
+        """u 아래(x0~x1)에서 처음 잉크가 나오는 y (없으면 bottom)."""
+        if bottom <= u.rect.y1 + 1.0:
+            return bottom
+        a, b = self._px(x0, u.rect.y1 + 1.0)
+        c, d = self._px(x1, bottom)
+        a, b, c, d = max(0, a), max(0, b), min(self.w, c), min(self.h, d)
+        for y in range(b, d):
+            row = self.buf[y * self.w + a:y * self.w + c]
+            if sum(1 for v in row if abs(v - bgv) > 70) >= 2:
+                return max(u.rect.y1, self.y0 + y / self.k - 0.2 * u.size)
+        return bottom
+
+
 def free_bottom(u: Unit, units: list[Unit], hedges, page_rect, left: float, right: float) -> float:
     """유닛이 아래로 늘어날 수 있는 한계 y. 셀 안이면 셀 바닥까지, 아니면 최대 1줄."""
     bottom = page_rect.y1 - 10
@@ -1421,8 +1489,11 @@ def _underline_spans(u: Unit, placed: list, size: float, font) -> list:
     k = size / max(ref["size"], 1.0)
     off = (ref["rect"].y0 - ref["oy"]) * k
     th = max(0.35, ref["rect"].height * k)
+    if ref.get("ocr_full"):
+        # OCR 의 기준선은 디센더('p' '(' ) 때문에 실제보다 아래로 잡힐 수 있다 → 번역문 기준선 바로 아래에 고정
+        off, th = 0.12 * size, min(max(0.4, ref["rect"].height), 0.09 * size)
     full = all(sum(x["rect"].width for x in u.uls if abs(x["oy"] - ln[4]) < 0.5) >= 0.85 * (ln[2] - ln[0])
-               for ln in u.lines) if u.lines else False
+               for ln in u.lines) if u.lines else any(x.get("ocr_full") for x in u.uls)
     out = []
     if full:
         for x, y, ln in placed:
@@ -1553,11 +1624,24 @@ def render_page(page, units: list[Unit], fonts, cfg: Config) -> dict:
 
     # 1) 배치 계산 (원본 위치/폭/높이 기준)
     plans = []
+    ink = None
+    if any(u.source == "ocr-page" for u in todo):
+        try:
+            ink = InkMap(page)  # 리댁션/패치 전 원본 이미지 기준
+        except Exception:  # noqa: BLE001
+            ink = None
     for u in todo:
         use_bold = bool(u.bold and fonts["bold"]["font"])
         font = fonts["bold"]["font"] if use_bold else fonts["regular"]["font"]
         fname = "OMKOB" if use_bold else "OMKO"
         left, right = free_span(u, units, vedges, page.rect)
+        bgv = None
+        if ink is not None and u.source == "ocr-page" and u.cell is None:
+            # 스캔 쪽: 옆의 로고/그림/선 위로 번역문이 번지지 않게 빈 배경까지만 넓힌다
+            bg = tuple(u.bg) if u.bg else (1, 1, 1)
+            bgv = int(round(255 * (0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2])))
+            right = ink.free_right(u, right, bgv)
+            left = ink.free_left(u, left, bgv)
         if u.align == "center":
             cx = (u.rect.x0 + u.rect.x1) / 2
             box_w = 2 * min(cx - left, right - cx)
@@ -1566,6 +1650,8 @@ def render_page(page, units: list[Unit], fonts, cfg: Config) -> dict:
         else:
             box_w = right - u.rect.x0
         bottom = free_bottom(u, units, hedges, page.rect, left, right)
+        if bgv is not None:
+            bottom = ink.free_bottom(u, u.rect.x0, u.rect.x0 + box_w, bottom, bgv)
         if u.source == "ocr-figure":
             # 그림 속 라벨: 래스터 그림의 선/기호를 덮지 않도록 원래 자리에서 거의 넓히지 않고 축소로 맞춘다
             box_w = min(box_w, u.rect.width * 1.12 + 2)
@@ -1653,6 +1739,8 @@ def render_page(page, units: list[Unit], fonts, cfg: Config) -> dict:
         if not u.ocr:
             continue
         patch = (fitz.Rect(u.rect) + (-1.2, -1.2, 1.2, 1.2)) | (area + (-0.6, -0.6, 0.6, 0.6))
+        for ul in u.uls:  # 원본 밑줄도 덮는다 (번역문 폭에 맞춰 4단계에서 다시 그림)
+            patch |= ul["rect"] + (-0.6, -0.6, 0.6, 0.6)
         if u.cell is not None:
             patch &= (u.cell + (1.5, 1.5, -1.5, -1.5))
         if patch.is_empty:
@@ -1678,7 +1766,7 @@ def render_page(page, units: list[Unit], fonts, cfg: Config) -> dict:
                         fb_used.add(fn)
                 page.insert_text(fitz.Point(x, y), part, fontname=fn, fontsize=size, color=color)
                 x += mix.font_of(k).text_length(part, fontsize=size)
-        if id(u) in ul_done:
+        if id(u) in ul_done or (u.ocr and u.uls):  # OCR: 원본 밑줄은 3단계 패치로 덮였다
             for x0, x1, y, th, col in _underline_spans(u, placed, size, mix):
                 page.draw_rect(fitz.Rect(x0, y, x1, y + th), color=None, fill=col, width=0, overlay=True)
                 stats["drawn"] += 1
@@ -1882,6 +1970,9 @@ def prepare_units(doc, cfg: Config, protector: Protector, overrides: dict[str, s
 TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9\-_/.]*[A-Za-z0-9]")
 LEAD_DIGIT_RE = re.compile(r"^([10])([A-Z]{1,4}\d[\w.\-]*)$")           # 1Q3, 1QT3 (모델명이 숫자로 시작)
 ZERO_O_RE = re.compile(r"^([A-Z]{2,4}?)(O{1,3})(\d{1,4})((?:-[\w.]+)*)$")  # PUBOO2-137, PUBO02-040
+BAR_I_RE = re.compile(r"(?<![\w|])\|(?=[A-Z])")  # '|Q3' '|P68' '|SO': 대문자 앞의 '|' 는 I
+# 위첨자 ²/³ 를 ’ ' / ` 로 읽은 단위 ('10kgf/cm’', '16kgf/cm/', '5 mm'') → ²
+SUP2_RE = re.compile(r"(?<=\d)(\s?(?:[Kk][Gg][Ff]?/[Cc][Mm]|N/mm|mm|cm))[’'‘`/](?=[\s),.;:]|$)")
 
 
 def fix_ocr_tokens(units: list[Unit], extra_text: str = "") -> int:
@@ -1929,7 +2020,13 @@ def fix_ocr_tokens(units: list[Unit], extra_text: str = "") -> int:
                 changes.append(f"{m.group(0)}→{new}")
             return new
 
-        txt = TOKEN_RE.sub(rep, u.text)
+        txt = BAR_I_RE.sub("I", u.text)
+        if txt != u.text:
+            changes.append("|→I")
+        t2 = SUP2_RE.sub(lambda m: m.group(1) + "²", txt)
+        if t2 != txt:
+            changes.append("위첨자²")
+        txt = TOKEN_RE.sub(rep, t2)
         if changes:
             u.text = txt
             u.notes.append("OCR_FIXED(" + ", ".join(changes[:4]) + ")")
