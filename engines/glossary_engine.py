@@ -27,6 +27,8 @@ _UNITS = [
     r"ppm", r"ppb", r"mm", r"cm", r"[kK]m", r"m[²³23]", r"m", r"kg", r"g", r"L",
     r"l/min", r"mmH2O", r"mmHg", r"NPS", r"DN", r"inch", r"\"", r"Ω",
     r"dB(?:\(A\))?", r"kcal/(?:kg|Nm[³3]|h)", r"[kM]?J(?:/kg)?",
+    r"ft(?:[²³23]|/s|/min)?", r"AWG", r"V\s?(?:DC|AC|dc|ac)", r"lbs?", r"lbf(?:\.ft|·ft)?", r"[kM]?N(?:·?m)?",
+    r"gpm", r"GPM", r"[sS][cC][fF][mM]", r"[mM]Pa[ga]?", r"inH[2₂]O",
 ]
 
 
@@ -56,6 +58,9 @@ DEFAULT_KEEP_PATTERNS = [
     r"(?<![\w/])(?:[Kk][Gg][Ff]?/[Cc][Mm][²2]?(?:[ga]|\s?\([ga]\))?|N/mm[²2]?|N?m[³3]/(?:h|hr|min|s)|kg/(?:h|hr|s|m[³3])"
     r"|[lL]/(?:min|hr|h|s)|(?:mm|in|m)H[2₂]O|mmHg|ft[²³23](?:/(?:h|s|min))?|(?:in|mm|cm|dm|m)[²³23]"
     r"|kcal/(?:kg|Nm[³3]|h)|kPa|MPa|kVA|kW|rpm|psi[ga]?|bar[ga]|kN|MN|kNm|Nm|lbf(?:\.ft|·ft)?|lb\.?ft|ft\.?lbf?)(?![\w/])",
+    # 괄호/대괄호 안에 홀로 쓴 단위 (표 머리글 '[mm]', '[in]', '[dm³/min]', '(°C)', '[%]'): 그대로 둔다
+    r"[\[(](?:[kMmcµμdn]?(?:m|g|l|L|s|N|W|V|A|Pa|J|Hz|bar)|in|ft|lb|lbf|psi[ga]?|°\s?[CF]|[℃℉%]|min|h|rpm|AWG)"
+    r"(?:[²³23])?(?:/(?:min|s|h|hr|m[²³23]?|kg))?[\])]",
     # 점 세 개/말줄임표 범위 (4...20mA, 0…10 V)
     r"(?<![\w.])\d+(?:[.,]\d+)?\s?(?:\.{2,3}|…)\s?\d+(?:[.,]\d+)?(?:\s?[A-Za-z%°µ][A-Za-z0-9/%°µ]*)?",
     # 하이픈/슬래시로 이어진 번호 (부품번호 397802-0042, 그림 13-5, 분수 1/4, 범위 10-40, 날짜 09/2022) → 한 덩어리로 보호
@@ -298,6 +303,7 @@ _UNIT_JONG = {"kg": (True, False), "mm": (False, False), "cm": (False, False), "
               "kA": (False, False), "mA": (False, False), "Vac": (False, False), "Vdc": (False, False),
               "%": (False, False), "℃": (False, False), "°C": (False, False), "mmH2O": (False, False),
               "Nm": (False, False), "lb.ft": (False, False), "lbf": (False, False), "ft": (False, False),
+              "lb": (False, False), "lbs": (False, False), "gpm": (True, False), "scfm": (True, False),
               "in": (False, False), "L/hr": (False, False), "l/hr": (False, False), "L/h": (False, False),
               "m3/h": (False, False), "°F": (False, False), "rpm.": (True, False)}
 # 기호: 도(°), 제곱/세제곱 미터(²³ → '…미터'), 아래첨자 숫자(O₂ '오투', H₂O)
