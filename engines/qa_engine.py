@@ -26,6 +26,56 @@ except ImportError:  # pragma: no cover
 from engines.glossary_engine import STOP, Glossary, clean_text, optional_path, read_text_auto
 from engines.pdf_engine import PAGE_CLASS_KO, Unit
 
+
+def _graphics_only(page, dpi: int = 50):
+    """글자를 모두 뺀 화면(그림·선·배경)과 글자 줄 상자 목록"""
+    tmp = fitz.open()
+    tmp.insert_pdf(page.parent, from_page=page.number, to_page=page.number, annots=False, links=False)
+    pg = tmp[0]
+    boxes = []
+    for bl in pg.get_text("dict")["blocks"]:
+        for ln in bl.get("lines", []) if bl.get("type") == 0 else []:
+            x0, y0, x1, y1 = ln["bbox"]
+            h = max(1.0, y1 - y0)
+            boxes.append(fitz.Rect(x0 - 1.5, y0 - 0.2 * h, x1 + 1.5, y1 + 0.5 * h))
+    pg.add_redact_annot(pg.rect, fill=False)
+    pg.apply_redactions(images=0, graphics=0)
+    pm = pg.get_pixmap(dpi=dpi, colorspace=fitz.csGRAY)
+    return pm.samples, pm.width, pm.height, boxes
+
+
+def visually_same(a, b, dpi: int = 50, limit: int = 12) -> bool:
+    """그림/선 '개수'가 달라도 화면에서 보이는 차이가 없으면 True.
+    (원래 보이지 않던 그림 - 글자 모양으로 오린 그림, 가려진 중복 그림, 빈 클립 - 이 정리된 경우)
+    글자 줄 주변(다시 그린 밑줄·스캔 패치)은 비교에서 뺀다."""
+    try:
+        xa, w, h, ba = _graphics_only(a, dpi)
+        xb, w2, h2, bb = _graphics_only(b, dpi)
+        if (w, h) != (w2, h2):
+            return False
+        k = dpi / 72.0
+        new = []
+        if len(a.get_text("text").strip()) < 20:  # 스캔 쪽: 영어를 덮은 패치 자리는 비교에서 뺀다
+            try:
+                new = [fitz.Rect(d["rect"]) + (-1.5, -1.5, 1.5, 1.5) for d in b.get_drawings()
+                       if d.get("fill") is not None]
+            except Exception:  # noqa: BLE001
+                new = []
+        masks = ba + bb + new
+        n = 0
+        for i, (p, q) in enumerate(zip(xa, xb)):
+            if abs(p - q) <= 60:
+                continue
+            x, y = (i % w) / k, (i // w) / k
+            if any(r.x0 <= x <= r.x1 and r.y0 <= y <= r.y1 for r in masks):
+                continue
+            n += 1
+            if n > limit:
+                return False
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
 def verify_output(dst: Path, expect_pages: int, translated_pages: set[int],
                   src: Optional[Path] = None, pages: Optional[list[int]] = None,
                   draw_delta: Optional[dict] = None) -> tuple[list[str], list]:
@@ -69,7 +119,7 @@ def verify_output(dst: Path, expect_pages: int, translated_pages: set[int],
                         return sum(1 for im in pg.get_image_info()
                                    if im["bbox"][2] - im["bbox"][0] >= 4 and im["bbox"][3] - im["bbox"][1] >= 4
                                    and not (fitz.Rect(im["bbox"]) & pg.rect).is_empty)  # 페이지 밖 그림 제외
-                    if big(a) != big(b):
+                    if big(a) != big(b) and not visually_same(a, b):
                         img_bad.append(pno + 1)
                 except Exception:  # noqa: BLE001
                     pass
@@ -77,7 +127,7 @@ def verify_output(dst: Path, expect_pages: int, translated_pages: set[int],
                 if draw_delta is not None:
                     try:
                         na, nb = len(a.get_cdrawings()), len(b.get_cdrawings())
-                        if nb - na != draw_delta.get(pno, 0):
+                        if nb - na != draw_delta.get(pno, 0) and not visually_same(a, b):
                             draw_bad.append(pno + 1)
                     except Exception:  # noqa: BLE001
                         pass

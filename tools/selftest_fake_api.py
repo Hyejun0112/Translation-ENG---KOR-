@@ -6,7 +6,7 @@ selftest_fake_api.py - API 비용 없이 '실제 번역 경로 전체'를 시험
 Claude API 대신 가짜 서버(실제 SDK 예외/응답 모양을 흉내)를 끼워 넣고 main.py 의 일괄 번역을 그대로 실행합니다.
 번역문은 길이가 비슷한 가짜 한글이라 레이아웃·안정성만 확인됩니다 (번역 품질은 실제 API 로 확인).
 
-사용:  python tools/selftest_fake_api.py 결과폴더 원본.pdf [원본2.pdf …] [--mode normal|chaos|credit|oldsdk|nostruct|auth|ssl] [--ocr]
+사용:  python tools/selftest_fake_api.py 결과폴더 원본.pdf [원본2.pdf …] [--mode normal|chaos|credit|oldsdk|nostruct|auth|ssl] [--ocr] [--pages 1-20]
   normal   : 정상 응답 (모든 토큰 뒤 조사 병기 '을(를)' 포함 → 조사 보정 확인)
   chaos    : 응답 잘림(max_tokens) / 과부하(529) / 거절(refusal) / 문구 누락 / 보호 토큰 누락 / ```json 감싸기 섞기
   credit   : 7번째 호출부터 잔액 부족 → 즉시 중지되는지
@@ -91,6 +91,11 @@ def main(argv):
     mode = argv[argv.index("--mode") + 1] if "--mode" in argv else "normal"
     if "--mode" in argv:
         args.remove(mode)
+    extra = []
+    if "--pages" in argv:  # 쪽 범위만 시험 (예: --pages 18-22)
+        pages = argv[argv.index("--pages") + 1]
+        args.remove(pages)
+        extra = ["--pages", pages]
     os.environ["MODE"] = mode
     out = Path(args[0])
     import config
@@ -108,7 +113,7 @@ def main(argv):
         if Path(f).exists():
             P.FONT_CANDIDATES[kind].insert(0, f)
     import main as M
-    rc = M.main(["--once", "--no-open"] + ([] if "--ocr" in argv else ["--no-ocr"]) + args[1:])
+    rc = M.main(["--once", "--no-open"] + ([] if "--ocr" in argv else ["--no-ocr"]) + extra + args[1:])
     print("RC", rc, "| fake API calls", Stats.calls, "items", Stats.items, "| injected faults", Stats.kinds)
     return rc
 

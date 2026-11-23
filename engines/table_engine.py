@@ -63,6 +63,9 @@ def _starts_like_continuation(text: str) -> bool:
     return w[0].islower() or (len(w) > 1 and w.isupper() and w.lower() in CONT_WORDS)
 
 
+TOC_LINE_RE = re.compile(r"(?:[.·…]\s*){4,}\d{0,4}\s*$")
+
+
 def same_row(a: dict, b: dict) -> bool:
     return abs(a["_oy"] - b["_oy"]) < 0.35 * max(a["_size"], b["_size"], 1.0)
 
@@ -80,6 +83,8 @@ def continues(a: dict, b: dict, hedges=None) -> bool:
     size = max(a["_size"], 1.0)
     if b.get("_marker") or BULLET_RE.match(b["_text"]):
         return False
+    if TOC_LINE_RE.search(a["_text"]) or TOC_LINE_RE.search(b["_text"]):
+        return False  # 목차 줄('Title . . . . 11')은 한 줄이 한 항목
     if abs(a["_size"] - b["_size"]) > 0.6:
         return False
     if (a.get("_ul", 0.0) >= 0.85) != (b.get("_ul", 0.0) >= 0.85):
@@ -127,10 +132,15 @@ def x_ok(group: list[dict], b: dict) -> bool:
         return True
     if len(group) >= 2:
         return False
+    if re.fullmatch(r"\(?\d{1,4}\)?\s?[*†‡]?", a["_text"].strip()):
+        return False  # 부품 번호('70*', '239')만 있는 조각: 아래 줄은 옆 칸(부품명)의 둘째 줄이다
     if dx > 0:
         return dx <= 4.0 * size  # 글머리표/번호/'NOTE:' 뒤 내어쓰기
     first_bullet = bool(group[0].get("_marker") or BULLET_RE.match(group[0]["_text"]))
-    return (not first_bullet) and -dx <= 3.0 * size  # 첫 줄 들여쓰기 문단
+    mx = group[0].get("_marker_x0")
+    if first_bullet and mx is not None and abs(b["bbox"][0] - mx) <= 0.6 * size:
+        return True  # '7   Fig. 22 shows …' 다음 줄이 번호 아래(왼쪽)로 돌아가는 단계 문단
+    return (not first_bullet) and -dx <= 4.5 * size  # 첫 줄 들여쓰기 문단 (탭 들여쓰기 포함)
 
 
 def line_merge(segs: list[dict], hedges: list | None = None) -> list[list[dict]]:
