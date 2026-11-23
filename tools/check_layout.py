@@ -125,7 +125,14 @@ def compare(src: str, dst: str, png_dir: str = "") -> int:
         ta, tb = pa.get_text(), pb.get_text()
         if _bad_chars(tb) > _bad_chars(ta):
             msg.append(f"깨진 글자 {_bad_chars(tb) - _bad_chars(ta)}개")
-        oa, ob = _overlaps(_lines(pa)), _overlaps(_lines(pb))
+        pa_n = pa
+        if pa.rotation and hasattr(pa, "remove_rotation"):
+            # 번역기는 회전된 쪽(가로 도면 등)을 보이는 모습 그대로 정규화한다 → 원본도 같게 맞춰 비교
+            tmp = fitz.open()
+            tmp.insert_pdf(a, from_page=i, to_page=i, annots=False, links=False)
+            pa_n = tmp[0]
+            pa_n.remove_rotation()
+        oa, ob = _overlaps(_lines(pa_n)), _overlaps(_lines(pb))
         if ob > oa:
             msg.append(f"글자 겹침 {oa}→{ob}")
         en0, en1 = len(re.findall(r"[A-Za-z]{4,}", ta)), len(re.findall(r"[A-Za-z]{4,}", tb))

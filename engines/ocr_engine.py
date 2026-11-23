@@ -39,7 +39,7 @@ try:
 except ImportError:  # pragma: no cover
     pytesseract = None  # type: ignore
 
-OCR_VERSION = "20"  # OCR 로직이 바뀌면 올려서 캐시를 무효화
+OCR_VERSION = "21"  # OCR 로직이 바뀌면 올려서 캐시를 무효화
 
 DEFAULT_BULLET_RE = re.compile(
     r"^\s*(?:[•●▪■◦○‣·*\-–—]|\(?\d{1,3}[.)]|\(?[a-zA-Z][.)]|\d+(?:\.\d+)+\.?)\s+"
@@ -547,9 +547,13 @@ def _line_break_intended(last: Line, ln: Line, right: float) -> bool:
     if fw * 1.15 + 0.3 * last.h > avail:
         return False
     t, n = last.text.rstrip(), ln.text.lstrip()
+    words_t = re.findall(r"[A-Za-z]{2,}", t)
+    # 'Actuator' / 'size' 처럼 한 낱말 머리글이 두 줄로 나뉜 경우도 이어진 글로 본다 (둘째 줄이 짧고 소문자로 시작)
     soft = (not re.search(r"[.:;!?]['\")\]]?$", t) and bool(re.match(r"[\"'(\[]*[a-z]", n))
-            and len(re.findall(r"[A-Za-z]{2,}", t)) >= 2)
+            and (len(words_t) >= 2 or (len(words_t) == 1 and len(words_t[0]) >= 3 and len(ln.words) <= 2)))
     filled = (last.x1 - last.x0) >= 0.6 * max(right - last.x0, 1.0)
+    if soft and len(words_t) == 1:
+        return False  # 한 낱말 머리글 + 소문자로 시작하는 짧은 줄 ('Actuator' / 'size') = 두 줄로 나눈 머리글
     if soft and (CONT_WORD_RE.match(n) or CONT_END_RE.search(t)):
         return False  # 'Low cost / of ownership' 처럼 일부러 줄을 나눈 제목: 새 항목이 of/and… 로 시작하지 않는다
     if CONT_END_RE.search(t) and re.match(r"[\"'(\[]*[a-z]", n):
@@ -801,6 +805,11 @@ class OcrEngine:
             return ln
         new = Line([Word(x0 + (w.x0 - 10) / f, y0 + (w.y0 - 10) / f, x0 + (w.x1 - 10) / f,
                          y0 + (w.y1 - 10) / f, w.text, w.conf) for w in ws])
+        # 잘라낸 범위에 이웃 줄(아래 그림 라벨 등)이 걸려 그 글자를 읽은 경우는 버린다
+        # (예: 그림 조각 'AL' 을 다시 읽어 아래 'Work station' 까지 합친 'a statiol' → 그림 전체를 덮는 상자)
+        tol = 0.1 * ln.h
+        if any(not (ln.y0 - tol <= w.cy <= ln.y1 + tol) for w in new.words):
+            return ln  # 낱말 중심이 원래 줄 높이 밖(이웃 줄)에 있다
         return new if new.conf > ln.conf + 3 else ln
 
     def _ocr_words(self, gray, origin, scale) -> list[OcrBlock]:
@@ -939,6 +948,8 @@ class OcrEngine:
             conf = sum(l.conf * len(l.text) for l in lns) / max(1, sum(len(l.text) for l in lns))
             if conf < min_conf:
                 continue
+            if mode == "page" and conf < 75 and len(re.sub(r"[^A-Za-z0-9]", "", text)) <= 3:
+                continue  # 그림/아이콘을 글자로 잘못 읽은 짧은 조각('AL', 'x, a'): 덮어 쓰면 그림이 망가진다
             if mode == "figure" and not re.search(r"[A-Za-z]{2,}", text):
                 continue
             x0 = min(l.x0 for l in lns)

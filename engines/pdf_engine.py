@@ -82,6 +82,7 @@ class Unit:
     leader_num: str = ""     # 점선 뒤 쪽번호가 같은 글자 상자에 있으면 보관
     bullet: bool = False     # 글머리표/번호로 시작하는 항목 (앞 문구와 합치지 않음)
     lines: list = field(default_factory=list)  # 원문 줄별 (x0, y0, x1, y1, 기준선 y, 크기) → 줄 단위로만 지운다
+    ocr_lines: list = field(default_factory=list)  # OCR: 글자 줄 상자 [(x0, y0, x1, y1)] → 줄마다 덮는다
     uls: list = field(default_factory=list)    # 밑줄: {"rect", "x0", "x1", "oy", "size", "color"} (번역 폭에 맞춰 다시 그림)
     segs: list = field(default_factory=list, repr=False)  # 원문 줄 조각 (문단 이어짐 판단용)
     tab: bool = False        # 괘선 없는 표/다단 블록에서 나온 문구 (다른 블록과 합치지 않음)
@@ -1019,6 +1020,10 @@ def block_to_unit(pno: int, b) -> Unit:
              fg=tuple(b.fg), bg=tuple(b.bg))
     if getattr(b, "busy", False):
         u.scope_keep = "사진/무늬 배경 위의 글자 → 원문 유지"
+    elif b.n_lines == 1 and u.rect.height > 1.8 * u.rect.width and len(re.sub(r"\W", "", u.text)) >= 3:
+        # 세로로 쓴 글자(좁은 표 칸의 'Model', 'Springs'): 가로 한글로 바꿔 쓰면 칸이 망가진다 → 원본 그대로
+        u.scope_keep = "세로 글자(스캔) → 원문 유지"
+    u.ocr_lines = [tuple(ln[:4]) for ln in (getattr(b, "lines", None) or []) if len(ln) >= 4]
     for ul in getattr(b, "uls", None) or []:  # 스캔 글자의 밑줄 (줄 전체) → 번역문 폭에 맞춰 다시 그림
         r = fitz.Rect(ul)
         u.uls.append({"rect": r, "x0": b.rect[0], "x1": b.rect[2], "oy": b.origin_y, "size": b.size,
@@ -1842,15 +1847,16 @@ def render_page(page, units: list[Unit], fonts, cfg: Config) -> dict:
     for u, fname, size, placed, area, color in plans:
         if not u.ocr:
             continue
-        patch = (fitz.Rect(u.rect) + (-1.2, -1.2, 1.2, 1.2)) | (area + (-0.6, -0.6, 0.6, 0.6))
-        for ul in u.uls:  # 원본 밑줄도 덮는다 (번역문 폭에 맞춰 4단계에서 다시 그림)
-            patch |= ul["rect"] + (-0.6, -0.6, 0.6, 0.6)
-        if u.cell is not None:
-            patch &= (u.cell + (1.5, 1.5, -1.5, -1.5))
-        if patch.is_empty:
-            continue
-        page.draw_rect(patch, color=None, fill=tuple(u.bg) if u.bg else (1, 1, 1), width=0, overlay=True)
-        stats["drawn"] += 1
+        # 원문 글자 줄마다 덮는다 (문구 상자 전체를 칠하면, 상자가 그림까지 넓게 잡힌 경우 그림이 지워진다)
+        src = [fitz.Rect(r) + (-1.2, -1.2, 1.2, 1.2) for r in u.ocr_lines] or [fitz.Rect(u.rect) + (-1.2, -1.2, 1.2, 1.2)]
+        patches = src + [area + (-0.6, -0.6, 0.6, 0.6)] + [ul["rect"] + (-0.6, -0.6, 0.6, 0.6) for ul in u.uls]
+        for patch in patches:  # 원본 밑줄도 덮는다 (번역문 폭에 맞춰 4단계에서 다시 그림)
+            if u.cell is not None:
+                patch &= (u.cell + (1.5, 1.5, -1.5, -1.5))
+            if patch.is_empty:
+                continue
+            page.draw_rect(patch, color=None, fill=tuple(u.bg) if u.bg else (1, 1, 1), width=0, overlay=True)
+            stats["drawn"] += 1
 
     # 4) 한글 쓰기 (한글 글꼴에 없는 기호는 대체 글꼴로) + 밑줄 다시 그리기
     insert_font(page, "OMKO", fonts["regular"])
