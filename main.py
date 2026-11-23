@@ -299,7 +299,7 @@ def output_paths(src: Path) -> tuple[Path, Path]:
 
 
 # 레이아웃 코드가 바뀌면 이 값을 올린다 → 예전에 만든 결과도 자동으로 다시 만든다
-LAYOUT_VERSION = "2026-11-18c"
+LAYOUT_VERSION = "2026-11-23a"
 STAMP_FILE = ".om_stamps.json"
 _sha_memo: dict = {}
 
@@ -415,7 +415,8 @@ def process_pdf(src: Path, cfg: Config, backend, gloss: Glossary, protector: Pro
     chars = sum(len(t) for t in pending)
     print(f"  페이지 {n_pages} ({describe_classes(classes)}) | 원문유지 페이지 {n_scope} | 텍스트블록 {len(units)}"
           f" | 번역메모리 재사용 {from_tm} | API 번역 {len(pending)}문구 ({chars:,}자)")
-    res = translate_texts(pending, backend, gloss, cache, cfg, label=src.stem[:20]) if pending else {}
+    res = translate_texts(pending, backend, gloss, cache, cfg, label=src.stem[:20],
+                          context=doc_context(doc, src)) if pending else {}
 
     for u in all_units:
         if u.status == "PENDING":
@@ -753,6 +754,32 @@ class Runner:
         for m, (pin, pout) in MODEL_PRICES.items():  # 시스템 프롬프트는 캐시되므로 입력 비용은 이보다 적게 나온다
             print(f"  {m:<20} 예상 비용 약 ${(in_tok * pin + out_tok * pout) / 1e6:,.2f}"
                   + ("  ← 현재 선택" if m == self.cfg.model else ""))
+
+
+def doc_context(doc, src: Path) -> str:
+    """번역 요청에 붙일 문서 설명: 파일 이름 + PDF 제목 + 첫 쪽의 가장 큰 글자(표지 제목). 짧은 표 머리글·범례의
+    뜻(예: 'Standard', 'Seat', 'Max')을 문서 종류에 맞게 고르도록 돕는다. 실패하면 파일 이름만."""
+    parts = [src.stem]
+    try:
+        title = (doc.metadata or {}).get("title") or ""
+        if title and title.lower() not in src.stem.lower():
+            parts.append(title)
+        best = []
+        for pno in range(min(2, len(doc))):
+            for b in doc[pno].get_text("dict")["blocks"]:
+                for ln in b.get("lines", []) if b.get("type") == 0 else []:
+                    t = "".join(s["text"] for s in ln["spans"]).strip()
+                    sz = max((s["size"] for s in ln["spans"]), default=0)
+                    if len(re.findall(r"[A-Za-z]{3,}", t)) >= 1 and len(t) >= 4:
+                        best.append((sz, t))
+        best.sort(key=lambda x: -x[0])
+        for _, t in best[:3]:
+            if t not in parts:
+                parts.append(t)
+    except Exception:  # noqa: BLE001
+        pass
+    ctx = " | ".join(parts)
+    return re.sub(r"[<>]", " ", ctx)[:200]
 
 
 def open_folder(p: Path):

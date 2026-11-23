@@ -65,7 +65,10 @@ Never → 절대로 하지 마십시오.
 8. Items are titles, headings, paragraphs, bullets, steps, table headers / cells, figure captions or labels. Keep \
 short items short (headings, table headers, labels and captions as noun phrases). Keep Korean as concise as the \
 English so it fits the same space. No omissions, no added explanations, no paraphrasing beyond what Korean \
-grammar needs, do not change the order of information. Do not merge or split items.
+grammar needs, do not change the order of information. Do not merge or split items. Items are listed in \
+reading order, so neighbouring items give context. The <document> line names the source manual: use it only to \
+choose the right technical meaning of short or ambiguous items (table headers, chart legends, labels); never \
+translate or output it.
 9. Some items come from OCR of scanned pages and may contain recognition errors ("rn"<->"m", "0"<->"O", \
 "l"<->"1", broken hyphenation). Silently infer the intended English and translate that. Never "fix" tokens.
 10. {tone}
@@ -89,7 +92,7 @@ class MockBackend:
     name = "mock"
     in_tokens = out_tokens = 0
 
-    def translate(self, items, glossary_entries, tone):
+    def translate(self, items, glossary_entries, tone, context=""):
         return {i: "[번역] " + t for i, t in items}
 
 
@@ -208,13 +211,14 @@ class AnthropicBackend:
                 return True
         return False
 
-    def translate(self, items, glossary_entries, tone):
+    def translate(self, items, glossary_entries, tone, context=""):
         import anthropic
         gl = "\n".join(
             f"{en} => {ko}" + (f"   ({note})" if note else "") for en, ko, note in glossary_entries
         ) or "(none)"
         payload = json.dumps([{"id": i, "text": t} for i, t in items], ensure_ascii=False)
-        user = f"<glossary>\n{gl}\n</glossary>\n<items>\n{payload}\n</items>\nReturn the JSON only."
+        doc = f"<document>{context}</document>\n" if context else ""
+        user = f"{doc}<glossary>\n{gl}\n</glossary>\n<items>\n{payload}\n</items>\nReturn the JSON only."
         system = SYSTEM_PROMPT.format(tone=TONES[tone])
         last: Optional[Exception] = None
         for attempt in range(5):
@@ -358,8 +362,8 @@ def make_chunks(texts: list[str], cfg: Config) -> list[list[str]]:
 
 
 def translate_texts(texts: list[str], backend, gloss: Glossary, cache: Cache, cfg: Config,
-                    label: str = "") -> dict[str, Optional[str]]:
-    """ptxt(토큰화된 원문) → 한글(토큰 포함). 실패 시 None."""
+                    label: str = "", context: str = "") -> dict[str, Optional[str]]:
+    """ptxt(토큰화된 원문) → 한글(토큰 포함). 실패 시 None. context: 문서 제목(짧은 문구의 뜻 고르기용)"""
     results: dict[str, Optional[str]] = {}
     missing = []
     for t in texts:
@@ -376,7 +380,7 @@ def translate_texts(texts: list[str], backend, gloss: Glossary, cache: Cache, cf
     def ask(items: list) -> dict:
         """묶음 번역. 응답 잘림/거절/형식 오류면 반으로 나눠 다시 (한 문구까지). FatalAPIError 는 그대로 올린다."""
         try:
-            return backend.translate(items, gloss.find("\n".join(t for _, t in items)), cfg.tone)
+            return backend.translate(items, gloss.find("\n".join(t for _, t in items)), cfg.tone, context=context)
         except ChunkError as e:
             if len(items) == 1:
                 print(f"  ! 번역 실패(원문 유지): {e} | {items[0][1][:40]}", file=sys.stderr)
@@ -397,8 +401,12 @@ def translate_texts(texts: list[str], backend, gloss: Glossary, cache: Cache, cf
                 out[t] = ko
             else:
                 retry.append((i, t))
-        for i, t in retry:  # 빠졌거나 보호 토큰이 틀린 문구: 하나씩 1회 재시도
-            ko = ask([("0", t)]).get("0")
+        for i, t in retry:  # 빠졌거나 보호 토큰이 틀린 문구: 하나씩 최대 2회 재시도
+            ko = None
+            for _ in range(2):  # 쪽마다 반복되는 머리글 같은 문구는 한 번 실패하면 수십 곳이 영어로 남는다
+                ko = ask([("0", t)]).get("0")
+                if ko and tokens_ok(t, ko):
+                    break
             out[t] = ko if (ko and tokens_ok(t, ko)) else None
         for t, ko in out.items():
             if ko:

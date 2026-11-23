@@ -189,6 +189,12 @@ SYMBOL_PUA = {0xF0B1: "±", 0xF0B0: "°", 0xF0B4: "×", 0xF0B7: "•", 0xF0A3: "
               0xF057: "Ω", 0xF044: "Δ", 0xF061: "α", 0xF062: "β", 0xF064: "δ", 0xF070: "π", 0xF071: "θ",
               0xF06C: "λ", 0xF068: "η", 0xF072: "ρ", 0xF073: "σ", 0xF0C6: "∅", 0xF0A5: "∞", 0xF0D6: "√",
               0xF02D: "−", 0xF0BC: "…", 0xF0A0: " ", 0xF020: " "}
+# 기호 글꼴이 ASCII 코드로 기호를 찍은 경우 (글자층에는 영문자로 나온다)
+ZAPF_ASCII = {"l": "●", "m": "❍", "n": "■", "o": "❏", "p": "❐", "q": "❑", "r": "❒", "s": "▲", "t": "▼",
+              "u": "◆", "v": "❖", "w": "◗", "3": "✓", "4": "✔", "5": "✕", "6": "✖", "7": "✗", "8": "✘",
+              "H": "★", "I": "✩", "Q": "✱", "a": "✁", "F": "✦", "G": "✧", "+": "☛", "*": "☛", "%": "✆"}
+SYMBOL_ASCII = {**dict(zip("abgdezhqiklmnxprstufcywjJDFGLPQSWXY",
+                            "αβγδεζηθικλμνξπρστυφχψωϕϑΔΦΓΛΠΘΣΩΞΨ")), "o": "ο", "A": "Α", "B": "Β", "E": "Ε"}
 WINGDINGS_PUA = {0xF0A7: "▪", 0xF06E: "■", 0xF0FC: "✓", 0xF0D8: "➢", 0xF09F: "•", 0xF0B7: "•", 0xF06C: "●",
                  0xF071: "❑", 0xF0A8: "◻", 0xF0E0: "→", 0xF076: "❖"}
 
@@ -201,17 +207,33 @@ def _is_icon_char(c: str) -> bool:
     return 0xE000 <= o <= 0xF8FF and o not in SYMBOL_PUA and o not in WINGDINGS_PUA
 
 
+WIDE_SPACE_RE = re.compile(r"(?<=\S) {3,}(?=\S)")
+
+
 def split_icon_spans(page, d: dict) -> None:
-    """제작사 글꼴 전용 아이콘(사용자 정의 영역 글자, 예: '→ [문서 아이콘] 8' 쪽 참조)이 든 글자 조각을
+    """(1) 제작사 글꼴 전용 아이콘(사용자 정의 영역 글자, 예: '→ [문서 아이콘] 8' 쪽 참조)이 든 글자 조각을
     아이콘 앞/아이콘(+쪽번호)/뒤로 나눈다. 아이콘 조각은 수식처럼 원본 그대로 두고 나머지만 번역한다.
-    (한글 글꼴에는 이 글자가 없어서, 나누지 않으면 문구 전체를 영어로 남기게 된다)"""
+    (한글 글꼴에는 이 글자가 없어서, 나누지 않으면 문구 전체를 영어로 남기게 된다)
+    (2) 한 조각 안에 공백을 여러 칸 넣어 자리를 비워 두고 그 자리에 다른 글자(세로 분수 1/10, 기호)를
+    따로 찍은 경우: 넓은 공백에서 조각을 나눈다. 나누지 않으면 줄 전체를 지울 때 그 자리의 글자까지 지워지고
+    번역문이 그 위를 덮는다 (예: 'e. g.  ¹⁄₁₀  specifies the quarter')."""
     blocks = [b for b in d.get("blocks", []) if b.get("type") == 0]
-    if not any(_is_icon_char(c) for b in blocks for ln in b["lines"] for sp in ln["spans"] for c in sp["text"]):
+    for b in blocks:  # 본문 글꼴의 사용자 정의 영역 하이픈(U+E02D)은 아이콘이 아니다 → '-' (글자 수 그대로)
+        for ln in b["lines"]:
+            for sp in ln["spans"]:
+                fl = (sp.get("font") or "").lower()
+                if "\ue02d" in sp["text"] and not any(k in fl for k in ("symbol", "ding", "wing", "icon")):
+                    # 줄 끝에서만 보이는 '선택 하이픈': 줄 끝이면 '-', 줄 중간(뒤에 공백)이면 공백 (원본에도 안 보임)
+                    sp["text"] = re.sub("\ue02d(?=\\s*$)", "\u00ad", sp["text"]).replace("\ue02d", " ")
+    has_icon = any(_is_icon_char(c) for b in blocks for ln in b["lines"] for sp in ln["spans"] for c in sp["text"])
+    has_gap = any(WIDE_SPACE_RE.search(sp["text"]) for b in blocks for ln in b["lines"] for sp in ln["spans"])
+    if not (has_icon or has_gap):
         return
     try:
         raw = page.get_text("rawdict", flags=TEXT_FLAGS)
     except Exception:  # noqa: BLE001
         return
+    all_spans = [sp for b in blocks for ln in b["lines"] for sp in ln["spans"]]
     chars: dict[tuple, list] = {}
     for b in raw.get("blocks", []):
         for ln in b.get("lines", []) if b.get("type") == 0 else []:
@@ -223,8 +245,31 @@ def split_icon_spans(page, d: dict) -> None:
             for sp in ln["spans"]:
                 t = sp["text"]
                 cs = chars.get(tuple(round(v, 1) for v in sp["bbox"]))
-                if not any(_is_icon_char(c) for c in t) or not cs or len(cs) != len(t):
+                if not cs or len(cs) != len(t):
                     new.append(sp)
+                    continue
+                if not any(_is_icon_char(c) for c in t):
+                    def gap_used(m) -> bool:
+                        """빈자리에 다른 글자가 찍혀 있거나(세로 분수 등), 열 간격처럼 아주 넓은가"""
+                        gx0, gx1 = cs[m.start() - 1]["bbox"][2], cs[m.end()]["bbox"][0]
+                        if gx1 - gx0 >= 4.0 * sp["size"]:
+                            return True
+                        if gx1 - gx0 < 1.0 * sp["size"]:
+                            return False
+                        y0, y1 = sp["bbox"][1], sp["bbox"][3]
+                        return any(o is not sp and o["text"].strip() and o["bbox"][0] < gx1 - 0.5 and o["bbox"][2] > gx0 + 0.5
+                                   and o["bbox"][1] < y1 and o["bbox"][3] > y0 for o in all_spans)
+                    cut = [m for m in WIDE_SPACE_RE.finditer(t) if gap_used(m)]
+                    if not cut:
+                        new.append(sp)
+                        continue
+                    pos = 0
+                    for m in cut + [None]:
+                        a, e = pos, (m.start() if m else len(t))
+                        if t[a:e].strip():
+                            new.append(dict(sp, text=t[a:e], bbox=(cs[a]["bbox"][0], sp["bbox"][1],
+                                                                     cs[e - 1]["bbox"][2], sp["bbox"][3])))
+                        pos = m.end() if m else len(t)
                     continue
                 pos = 0
                 parts = []
@@ -250,6 +295,11 @@ def _fix_span(s: dict) -> dict:
     (2) 앞쪽 공백(스페이스로 들여쓴 줄, '•' 뒤의 공백)만큼 시작 위치를 오른쪽으로 옮긴다
         → 번역문이 들여쓰기 없이 왼쪽으로 당겨지지 않게"""
     t = s["text"]
+    fl = (s.get("font") or "").lower().split("+")[-1]
+    if "dingbat" in fl and any(c.isascii() and not c.isspace() for c in t):
+        t = "".join(ZAPF_ASCII.get(c, c) for c in t)  # ZapfDingbats 'n' = ■, 'l' = ●, '4' = ✔
+    elif fl in ("symbol", "symbolmt", "symbol-regular") and any(c.isascii() and c.isalpha() for c in t):
+        t = "".join(SYMBOL_ASCII.get(c, c) for c in t)  # Symbol 'm' = μ, 'W' = Ω, 'j' = φ
     if any(0xF000 <= ord(c) <= 0xF0FF for c in t):
         table = WINGDINGS_PUA if "wingding" in (s.get("font") or "").lower() else SYMBOL_PUA
         t = "".join(table.get(ord(c), SYMBOL_PUA.get(ord(c), c)) for c in t)
@@ -351,11 +401,32 @@ def split_line_segments(ln: dict, vedges: Optional[list] = None, cols: Optional[
     return out
 
 
+def join_hyphenated(parts: list[str]) -> str:
+    """여러 줄을 한 문장으로 잇는다. 줄 끝 하이픈 처리:
+    - 선택 하이픈(U+00AD, 줄 끝에서만 보이는 하이픈): 지우고 붙인다  'param\xad' + 'eters' → 'parameters'
+    - 보이는 하이픈: 원래 하이픈이 있는 복합어/번호일 수 있으므로 남기고 띄어 쓰지 않는다
+      'start-' + 'up' → 'start-up', 'VP-220202-16-101-0001-' + '0474' → 'VP-220202-16-101-0001-0474'"""
+    out = ""
+    for t in parts:
+        t = t.strip()
+        if not t:
+            continue
+        if not out:
+            out = t
+        elif out.endswith("\u00ad"):
+            out = out[:-1] + t
+        elif out.endswith("-") and len(out) > 2 and out[-2] not in " -" and t[:1].isalnum():
+            out = out + t
+        else:
+            out = out + " " + t
+    return out
+
+
 def _group_to_unit(page, g: list[dict], cell=None) -> Optional[Unit]:
     rect = fitz.Rect(g[0]["bbox"])
     for ln in g[1:]:
         rect |= fitz.Rect(ln["bbox"])
-    text = clean_text(" ".join(ln["_text"] for ln in g))
+    text = clean_text(join_hyphenated([ln["_text"] for ln in g]))
     if not text:
         return None
     w = Counter()
@@ -450,11 +521,7 @@ def merge_paragraphs(units: list[Unit], hedges: Optional[list] = None) -> list[U
         if target is None:
             out.append(b)
             continue
-        t = target.text
-        if t.endswith("-") and len(t) > 2 and t[-2].isalpha() and b.text[:1].islower():
-            target.text = t[:-1] + b.text  # 줄끝 하이픈 연결
-        else:
-            target.text = t + " " + b.text
+        target.text = join_hyphenated([target.text, b.text])
         # 가운데 맞춘 두 줄 제목(표지 제목 등)은 합친 뒤에도 가운데 정렬
         ca, cb = (target.rect.x0 + target.rect.x1) / 2, (b.rect.x0 + b.rect.x1) / 2
         centered = (target.align == "center" or len(target.lines) == 1) and \
@@ -1716,6 +1783,10 @@ def render_page(page, units: list[Unit], fonts, cfg: Config) -> dict:
     #  2-2) 글자 제거: 네이티브 텍스트는 리댁션(그림/선은 보존), OCR 영역의 숨은/깨진 텍스트층도 제거
     n_redact = 0
     any_ocr = any(u.ocr for u in todo)
+    try:
+        page_words = [fitz.Rect(w[:4]) for w in page.get_text("words")] if any(not u.ocr for u in todo) else []
+    except Exception:  # noqa: BLE001
+        page_words = []
     for u in todo:
         if not u.ocr:
             # 문구 전체 상자가 아니라 '원문 줄마다, 글자가 실제로 찍힌 영역'만 지운다
@@ -1724,6 +1795,21 @@ def render_page(page, units: list[Unit], fonts, cfg: Config) -> dict:
             for ln in src_lines:
                 ink = _line_ink(ln) if (u.size and not u.rotated) else fitz.Rect(ln[:4])
                 r = fitz.Rect(ink.x0 + 0.3, ink.y0 + 0.2, ink.x1 - 0.3, max(ink.y1 - 0.2, ink.y0 + 0.6))
+                if not u.rotated and u.source != "native-ocr":  # 글자깨짐 쪽은 글자 상자를 믿을 수 없음
+                    # 줄 끝에 살짝 걸친 이웃 글자(세로 분수 '1/10', 기호)는 피한다: 폭의 절반 이상이 이 줄 밖에 있는 낱말
+                    lr = fitz.Rect(ln[:4])
+                    for wr in page_words:
+                        if not wr.intersects(r) or wr.width <= 0:
+                            continue
+                        if min(wr.y1, lr.y1) - max(wr.y0, lr.y0) < 0.5 * min(wr.height, lr.height):
+                            continue  # 위·아래 줄의 낱말이 살짝 걸친 것: 같은 줄의 이웃 글자가 아니다
+                        inside = max(0.0, min(wr.x1, lr.x1) - max(wr.x0, lr.x0))
+                        if inside >= 0.5 * wr.width:
+                            continue
+                        if (wr.x0 + wr.x1) / 2 > (r.x0 + r.x1) / 2:
+                            r.x1 = min(r.x1, wr.x0 - 0.1)
+                        else:
+                            r.x0 = max(r.x0, wr.x1 + 0.1)
                 if r.is_empty:
                     continue
                 page.add_redact_annot(r, fill=(1, 1, 1) if cfg.whiteout else False)
@@ -1733,6 +1819,24 @@ def render_page(page, units: list[Unit], fonts, cfg: Config) -> dict:
             n_redact += 1
     if n_redact:
         apply_redactions(page, cfg.whiteout and not any_ocr)
+        # 확인: 잉크 영역만 좁게 지우면, 글꼴 상자가 큰 글자(차트 라벨 등)는 MuPDF 가 '덜 덮였다'고 보고 남겨 둔다
+        # → 원문 낱말이 아직 남은 문구는 줄 상자 전체로 한 번 더 지운다 (안 그러면 영어 위에 한글이 겹쳐 찍힘)
+        again = 0
+        for u in todo:
+            if u.ocr:
+                continue
+            want = {w for w in re.findall(r"[A-Za-z]{3,}", u.text)}
+            if not want:
+                continue
+            left = {x for w in page.get_text("words", clip=u.rect + (-0.5, -0.5, 0.5, 0.5))
+                    for x in re.findall(r"[A-Za-z]{3,}", w[4])}
+            if want & left:
+                for ln in (u.lines or [(u.rect.x0, u.rect.y0, u.rect.x1, u.rect.y1, u.origin_y, u.size)]):
+                    page.add_redact_annot(fitz.Rect(ln[:4]), fill=False)
+                    again += 1
+        if again:
+            apply_redactions(page, False)
+            stats["redact_retry"] = again
 
     # 3) OCR 영역: 원본 배경색으로 영어를 덮는 패치 (표 셀이면 괘선을 침범하지 않게 셀 안쪽으로 제한)
     for u, fname, size, placed, area, color in plans:

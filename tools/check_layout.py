@@ -7,7 +7,8 @@ check_layout.py - 원본 PDF와 번역본 PDF를 페이지별로 자동 대조 (
 
 페이지마다 아래를 검사해 이상이 있는 페이지만 출력합니다.
   - 페이지 크기                     : 원본과 다르면 표시
-  - 그림/선(표 괘선, 도면, 로고)    : 글자를 뺀 화면을 서로 비교 (밑줄을 다시 그린 쪽은 조금 달라질 수 있음)
+  - 그림/선(표 괘선, 도면, 로고)    : 글자를 뺀 화면을 서로 비교. 글자 줄 주변(밑줄을 다시 그린 자리)과
+                                      스캔 쪽의 덧씌운 패치 자리는 빼고, 그 밖에서 그림이 바뀐 곳만 표시
   - 주석(Markup·스탬프)/링크 개수   : 원본과 다르면 표시
   - 깨진 글자                       : 번역본에만 있는 � / 사용자 정의 영역 글자
   - 글자 겹침                       : 원본보다 겹친 줄이 늘었으면 표시
@@ -24,6 +25,33 @@ try:
     import pymupdf as fitz
 except ImportError:  # pragma: no cover
     import fitz  # type: ignore
+
+
+def _text_mask(pa, pb, dpi: int = 60) -> set:
+    """비교에서 뺄 화소: 원본/번역본 글자 줄 주변(밑줄 포함)과, 번역본에 새로 생긴 채움 도형(스캔 쪽 패치, 다시 그린 밑줄)."""
+    k = dpi / 72.0
+    rects = []
+    for page in (pa, pb):
+        for bl in page.get_text("dict")["blocks"]:
+            for ln in bl.get("lines", []) if bl.get("type") == 0 else []:
+                x0, y0, x1, y1 = ln["bbox"]
+                h = max(1.0, y1 - y0)
+                rects.append((x0 - 1.5, y0 - 0.2 * h, x1 + 1.5, y1 + 0.5 * h))
+    try:
+        old = {tuple(round(v) for v in d["rect"]) for d in pa.get_drawings()}
+        for d in pb.get_drawings():
+            r = d["rect"]
+            if d.get("fill") is not None and tuple(round(v) for v in r) not in old:
+                rects.append((r.x0 - 1.5, r.y0 - 1.5, r.x1 + 1.5, r.y1 + 1.5))
+    except Exception:  # noqa: BLE001
+        pass
+    W, H = int(pa.rect.width * k) + 2, int(pa.rect.height * k) + 2
+    out = set()
+    for x0, y0, x1, y1 in rects:
+        for yy in range(max(0, int(y0 * k)), min(H, int(y1 * k) + 1)):
+            for xx in range(max(0, int(x0 * k)), min(W, int(x1 * k) + 1)):
+                out.add(yy * 100000 + xx)
+    return out
 
 
 def _no_text_pixels(doc, pno: int, dpi: int = 60) -> bytes:
@@ -79,9 +107,13 @@ def compare(src: str, dst: str, png_dir: str = "") -> int:
         try:
             (xa, w, h), (xb, w2, h2) = _no_text_pixels(a, i), _no_text_pixels(b, i)
             if (w, h) == (w2, h2):
-                diff = sum(1 for p, q in zip(xa, xb) if abs(p - q) > 60)
-                if diff > 15:
-                    msg.append(f"그림/선 차이 {diff}px (밑줄 제목이 있는 쪽은 밑줄을 다시 그려서 생기는 정상 차이)")
+                idx = [n for n, (p, q) in enumerate(zip(xa, xb)) if abs(p - q) > 60]
+                if len(idx) > 15:
+                    mask = _text_mask(pa, pb)
+                    out = [n for n in idx if (n // w) * 100000 + (n % w) not in mask]
+                    if len(out) > 15:
+                        ys = sorted({int((n // w) * 72 / 60) for n in out})
+                        msg.append(f"그림/선 차이 {len(out)}px (글자 주변 제외, y≈{ys[0]}~{ys[-1]}pt)")
         except Exception as e:  # noqa: BLE001
             msg.append(f"그림 비교 실패({type(e).__name__})")
         ka = sorted(x.type[1] for x in (pa.annots() or []))
