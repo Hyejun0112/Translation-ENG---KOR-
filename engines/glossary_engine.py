@@ -40,7 +40,10 @@ _UNIT_RX = (
 
 DEFAULT_KEEP_PATTERNS = [
     r"⟦I\d+⟧",  # 문장 속 아이콘 자리 (번역문과 함께 옮겨 다시 그림)
-    r"https?://\S+",
+    # 웹 주소: 대문자 'HTTP://www.sambo21.com', 'www.emerson.com', 'fisher.com/support' 도 (번역하면 주소가 망가짐)
+    r"(?i:https?://)\S+",
+    r"(?<![\w@.])(?i:www)\.[\w-]+(?:\.[\w-]+)+(?:/[^\s)\]]*)?",
+    r"(?<![\w@.-])[A-Za-z0-9][\w-]*(?:\.[\w-]+)*\.(?:com|net|org|co\.kr|or\.kr|kr|de|jp|cn|io|eu|co\.uk|fr|nl|ch)(?!\w|\.\w)(?:/[^\s)\]]*)?",
     # 파일 이름(mda4201.pdf, BK212_manual.docx)과 밑줄로 이은 식별자(bk212_steamtrap_manual): 번역하면 찾을 수 없게 된다
     r"(?<![\w.])[\w\-.]+\.(?:pdf|PDF|docx?|xlsx?|dwg|dxf|zip|txt|csv|xml|stp|step|igs|eds|EDS|gsd|GSD|gsdml|csp|cfg|ini|hex|bin|exe|msi|jpg|png|tif)(?![\w])",
     r"(?<![\w-])[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*(?:_[A-Za-z0-9]+)+(?:-[A-Za-z0-9_]+)*(?![\w])",

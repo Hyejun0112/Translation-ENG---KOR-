@@ -40,7 +40,7 @@ def norm(s: str) -> str:
 
 # 숫자 + 영어 낱말 꼬리('10-mm', '4-pole', '3-core', '7th', '1/6th', '10mm'): 한국어로는 '10mm', '4극', '3심',
 # '7번째' 처럼 꼬리가 바뀌거나 띄어 쓰이는 것이 정상 → 숫자 부분만 비교 (Tag·모델명처럼 영문이 앞에 오는 것은 그대로)
-NUM_TAIL_RE = re.compile(r"^(\d[\d.,/]*)-?[a-z]{1,8}$")
+NUM_TAIL_RE = re.compile(r"^(\d[\d.,/]*)-?[a-z]{1,12}$")
 
 
 def ids(text: str) -> Counter:
@@ -104,6 +104,9 @@ def main(argv: list[str]) -> int:
                         continue
                     if re.search(r"[가-힣]", t) or re.search(r"https?://|www\.|@", t):
                         continue
+                    if re.search(r"\s[x×*/+=−-]\s", t) and len(re.findall(r"\b[a-z]{3,}\b", t)) <= 4 \
+                            and not re.search(r"\b(?:the|and|of|to|is|are|with|for)\b", t):
+                        continue  # 수식('6 x rpm + gpm x psi'): 원본 그대로 두는 것이 정상
                     if len(re.findall(r"\b[a-z]{3,}\b", t)) >= 3:
                         left.append(t[:60])
             if left:
