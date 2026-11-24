@@ -915,6 +915,36 @@ def mark_centered_lines(units: list[Unit], vedges: list, page_rect) -> None:
         u.align = "center"
 
 
+def _on_own_line(wr, own: list) -> bool:
+    """낱말이 이 문구의 어느 줄에 속하는가 (세로로 절반 이상 겹침)"""
+    return any(min(wr.y1, o.y1) - max(wr.y0, o.y0) >= 0.5 * min(wr.height, o.height) for o in own if wr.height > 0)
+
+
+def _spare_rows(r, lr, own: list, page_words: list) -> tuple[float, float]:
+    """지우기 상자 r 에 걸친 위·아래 행의 다른 글자(분수의 분모 '63,000', 머리글 아래 문서번호, 촘촘한 줄의 이웃 줄)를
+    피하는 세로 한계 (top, bot). 같은 행의 글자는 좌우로 피하므로 여기서 보지 않고, 이 문구의 다른 줄 글자는
+    어차피 지우므로 제외. 상자가 원래 높이의 45% 미만으로 줄어들면 그 글자는 피하지 않는다 (원문이 남는 편이 더 위험)."""
+    top, bot = -1e9, 1e9
+    h0 = r.height
+    for wr in page_words:
+        if not wr.intersects(r) or wr.height <= 0:
+            continue
+        if min(wr.y1, lr.y1) - max(wr.y0, lr.y0) >= 0.5 * min(wr.height, lr.height):
+            continue  # 같은 행의 글자
+        if any(min(wr.y1, o.y1) - max(wr.y0, o.y0) >= 0.5 * min(wr.height, o.height)
+               and min(wr.x1, o.x1) - max(wr.x0, o.x0) > 0.5 * wr.width for o in own):
+            continue  # 이 문구의 다른 줄 글자
+        if (wr.y0 + wr.y1) / 2 > (r.y0 + r.y1) / 2:
+            nb = min(bot, wr.y0 + 0.5)
+            if nb - max(r.y0, top) >= 0.45 * h0:
+                bot = nb
+        else:
+            nt = max(top, wr.y1 - 0.5)
+            if min(r.y1, bot) - nt >= 0.45 * h0:
+                top = nt
+    return top, bot
+
+
 def mark_right_aligned_lines(units: list[Unit], page_rect) -> None:
     """오른쪽에 붙여 쓴 머리글('Quick Start Guide' 위 / 'D103556X012' 아래처럼 오른쪽 끝이 같은 두 줄)의 한 줄짜리 글은
     오른쪽 정렬로 표시한다 → 번역문이 짧아져도 오른쪽 끝이 원본처럼 맞는다 (왼쪽에서 시작하면 머리글이 가운데로 떠 보임).
@@ -2354,26 +2384,7 @@ def _render_page(page, units: list[Unit], fonts, cfg: Config) -> dict:
                 r = fitz.Rect(ink.x0 + 0.3, ink.y0 + 0.2, ink.x1 - 0.3, max(ink.y1 - 0.2, ink.y0 + 0.6))
                 top, bot = -1e9, 1e9
                 if not u.rotated and u.source != "native-ocr":
-                    # 위·아래 행의 다른 글자가 이 줄의 지우기 상자에 걸치면(분수의 분모 '63,000', 첨자 줄, 표의 다음 행)
-                    # 그 글자 쪽으로 상자를 줄여 함께 지워지지 않게 한다. 이 문구의 다른 줄에 속한 글자는 어차피 지우므로 제외.
-                    h0 = r.height
-                    for wr in page_words:
-                        if not wr.intersects(r) or wr.height <= 0:
-                            continue
-                        lr = fitz.Rect(ln[:4])
-                        if min(wr.y1, lr.y1) - max(wr.y0, lr.y0) >= 0.5 * min(wr.height, lr.height):
-                            continue  # 같은 행의 글자 (아래에서 좌우로 피한다)
-                        if any(min(wr.y1, o.y1) - max(wr.y0, o.y0) >= 0.5 * min(wr.height, o.height)
-                               and min(wr.x1, o.x1) - max(wr.x0, o.x0) > 0.5 * wr.width for o in own):
-                            continue  # 이 문구의 다른 줄 글자
-                        if (wr.y0 + wr.y1) / 2 > (r.y0 + r.y1) / 2:
-                            nb = min(bot, wr.y0 + 0.5)
-                            if nb - max(r.y0, top) >= 0.45 * h0:
-                                bot = nb
-                        else:
-                            nt = max(top, wr.y1 - 0.5)
-                            if min(r.y1, bot) - nt >= 0.45 * h0:
-                                top = nt
+                    top, bot = _spare_rows(r, fitz.Rect(ln[:4]), own, page_words)
                     r.y0, r.y1 = max(r.y0, top), min(r.y1, bot)
                 vc.append((top, bot))
                 if not u.rotated and u.source != "native-ocr":  # 글자깨짐 쪽은 글자 상자를 믿을 수 없음
@@ -2409,14 +2420,22 @@ def _render_page(page, units: list[Unit], fonts, cfg: Config) -> dict:
             want = {w for w in re.findall(r"[A-Za-z]{3,}", u.text)}
             if not want:
                 continue
+            src_lines = u.lines or [(u.rect.x0, u.rect.y0, u.rect.x1, u.rect.y1, u.origin_y, u.size)]
+            own = [fitz.Rect(l[:4]) for l in src_lines]
+            # 이 문구의 줄 위에 있는 낱말만 본다: 상자가 겹친 이웃 줄('DVC6200: +/- 1%')의 낱말을
+            # '덜 지워진 원문'으로 잘못 보고 줄 상자 전체를 지우면 이웃 줄이 사라진다
             left = {x for w in page.get_text("words", clip=u.rect + (-0.5, -0.5, 0.5, 0.5))
+                    if _on_own_line(fitz.Rect(w[:4]), own)
                     for x in re.findall(r"[A-Za-z]{3,}", w[4])}
             if want & left:
                 vc = vclips.get(id(u), [])
-                for k, ln in enumerate(u.lines or [(u.rect.x0, u.rect.y0, u.rect.x1, u.rect.y1, u.origin_y, u.size)]):
+                for k, ln in enumerate(src_lines):
                     r = fitz.Rect(ln[:4])
                     if k < len(vc):  # 1차 때 피한 위·아래 행 글자는 2차에도 피한다
                         r.y0, r.y1 = max(r.y0, vc[k][0]), min(r.y1, vc[k][1])
+                    if not u.rotated and u.source != "native-ocr":  # 줄 상자 전체로 넓혔으니 다시 확인
+                        t2, b2 = _spare_rows(r, fitz.Rect(ln[:4]), own, page_words)
+                        r.y0, r.y1 = max(r.y0, t2), min(r.y1, b2)
                     if r.is_empty:
                         continue
                     page.add_redact_annot(r, fill=False)
