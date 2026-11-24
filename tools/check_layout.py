@@ -71,7 +71,7 @@ def _lines(page) -> list:
         if bl["type"]:
             continue
         for ln in bl["lines"]:
-            t = "".join(s["text"] for s in ln["spans"]).strip()
+            t = re.sub(r"[\x00-\x1f]", "", "".join(s["text"] for s in ln["spans"])).strip()  # 보이지 않는 제어 문자 제외
             if not t or abs(ln["dir"][0]) < 0.99:
                 continue
             sz = max(s["size"] for s in ln["spans"])

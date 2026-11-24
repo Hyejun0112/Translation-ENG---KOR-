@@ -10,6 +10,7 @@ check_layout.py 가 모양(그림/선/겹침)을 본다면, 이 도구는 글 �
   2) 조사가 '을(를)', '은(는)' 처럼 병기된 채 남은 곳 (보정되지 않은 번역)
   3) OCR 이 잘못 읽은 것으로 보이는 식별자 (예: 1Q3, PUBOO2-137, IO0 …)
   4) 번역은 되었는데 영어 낱말이 많이 남은 쪽
+  5) 번역된 쪽(한글이 있는 쪽)에 영어 문장 줄이 그대로 남은 곳 (번역 누락 후보: 쪽마다 최대 3줄 표시)
 번역본이 일부 쪽만 번역한 것이면(--pages 로 번역) 같은 범위를 --pages 로 지정하세요.
 원본이 스캔 PDF 라서 글자층이 없는 쪽은 1)·4) 를 건너뜁니다.
 """
@@ -83,6 +84,20 @@ def main(argv: list[str]) -> int:
             left = len(re.findall(r"[A-Za-z]{4,}", tk))
             if en_words > 40 and 0.5 * en_words < left < 0.9 * en_words and re.search(r"[가-힣]", tk):
                 msgs.append(f"번역은 되었으나 영어 낱말이 많이 남음 ({left}/{en_words})")
+        if re.search(r"[가-힣]", tk):  # 번역된 쪽: 영어 문장으로 남은 줄 (URL·메일·제품명/번호 줄 제외)
+            left = []
+            ann = [a.rect for a in (kr[k].annots() or [])]  # 메모/스탬프 주석 안의 글자는 번역 대상이 아님
+            for bl in kr[k].get_text("dict")["blocks"]:
+                for ln in bl.get("lines", []):
+                    t = "".join(sp["text"] for sp in ln["spans"]).strip()
+                    if any(fitz.Rect(ln["bbox"]).intersects(r) for r in ann):
+                        continue
+                    if re.search(r"[가-힣]", t) or re.search(r"https?://|www\.|@", t):
+                        continue
+                    if len(re.findall(r"\b[a-z]{3,}\b", t)) >= 3:
+                        left.append(t[:60])
+            if left:
+                msgs.append(f"영어 문장 줄 {len(left)}개 남음(번역 누락 확인): " + " / ".join(left[:3]))
         for m in PARTICLE_RE.finditer(tk):
             msgs.append("조사 병기 형태 남음: " + m.group(0))
             break

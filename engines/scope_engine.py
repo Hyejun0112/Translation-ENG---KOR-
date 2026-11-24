@@ -149,7 +149,7 @@ def smooth_scopes(pages: list[int], scopes: dict, units_by_page: dict) -> None:
         (oa, wa), (ob, wb) = before.get(p - 1, (True, "")), before.get(p + 1, (True, ""))
         if oa or ob or not (wa.startswith(KEPT_TITLE_REASONS) and wb.startswith(KEPT_TITLE_REASONS)):
             continue
-        us = units_by_page.get(p, [])
+        us = [u for u in units_by_page.get(p, []) if not (u.scope_keep or "").startswith("글머리 기호")]
         if not us or is_prose_page(us) or is_toc_page(us):
             continue
         scopes[p] = (False, "앞뒤 쪽이 모두 원문 유지(데이터시트/도면) → 같은 문서의 쪽으로 보고 원문 유지")
@@ -157,6 +157,8 @@ def smooth_scopes(pages: list[int], scopes: dict, units_by_page: dict) -> None:
 
 def page_scope(page, units: list[Unit], drawings_count: int) -> tuple[bool, str]:
     """(번역 여부, 사유)"""
+    # 떼어 낸 글머리 기호/번호(원문 유지 문구로만 남긴 것)는 쪽 판단에 넣지 않는다 (짧은 라벨로 세면 도면으로 오판)
+    units = [u for u in units if not (u.scope_keep or "").startswith("글머리 기호")]
     area = abs(page.rect)
     if area > A4_AREA * 1.6:
         return False, "대형 페이지(A3 이상) → 도면으로 판단"
@@ -174,6 +176,8 @@ def page_scope(page, units: list[Unit], drawings_count: int) -> tuple[bool, str]
     if units and not is_prose_page(units):
         # 양식형 데이터시트: 글이 거의 다 표 칸 안에 있고, 제목 칸(페이지 아래 표제란 포함)에 제외 키워드가 있음
         in_cells = sum(1 for u in units if u.cell is not None)
+        # 표 밖에 설명 문장(8낱말 이상)이 있으면 매뉴얼 쪽의 작은 사양표다 ('Technical data' 표 + Note 문단) → 번역
+        prose_out = any(u.cell is None and len(re.findall(r"[A-Za-z]{2,}", u.text)) >= 8 for u in units)
         if len(units) >= 30 and in_cells >= 0.7 * len(units):
             sizes = sorted(u.size for u in units if u.size)
             med = sizes[len(sizes) // 2] if sizes else 10
@@ -183,6 +187,11 @@ def page_scope(page, units: list[Unit], drawings_count: int) -> tuple[bool, str]
                     # 표제처럼 보이는 글만 (대문자/굵게/큰 글자). 표의 한 행 이름('Wiring Diagram | 도면번호')은 제외
                     caps = bool(m) and m.group(0).isupper()  # 'INSTRUMENT SPECIFICATION' (뒤에 부제가 붙어도 인정)
                     if m and (caps or u.bold or u.size >= med * 1.12) and len(m.group(0)) >= 0.35 * len(u.text.strip()):
+                        # 매뉴얼 쪽 안의 작은 사양표('Technical data' 표 + 설명 Note 문단)는 번역한다.
+                        # 인증서·부품 목록·데이터시트 양식은 설명문이 있어도 원문 유지
+                        if prose_out and re.fullmatch(r"(?i)technical\s+data|specifications?|technical\s+specifications?",
+                                                      m.group(0).strip()):
+                            continue
                         return False, f"데이터시트/양식 페이지 (표제 '{m.group(0)}')"
         # 표제가 글자로 남아 있지 않은 양식(제목이 그림/윤곽선): 표 칸 안의 항목 이름이 거의 다 대문자 낱말이면
         # 데이터시트 양식으로 본다 (예: 전동기 DATA SHEET 의 'ENCLOSURE', 'COOLING METHOD' …)

@@ -18,6 +18,7 @@ import hashlib
 import inspect
 import json
 import os
+import math
 import re
 import sys
 import time
@@ -82,6 +83,9 @@ class Unit:
     leader_num: str = ""     # 점선 뒤 쪽번호가 같은 글자 상자에 있으면 보관
     bullet: bool = False     # 글머리표/번호로 시작하는 항목 (앞 문구와 합치지 않음)
     lines: list = field(default_factory=list)  # 원문 줄별 (x0, y0, x1, y1, 기준선 y, 크기) → 줄 단위로만 지운다
+    dirn: tuple = (1.0, 0.0)  # 글자 진행 방향 (0,-1)=위로 읽는 회전 글자, (0,1)=아래로
+    icon_map: dict = field(default_factory=dict)  # 문장 속 아이콘 표시 기호 '⟦I3⟧' → 원래 아이콘 자리(Rect)
+    obstacles: list = field(default_factory=list)  # 문단 안의 작은 아이콘(도형/그림): 번역문이 피해 가야 할 자리
     first_w: float = 0.0     # >0: 번역문 첫 줄의 최대 폭 (원문 첫 줄이 아이콘/옆 글에 막혀 짧게 끝난 문단)
     ocr_lines: list = field(default_factory=list)  # OCR: 글자 줄 상자 [(x0, y0, x1, y1)] → 줄마다 덮는다
     uls: list = field(default_factory=list)    # 밑줄: {"rect", "x0", "x1", "oy", "size", "color"} (번역 폭에 맞춰 다시 그림)
@@ -256,7 +260,7 @@ def split_icon_spans(page, d: dict) -> None:
                     new.append(sp)
                     continue
                 m = CTRL_LEAD_RE.match(t)
-                if m and m.end() < len(t):
+                if m and m.end() < len(t) and not CTRL_LEAD_RE.search(t[m.end():]) and "\x00" not in t:
                     # 앞쪽의 보이지 않는 제어 문자(번호 상자 ① 자리를 비워 두는 '\x03\x03'): 떼고 실제 첫 글자 위치에서 시작
                     k = m.end()
                     sp = dict(sp, text=t[k:], bbox=(cs[k]["bbox"][0], sp["bbox"][1], sp["bbox"][2], sp["bbox"][3]))
@@ -329,7 +333,8 @@ def _fix_span(s: dict) -> dict:
 BULLET_CH_RE = re.compile(r"^[•●▪■◦○‣·►▶➢✓□❑–—\-\uf0b7\uf0a7\u2460-\u24ff\u2776-\u2793]$")
 
 
-def split_line_segments(ln: dict, vedges: Optional[list] = None, cols: Optional[list] = None) -> list[dict]:
+def split_line_segments(ln: dict, vedges: Optional[list] = None, cols: Optional[list] = None,
+                        icons: Optional[list] = None) -> list[dict]:
     """한 줄 안에서 열 간격이 크게 벌어진 텍스트(표의 셀 등)를 별도 세그먼트로 분리.
     - 세로 괘선을 사이에 둔 글자도 분리 (괘선 표인데 표 인식이 안 된 경우: 개정 이력 표 등)
     - 맨 앞이 글머리표/번호 기호만이면 기호는 원문 그대로 두고(번역 단위에서 제외),
@@ -361,15 +366,40 @@ def split_line_segments(ln: dict, vedges: Optional[list] = None, cols: Optional[
             n_real = sum(1 for x in cur if x["text"].strip())
             bullet = not segs and n_real == 1 and bool(BULLET_CH_RE.match(last["text"].strip()))
             col = gap > 0.3 * size and sum(1 for c in (cols or []) if abs(nx - c) < 0.6) >= 2
-            hard = wall or bullet or col or (gap > max(6.0, 0.8 * size) and not justified)
+            # 문장 중간의 아이콘(키 모양·소프트키 그림)이 사이에 있으면 열이 아니라 한 문장: 나누지 않는다
+            # (번역문은 mark_inline_icons 로 등록된 아이콘 자리를 피해 줄을 바꾼다)
+            ic = None
+            line_words = len(re.findall(r"[A-Za-z]{2,}", "".join(x["text"] for x in spans_in)))
+            if icons and line_words >= 3 and re.search(r"[A-Za-z]{2,}", last["text"]) and \
+                    re.search(r"[A-Za-z]{2,}", s["text"]):
+                ic = _icon_in_gap(icons, px, nx, y0, y1, size)
+            icon_gap = ic is not None
+            hard = wall or bullet or (col and not icon_gap) or (gap > max(6.0, 0.8 * size) and not justified and not icon_gap)
             if hard or math_edge:
                 segs.append(cur)
                 cur = []
                 if not hard:
                     s = dict(s, _soft=True)  # 수식 경계로만 나뉨 (문장 중간 수식이면 다시 붙임)
+            elif icon_gap and ic["vec"]:  # 문장 중간 도형 아이콘 → 표시 기호
+                cur.append(dict(s, text=f" ⟦I{ic['id']}⟧ ", bbox=tuple(ic["r"]), _icon_id=ic["id"],
+                                _icon_rect=tuple(ic["r"])))
         cur.append(s)
         last = s
     if cur:
+        # 줄 끝 바로 뒤의 도형 아이콘('Use [아이콘] or [아이콘]' 의 두 번째): 표시 기호로 붙여 함께 옮긴다
+        lastr = [x for x in cur if x["text"].strip()]
+        tail = re.findall(r"[A-Za-z]+", lastr[-1]["text"])[-1:] if lastr else []
+        if icons and tail and tail[0].lower() in ICON_LEAD_WORDS and \
+                len(re.findall(r"[A-Za-z]{2,}", "".join(x["text"] for x in cur))) >= 3:
+            sz = max(lastr[-1]["size"], 1.0)
+            ex = lastr[-1]["bbox"][2]
+            for ic in icons:
+                r = ic["r"]
+                if ic["vec"] and not ic.get("has_text") and 0 <= r.x0 - ex <= 1.5 * sz and r.width <= 2.5 * sz and \
+                        y0 - 0.2 * sz <= (r.y0 + r.y1) / 2 <= y1 + 0.2 * sz:
+                    cur.append(dict(lastr[-1], text=f" ⟦I{ic['id']}⟧", bbox=tuple(r), _icon_id=ic["id"],
+                                    _icon_rect=tuple(r)))
+                    break
         segs.append(cur)
     for sg in segs:  # 끝에 붙은 공백 조각 제거
         while sg and not sg[-1]["text"].strip():
@@ -482,10 +512,13 @@ def _group_to_unit(page, g: list[dict], cell=None) -> Optional[Unit]:
     uls = [ul for ln in g for ul in ln.get("_uls", [])]
     return Unit(page=page.number, idx=0, rect=rect, text=text, size=size, color=color,
                 bold=bold, origin_y=first["origin"][1], align=align, rotated=rotated,
+                dirn=tuple(round(v, 3) for v in g[0].get("dir", (1.0, 0.0))),
                 cell=fitz.Rect(cell) if cell is not None else None, last_x1=g[-1]["bbox"][2],
                 bullet=bool(g[0].get("_marker") or BULLET_RE.match(text)),
                 lines=lines, uls=uls, segs=list(g), symbol=symbol,
-                hang=_hang_of(g, text, cell))
+                hang=_hang_of(g, text, cell),
+                icon_map={f"⟦I{sp['_icon_id']}⟧": fitz.Rect(sp["_icon_rect"]) for ln in g for sp in ln["spans"]
+                          if sp.get("_icon_id") and f"⟦I{sp['_icon_id']}⟧" in text})
 
 
 def _hang_of(g: list[dict], text: str, cell) -> float:
@@ -493,8 +526,9 @@ def _hang_of(g: list[dict], text: str, cell) -> float:
     if len(g) < 2 or cell is not None:
         return 0.0
     d = g[1]["bbox"][0] - g[0]["bbox"][0]
-    if 2.0 < d < 60.0 and BULLET_RE.match(text):
-        return d
+    rest_same = all(abs(x["bbox"][0] - g[1]["bbox"][0]) < 1.5 for x in g[1:])
+    if 2.0 < d < 60.0 and (BULLET_RE.match(text) or rest_same):
+        return d  # 내어쓰기: 둘째 줄부터 같은 만큼 안쪽 (글머리표 항목, 부품 목록의 둘째 줄)
     rest_aligned = len(g) < 3 or abs(g[2]["bbox"][0] - g[1]["bbox"][0]) < 2.0
     if -60.0 < d < -2.0 and rest_aligned:
         return d  # 첫 줄만 안쪽에서 시작하는 문단 (탭 들여쓰기, 단계 번호 뒤)
@@ -558,6 +592,10 @@ def merge_paragraphs(units: list[Unit], hedges: Optional[list] = None) -> list[U
         target.lines += b.lines
         target.uls += b.uls
         target.segs += b.segs
+        target.icon_map.update(b.icon_map)
+        target.obstacles += b.obstacles
+        if not centered:  # 합친 뒤 들여쓰기 다시 계산 (첫 줄만 안쪽: 글머리표 뒤 첫 줄, 탭 들여쓰기)
+            target.hang = _hang_of(target.segs, target.text, None)
     return out
 
 
@@ -654,6 +692,145 @@ def merge_justified_rows(lines: list) -> list:
         out.append(lines[i])
         i += 1
     return out
+
+
+def _icon_in_gap(icons: list, gx0: float, gx1: float, y0: float, y1: float, size: float) -> Optional[dict]:
+    for ic in icons or []:
+        if _inline_icon_in_gap(ic["r"], gx0, gx1, y0, y1, size) and not ic.get("has_text"):
+            return ic
+    return None
+
+
+def _inline_icon_in_gap(r, gx0: float, gx1: float, y0: float, y1: float, size: float) -> bool:
+    """간격(gx0~gx1)이 문장 중간 아이콘 자리인가: 아이콘이 간격 안에 있고, 앞뒤 빈칸이 좁으며(합쳐 글자 1.5개 이하),
+    아이콘 가운데가 줄 높이 안에 있다. (단 사이 여백에 놓인 작은 도형은 해당 없음)"""
+    if not (r.x0 >= gx0 - 1.0 and r.x1 <= gx1 + 1.0):
+        return False
+    if (gx1 - gx0) - r.width > 1.5 * size:
+        return False
+    cy = (r.y0 + r.y1) / 2
+    return y0 - 0.2 * size <= cy <= y1 + 0.2 * size
+
+
+def join_icon_split_lines(d: dict, icons: list) -> None:
+    """한 줄이 문장 중간의 아이콘 때문에 두 줄(같은 블록 또는 다른 블록)로 갈라져 저장된 경우
+    ('…five softkeys [아이콘] below the …') 오른쪽 조각을 왼쪽 줄 끝에 이어 붙인다
+    → 한 문장으로 번역되고, 아이콘은 mark_inline_icons 의 장애물로 피해 간다."""
+    blocks = [b for b in d.get("blocks", []) if b.get("type") == 0 and b.get("lines")]
+    pairs = [(b, ln) for b in blocks for ln in b["lines"] if ln.get("spans") and abs(ln["dir"][0]) >= 0.99]
+    gone: set = set()
+    for bb, lb in sorted(pairs, key=lambda t: t[1]["bbox"][0]):
+        if id(lb) in gone:
+            continue
+        hb = lb["bbox"][3] - lb["bbox"][1]
+        size = max(sp["size"] for sp in lb["spans"])
+        if not re.search(r"[A-Za-z]{2,}", "".join(sp["text"] for sp in lb["spans"])):
+            continue
+        hit = None
+        for ba, la in pairs:
+            if la is lb or id(la) in gone:
+                continue
+            if not re.search(r"[A-Za-z]{2,}", "".join(sp["text"] for sp in la["spans"])):
+                continue  # 양쪽 모두 낱말이어야 문장 중간 아이콘 (그림 라벨 '1▷ FEMALE' 의 번호는 해당 없음)
+            if abs(la["bbox"][1] - lb["bbox"][1]) > 0.3 * hb or abs(la["bbox"][3] - lb["bbox"][3]) > 0.3 * hb:
+                continue
+            gx0, gx1 = la["bbox"][2], lb["bbox"][0]
+            if not (0 < gx1 - gx0 < 6.0 * size):
+                continue
+            ic = _icon_in_gap(icons, gx0, gx1, lb["bbox"][1], lb["bbox"][3], size)
+            both = "".join(sp["text"] for sp in la["spans"] + lb["spans"])
+            if ic is not None and len(re.findall(r"[A-Za-z]{2,}", both)) >= 3:
+                hit = (ba, la, ic)
+                break
+        if hit is None:
+            continue
+        ba, la, ic = hit
+        ref = lb["spans"][0]
+        gap = dict(ref, text=" ", bbox=(la["bbox"][2], ref["bbox"][1], lb["bbox"][0], ref["bbox"][3]))
+        if ic["vec"]:  # 도형 아이콘: 문장 안의 표시 기호로 → 번역문과 함께 옮겨 다시 그린다
+            gap = dict(gap, text=f" ⟦I{ic['id']}⟧ ", _icon_id=ic["id"], _icon_rect=tuple(ic["r"]))
+        la["spans"] = la["spans"] + [gap] + lb["spans"]
+        la["bbox"] = (la["bbox"][0], min(la["bbox"][1], lb["bbox"][1]), lb["bbox"][2], max(la["bbox"][3], lb["bbox"][3]))
+        ba["bbox"] = tuple(fitz.Rect(ba["bbox"]) | fitz.Rect(la["bbox"]))
+        gone.add(id(lb))
+    if gone:
+        for b in blocks:
+            b["lines"] = [ln for ln in b["lines"] if id(ln) not in gone]
+        d["blocks"] = [b for b in d.get("blocks", []) if b.get("type") != 0 or b.get("lines")]
+
+
+ICON_TOKEN_RE = re.compile(r"⟦I\d+⟧")
+# 줄 끝 아이콘을 받는 말 ('Use [아이콘] or [아이콘]', 'press [아이콘]') - 도면 라벨·바닥글 끝의 도형과 구별
+ICON_LEAD_WORDS = {"or", "and", "press", "use", "select", "the", "with", "then", "push", "hold", "tap", "touch",
+                   "click", "via", "using", "key", "button", "symbol", "icon"}
+
+
+def inline_icons(page) -> list[dict]:
+    """글자 사이에 놓일 수 있는 작은 아이콘 후보 [{"r": Rect, "vec": 도형 아이콘인가, "id": 번호}].
+    도형은 붙어 있는 조각(원+화살표 등)을 한 아이콘으로 묶는다. 크기 2~30pt, 낱말과 겹치지 않는 것만
+    (글자 밑 배경 무늬·하이라이트 제외). 도형 아이콘은 번역문과 함께 옮길 수 있고, 그림 아이콘은 제자리 장애물."""
+    vec, img = [], []
+    try:
+        for d in page.get_drawings():
+            r = d["rect"]
+            if 0.5 <= r.width <= 30 and 0.5 <= r.height <= 30:
+                vec.append(fitz.Rect(r))
+        img = [fitz.Rect(i["bbox"]) for i in page.get_image_info()
+               if 2.0 <= i["bbox"][2] - i["bbox"][0] <= 30 and 2.0 <= i["bbox"][3] - i["bbox"][1] <= 30]
+        if not vec and not img:
+            return []
+        words = [fitz.Rect(w[:4]) for w in page.get_text("words")]
+    except Exception:  # noqa: BLE001
+        return []
+    # 붙어 있는 도형 조각 묶기
+    clusters: list = []
+    for r in sorted(vec, key=lambda r: (r.y0, r.x0)):
+        g = fitz.Rect(r)
+        merged = True
+        while merged:
+            merged = False
+            for c in clusters:
+                if (c + (-0.8, -0.8, 0.8, 0.8)).intersects(g):
+                    g |= c
+                    clusters.remove(c)
+                    merged = True
+                    break
+        clusters.append(g)
+    out = []
+    for kind, rects in ((True, clusters), (False, img)):
+        for r in rects:
+            if not (2.0 <= r.width <= 30 and 2.0 <= r.height <= 30):
+                continue
+            if any((r & w).get_area() > 0.15 * max(r.get_area(), 1e-6) for w in words if r.intersects(w)):
+                continue
+            out.append({"r": r, "vec": kind, "id": len(out) + 1})
+    return out
+
+
+def inline_icon_rects(page) -> list:
+    return [ic["r"] for ic in inline_icons(page)]
+
+
+def mark_inline_icons(page, units: list[Unit]) -> None:
+    """문단 안(문단 상자 안쪽)에 놓인 작은 아이콘(키 모양 도형, 작은 그림)을 그 문단의 장애물로 등록한다.
+    번역문은 줄바꿈할 때 아이콘 앞에서 줄을 바꾼다 → 'press the setting tool [아이콘] and [아이콘] keys' 에서
+    한글이 아이콘 위로 지나가지 않는다."""
+    cand = [u for u in units if u.cell is None and not u.rotated and u.align == "left" and u.size and not u.ocr]
+    if not cand:
+        return
+    rects = inline_icon_rects(page)
+    if not rects:
+        return
+    for u in cand:
+        R = u.rect
+        moving = list(u.icon_map.values())
+        # 문단 상자와 세로로 절반 이상 겹치고 가로로는 상자 안에 있는 아이콘 (줄보다 조금 튀어나와도 포함)
+        obs = [r for r in rects if r.width <= 2.5 * u.size and r.height <= 2.5 * u.size and r.height >= 0.4 * u.size
+               and r.x0 >= R.x0 + 0.5 and r.x1 <= R.x1 - 0.5
+               and min(r.y1, R.y1) - max(r.y0, R.y0) >= 0.5 * r.height
+               and not any(abs(r.x0 - m.x0) < 0.6 and abs(r.y0 - m.y0) < 0.6 for m in moving)]
+        if obs:
+            u.obstacles = obs
 
 
 def mark_blocked_first_lines(page, units: list[Unit]) -> None:
@@ -849,6 +1026,9 @@ def extract_units(page, table_cells: Optional[list] = None) -> list[Unit]:
         u.tab = tab
         units.append(u)
 
+    icons = inline_icons(page)
+    if icons:
+        join_icon_split_lines(d, icons)
     # 1차: 블록별 줄 조각
     blocks = []
     for b in d.get("blocks", []):
@@ -859,7 +1039,7 @@ def extract_units(page, table_cells: Optional[list] = None) -> list[Unit]:
         b_lines = merge_justified_rows(b.get("lines", []))
         cols = [sp["bbox"][0] for ln in b_lines for sp in ln["spans"][:1] if sp["text"].strip()]
         for ln in b_lines:
-            segs = split_line_segments(ln, vedges, cols)
+            segs = split_line_segments(ln, vedges, cols, icons)
             if len(segs) > 1:
                 tabular = True
             seg_lines += segs
@@ -890,6 +1070,13 @@ def extract_units(page, table_cells: Optional[list] = None) -> list[Unit]:
     for bl in blocks:
         bl[0] = [sl for sl in bl[0] if id(sl) not in drop]
     blocks = [bl for bl in blocks if bl[0]]
+    # 떼어 낸 글머리 기호/번호('7.1', '•')는 원본 그대로 두지만, 옆 문구가 그 자리를 침범하지 않도록 원문 유지 문구로 남긴다
+    for m in allsegs:
+        if id(m) in drop and m.get("spans"):
+            sp0 = m["spans"][0]
+            add(Unit(page=page.number, idx=0, rect=fitz.Rect(m["bbox"]), text=m["_text"].strip(),
+                     size=max(s_["size"] for s_ in m["spans"]), color=sp0.get("color", 0), bold=False,
+                     origin_y=sp0["origin"][1], scope_keep="글머리 기호/번호 (원문 유지)"))
     # 3차: 줄 조각별 폭/줄 간격/밑줄 계산 → 밑줄은 '행 경계선'에서 제외
     used = annotate_segments(blocks, cells, vedges, thin)
     if used:
@@ -916,10 +1103,22 @@ def extract_units(page, table_cells: Optional[list] = None) -> list[Unit]:
 
     narrow = 0.25 * page.rect.width
     widths = [max(s["bbox"][2] - s["bbox"][0] for s in r[0]) for r in rests]
+
+    def prose(r) -> bool:
+        """여러 단 편집의 본문 단(표의 열이 아님): 3줄 이상, 줄마다 낱말이 많고, 문장으로 이어지는 줄이 대부분"""
+        lines = r[0]
+        if len(lines) < 3:
+            return False
+        wpl = sum(len(re.findall(r"[A-Za-z]{2,}", x["_text"])) for x in lines) / len(lines)
+        cont = sum(1 for a, b in zip(lines, lines[1:]) if continues(a, b, None))
+        return wpl >= 4.0 and cont >= 0.5 * (len(lines) - 1)
+    is_prose = [prose(r) for r in rests]
     for i in range(len(rests)):
         for j in range(i + 1, len(rests)):
             if min(widths[i], widths[j]) > narrow:
                 continue
+            if is_prose[i] and is_prose[j]:
+                continue  # 나란한 본문 단끼리는 표로 묶지 않는다 (Rotork 4단 소책자 등)
             shared = set()
             for a in rests[i][0]:
                 for b in rests[j][0]:
@@ -968,6 +1167,7 @@ def extract_units(page, table_cells: Optional[list] = None) -> list[Unit]:
             add(u, bool(u is not None and u.tab))
     mark_centered_lines(units, vedges, page.rect)
     mark_blocked_first_lines(page, units)
+    mark_inline_icons(page, units)
     mark_keep_columns(units)
     return units
 
@@ -1368,7 +1568,8 @@ def insert_font(page, name: str, spec: dict):
 LINE_H = 1.22
 
 
-def wrap_text(text: str, font, size: float, width: float, hang: float = 0.0, first_w: float = 0.0) -> list[str]:
+def wrap_text(text: str, font, size: float, width: float, hang: float = 0.0, first_w: float = 0.0,
+              line_lim=None) -> list[str]:
     """hang > 0: 둘째 줄부터 줄 폭을 그만큼 줄인다 (내어쓰기 문단), hang < 0: 첫 줄만 줄인다 (첫 줄 들여쓰기)"""
     lines: list[str] = []
     full = width
@@ -1378,6 +1579,15 @@ def wrap_text(text: str, font, size: float, width: float, hang: float = 0.0, fir
             width = (full - hang if lines else full) if hang >= 0 else (full if lines else full + hang)
             if not lines and first_w > 0:
                 width = min(width, first_w)
+            if line_lim is not None:  # 이 줄 높이에 아이콘이 있으면 아이콘을 피한 폭만
+                for _ in range(20):
+                    lim = line_lim(len(lines), size, full)
+                    if lim is None or lim[1] >= 1.5 * size or cur:
+                        break
+                    lines.append("")  # 쓸 자리가 없는 줄: 비우고 다음 줄로
+                lim = line_lim(len(lines), size, full)
+                if lim is not None:
+                    width = min(width, max(lim[1], 1.5 * size))
             cand = w if not cur else cur + " " + w
             if font.text_length(cand, fontsize=size) <= width:
                 cur = cand
@@ -1386,6 +1596,15 @@ def wrap_text(text: str, font, size: float, width: float, hang: float = 0.0, fir
                 lines.append(cur)
                 cur = ""
                 width = full - hang if hang >= 0 else full
+                if line_lim is not None:  # 새 줄도 아이콘 확인 (쓸 자리가 없으면 비우고 다음 줄)
+                    for _ in range(20):
+                        lim = line_lim(len(lines), size, full)
+                        if lim is None or lim[1] >= 1.5 * size:
+                            break
+                        lines.append("")
+                    lim = line_lim(len(lines), size, full)
+                    if lim is not None:
+                        width = min(width, max(lim[1], 1.5 * size))
             if font.text_length(w, fontsize=size) <= width:
                 cur = w
             else:  # 한 단어가 너무 길면 글자 단위로 줄바꿈
@@ -1402,11 +1621,11 @@ def wrap_text(text: str, font, size: float, width: float, hang: float = 0.0, fir
     return lines
 
 
-def _shrink_fit(text, font, width, height, start, lo, tol=0.35, hang=0.0, first_w=0.0):
+def _shrink_fit(text, font, width, height, start, lo, tol=0.35, hang=0.0, first_w=0.0, line_lim=None):
     size = start
     words = [w for w in text.split() if w]
     while True:
-        lines = wrap_text(text, font, size, width, hang, first_w)
+        lines = wrap_text(text, font, size, width, hang, first_w, line_lim)
         ok = len(lines) * size * LINE_H <= height + size * tol
         if ok and words:  # 단어가 글자 단위로 쪼개지면(예: '개/정') 더 줄여 본다
             ok = max(font.text_length(w, fontsize=size) for w in words) <= width - abs(hang) + 0.5
@@ -1415,7 +1634,8 @@ def _shrink_fit(text, font, width, height, start, lo, tol=0.35, hang=0.0, first_
         size = max(lo, size - 0.25)
 
 
-def fit_text(text, font, w0, h0, box_w, box_h, orig_size, cfg: Config, hang: float = 0.0, first_w: float = 0.0):
+def fit_text(text, font, w0, h0, box_w, box_h, orig_size, cfg: Config, hang: float = 0.0, first_w: float = 0.0,
+             line_lim=None):
     """원래 박스 → 폭 확장 → 폭+높이 확장(셀 바닥/다음 글자 직전까지) 순서로 92%, 85%까지 축소해 시도,
     그래도 안 되면 확장 박스에서 하한(min_scale/min_size)까지 축소.
     반환: (크기, 줄 목록, 맞음여부, 사용폭)"""
@@ -1424,12 +1644,12 @@ def fit_text(text, font, w0, h0, box_w, box_h, orig_size, cfg: Config, hang: flo
     for tier in (0.92, 0.85):  # 약간 축소 → 폭/높이 확장 → 조금 더 축소 순
         mid = max(lo, orig_size * tier)
         for w, h in ((w0, h0), (W, h0), (W, H)):
-            s, ls, ok = _shrink_fit(text, font, w, h, orig_size, mid, hang=hang, first_w=first_w)
+            s, ls, ok = _shrink_fit(text, font, w, h, orig_size, mid, hang=hang, first_w=first_w, line_lim=line_lim)
             if ok:
                 return s, ls, ok, w
-    s, ls, ok = _shrink_fit(text, font, W, H, orig_size, lo, hang=hang, first_w=first_w)
+    s, ls, ok = _shrink_fit(text, font, W, H, orig_size, lo, hang=hang, first_w=first_w, line_lim=line_lim)
     if not ok:  # 겹쳐 그리는 것보다 작은 글자가 낫다: 원래 크기의 45%(최소 4pt)까지 더 축소
-        s, ls, ok = _shrink_fit(text, font, W, H, s, max(4.0, orig_size * 0.45), hang=hang, first_w=first_w)
+        s, ls, ok = _shrink_fit(text, font, W, H, s, max(4.0, orig_size * 0.45), hang=hang, first_w=first_w, line_lim=line_lim)
     return s, ls, ok, W
 
 
@@ -1613,6 +1833,38 @@ def restore_annotations(doc, stash: dict) -> None:
             print(f"  ! p.{pno + 1} 주석 복원 실패: {e}", file=sys.stderr)
 
 
+def _obstacle_limit(u: Unit, full: Optional[float] = None):
+    """줄 번호·글자 크기 → 그 줄에서 아이콘을 피해 쓸 자리 (시작 오프셋, 폭). 막힌 곳 없으면 None.
+    아이콘 앞 공간이 넉넉하면 아이콘 앞까지, 좁으면('Press [아이콘] to select …') 아이콘 뒤에서 시작한다.
+    _place_lines 와 같은 줄 위치를 쓴다."""
+    def first_base(size: float) -> float:
+        asc = (u.origin_y - u.rect.y0) / u.size if u.size else 0.85
+        asc = min(max(asc, 0.7), 1.0)
+        if u.size and not u.rotated and u.origin_y > u.rect.y0:
+            return _ink(u).y0 + 0.78 * size
+        return u.rect.y0 + asc * size
+
+    def lim(k: int, size: float, width: Optional[float] = None):
+        W = width if width is not None else (full if full is not None else u.rect.width)
+        base = first_base(size) + k * size * LINE_H
+        h = u.hang
+        xs = u.rect.x0 + ((h if k else 0.0) if h >= 0 else (-h if k == 0 else 0.0))
+        obs = sorted((r for r in u.obstacles if r.y1 > base - 0.8 * size and r.y0 < base + 0.25 * size
+                      and r.x1 > xs and r.x0 < xs + W), key=lambda r: r.x0)
+        if not obs:
+            return None
+        pad = 0.25 * size
+        start, end = 0.0, W
+        for r in obs:
+            before = r.x0 - xs - pad - start
+            if before >= max(0.35 * W, 4.0 * size):
+                end = min(end, r.x0 - xs - pad)
+                break
+            start = max(start, r.x1 - xs + pad)  # 아이콘 앞이 좁다 → 아이콘 뒤에서 시작
+        return (start, max(0.0, end - start))
+    return lim
+
+
 def _place_lines(u: Unit, font, size: float, lines: list[str]):
     """줄별 위치 계산. 반환: (placed[(x, y, 줄)], 차지 영역, 줄 목록)"""
     asc = (u.origin_y - u.rect.y0) / u.size if u.size else 0.85
@@ -1642,6 +1894,10 @@ def _place_lines(u: Unit, font, size: float, lines: list[str]):
         else:
             h = 0.0 if u.leader else u.hang
             x = u.rect.x0 + ((h if k else 0.0) if h >= 0 else (-h if k == 0 else 0.0))
+            if u.obstacles and getattr(u, "_lim", None) is not None:
+                lim = u._lim(k, size)
+                if lim is not None:
+                    x += lim[0]  # 아이콘 뒤에서 시작하는 줄
         if ln:
             placed.append((x, y, ln))
             r = fitz.Rect(x, y - asc * size, x + tw, y + 0.28 * size)
@@ -1788,8 +2044,83 @@ def remove_underlines(page, units: list[Unit]) -> set:
     return done
 
 
+NBSP = "\u00a0"
+ICON_RUN_TEXT_RE = re.compile(NBSP + "{2,}")
+
+
+def _prepare_icon_units(page, units: list[Unit], fonts) -> list:
+    """문장 속 아이콘 표시 기호('⟦I3⟧')가 든 번역문: 기호를 아이콘 폭만큼의 줄바꿈 없는 공백으로 바꾸고,
+    아이콘 도형을 미리 읽어 둔다. 반환: [(유닛, 원래 번역문)] (렌더링 후 번역문을 되돌리기 위해)"""
+    todo = [u for u in units if u.icon_map and u.ko and "⟦I" in u.ko]
+    if not todo:
+        return []
+    try:
+        drawings = page.get_drawings()
+    except Exception:  # noqa: BLE001
+        drawings = []
+    prim = fonts["regular"]["font"]
+    w1 = max(prim.text_length(NBSP, fontsize=1.0), 0.15) if hasattr(prim, "text_length") else 0.28
+    saved = []
+    for u in todo:
+        seq, paths = [], {}
+        smin = max(3.5, 0.85 * (u.size or 8.0))
+
+        def sub(m):
+            tok = m.group(0)
+            r = u.icon_map.get(tok)
+            if r is None:
+                return " "
+            seq.append(tok)
+            paths[tok] = [d for d in drawings if (r + (-0.8, -0.8, 0.8, 0.8)).contains(d["rect"])]
+            n = max(2, math.ceil((r.width + 0.35 * (u.size or 8.0)) / (w1 * smin)))
+            return NBSP * n
+        saved.append((u, u.ko))
+        u.ko = ICON_TOKEN_RE.sub(sub, u.ko)
+        u._icon_seq, u._icon_paths = seq, paths
+        for tok, r in u.icon_map.items():  # 번역문에서 빠진 아이콘은 옮기지 않고 제자리 장애물로
+            if tok not in seq:
+                u.obstacles.append(r)
+    return saved
+
+
+def _redraw_icon(page, paths: list, dx: float, dy: float) -> int:
+    """아이콘 도형을 (dx, dy) 만큼 옮겨 다시 그린다. 반환: 그린 도형 수"""
+    n = 0
+    for pth in paths:
+        sh = page.new_shape()
+        off = fitz.Point(dx, dy)
+        for it in pth.get("items", []):
+            op = it[0]
+            if op == "l":
+                sh.draw_line(it[1] + off, it[2] + off)
+            elif op == "c":
+                sh.draw_bezier(it[1] + off, it[2] + off, it[3] + off, it[4] + off)
+            elif op == "re":
+                sh.draw_rect(fitz.Rect(it[1]) + (dx, dy, dx, dy))
+            elif op == "qu":
+                q = it[1]
+                sh.draw_quad(fitz.Quad(q.ul + off, q.ur + off, q.ll + off, q.lr + off))
+        sh.finish(fill=pth.get("fill"), color=pth.get("color"), width=pth.get("width") or 0,
+                  closePath=bool(pth.get("closePath")), even_odd=bool(pth.get("even_odd")),
+                  fill_opacity=pth.get("fill_opacity") or 1, stroke_opacity=pth.get("stroke_opacity") or 1,
+                  lineCap=max(pth.get("lineCap") or (0,)) if isinstance(pth.get("lineCap"), (tuple, list))
+                  else (pth.get("lineCap") or 0), lineJoin=pth.get("lineJoin") or 0)
+        sh.commit(overlay=True)
+        n += 1
+    return n
+
+
 def render_page(page, units: list[Unit], fonts, cfg: Config) -> dict:
     """반환: {"ul_removed": 지운 밑줄 수, "drawn": 새로 그린 도형 수(밑줄 + OCR 배경 패치)} → 최종 검사(선/도형 보존)에 사용"""
+    saved = _prepare_icon_units(page, units, fonts)
+    try:
+        return _render_page(page, units, fonts, cfg)
+    finally:
+        for u, ko in saved:  # 번역 로그에는 아이콘 표시 기호가 든 원래 번역문을 남긴다
+            u.ko = ko
+
+
+def _render_page(page, units: list[Unit], fonts, cfg: Config) -> dict:
     stats = {"ul_removed": 0, "drawn": 0}
     # 번역해도 원문과 같은 문구(사람 이름·날짜·코드 등)는 지우고 다시 쓰지 않고 원본 글꼴 그대로 둔다
     todo = [u for u in units if u.ko and not _same_as_source(u)]
@@ -1823,7 +2154,19 @@ def render_page(page, units: list[Unit], fonts, cfg: Config) -> dict:
             ink = InkMap(page)  # 리댁션/패치 전 원본 이미지 기준
         except Exception:  # noqa: BLE001
             ink = None
+    rot_plans = []
     for u in todo:
+        if u.rotated:  # 90° 회전 글자: 같은 방향으로, 원래 띠 안에 맞춰 쓴다
+            use_bold = bool(u.bold and fonts["bold"]["font"])
+            font = fonts["bold"]["font"] if use_bold else fonts["regular"]["font"]
+            L, T = u.rect.height, u.rect.width
+            base = max(3.5, u.size * getattr(cfg, "text_scale", 1.0))
+            size, lines, ok, _w = fit_text(u.ko, font, L, T, L * 1.05, T, base, cfg)
+            if not ok:
+                u.notes.append("OVERFLOW(회전 글자 칸 초과, 글자 축소 한계)")
+            u.used_size = size
+            rot_plans.append((u, "OMKOB" if use_bold else "OMKO", size, lines))
+            continue
         use_bold = bool(u.bold and fonts["bold"]["font"])
         font = fonts["bold"]["font"] if use_bold else fonts["regular"]["font"]
         fname = "OMKOB" if use_bold else "OMKO"
@@ -1851,9 +2194,14 @@ def render_page(page, units: list[Unit], fonts, cfg: Config) -> dict:
             bottom = u.rect.y1 + 0.15 * u.size
         # 번역 글자 크기: 원문 크기 × 설정 비율(기본 92%)에서 시작해 필요하면 더 줄인다
         base = max(3.5, u.size * getattr(cfg, "text_scale", 1.0))
+        if u.obstacles:  # 아이콘이 박힌 문단: 아이콘 위치가 의미를 가지므로 원래 단 폭을 넘기지 않는다
+            box_w = min(box_w, u.rect.width + 0.5)
+        lim_fn = _obstacle_limit(u, box_w) if u.obstacles else None
         hang = u.hang if u.align == "left" and not u.leader else 0.0
         size, lines, ok, _w = fit_text(u.ko, font, u.rect.width, u.rect.height, box_w,
-                                       bottom - u.rect.y0, base, cfg, hang, u.first_w)
+                                       bottom - u.rect.y0, base, cfg, hang, u.first_w, lim_fn)
+        # 배치도 줄바꿈 때와 같은 폭으로 아이콘 앞/뒤를 판단한다
+        u._lim = (lambda k, sz, _f=lim_fn, _ww=_w: _f(k, sz, _ww)) if lim_fn else None
         u.used_size = size
         if not ok:
             u.notes.append("OVERFLOW(박스 초과, 글자 축소 한계)")
@@ -1866,7 +2214,9 @@ def render_page(page, units: list[Unit], fonts, cfg: Config) -> dict:
             sz = size
             while sz > 4.0 + 1e-6:
                 sz = max(4.0, sz - 0.25)
-                ls = wrap_text(u.ko, font, sz, box_w, hang, u.first_w)
+                ls = wrap_text(u.ko, font, sz, box_w, hang, u.first_w, lim_fn)
+                if lim_fn:
+                    u._lim = (lambda k, s2, _f=lim_fn, _ww=box_w: _f(k, s2, _ww))
                 pl, ar, ls = _place_lines(u, font, sz, ls)
                 if not _conflicts(u, pl, sz, font, others):
                     size, lines, placed, area, fixed = sz, ls, pl, ar, True
@@ -1963,6 +2313,21 @@ def render_page(page, units: list[Unit], fonts, cfg: Config) -> dict:
         if again:
             apply_redactions(page, False)
             stats["redact_retry"] = again
+    #  2-3) 옮겨 그릴 아이콘의 원래 도형만 지운다 (글자·그림·다른 선은 그대로)
+    icon_units = [u for u in todo if getattr(u, "_icon_seq", None)]
+    if icon_units and hasattr(fitz, "PDF_REDACT_TEXT_NONE"):
+        kw = _redact_kw(page)
+        kw["graphics"] = getattr(fitz, "PDF_REDACT_LINE_ART_REMOVE_IF_COVERED", 1)
+        kw["text"] = fitz.PDF_REDACT_TEXT_NONE
+        for u in icon_units:
+            for tok in u._icon_seq:
+                page.add_redact_annot(u.icon_map[tok] + (-0.6, -0.6, 0.6, 0.6), fill=False)
+                stats["ul_removed"] += len(u._icon_paths.get(tok, []))
+        page.apply_redactions(**kw)
+    elif icon_units:  # 구버전 PyMuPDF: 도형만 지울 수 없음 → 아이콘은 제자리 장애물로
+        for u in icon_units:
+            u.obstacles += [u.icon_map[t] for t in u._icon_seq]
+            u._icon_seq = []
 
     # 3) OCR 영역: 원본 배경색으로 영어를 덮는 패치 (표 셀이면 괘선을 침범하지 않게 셀 안쪽으로 제한)
     for u, fname, size, placed, area, color in plans:
@@ -1986,8 +2351,25 @@ def render_page(page, units: list[Unit], fonts, cfg: Config) -> dict:
     fb_used: set = set()
     for u, fname, size, placed, area, color in plans:
         mix = fonts_obj[fname]
+        seq = list(getattr(u, "_icon_seq", None) or [])
         for x, y, ln in placed:
-            for k, part in mix.runs(ln):
+            for m in ICON_RUN_TEXT_RE.finditer(ln):  # 아이콘 자리: 원래 아이콘 도형을 이 자리로 옮겨 그린다
+                if not seq:
+                    break
+                tok = seq.pop(0)
+                r = u.icon_map[tok]
+                xr = x + mix.text_length(ln[:m.start()], fontsize=size)
+                wr = mix.text_length(m.group(0), fontsize=size)
+                cy = (r.y0 + r.y1) / 2
+                oy = next((l[4] for l in u.lines if l[1] - 1 <= cy <= l[3] + 1), u.origin_y)
+                dx = xr + (wr - r.width) / 2 - r.x0
+                dy = (y + (cy - oy)) - cy
+                stats["drawn"] += _redraw_icon(page, u._icon_paths.get(tok, []), dx, dy)
+            # 아이콘 자리의 공백(NBSP)은 그리지 않고 자리만 건너뛴다 (줄인 한글 글꼴에 없는 글자라 □로 찍힘)
+            for k, part in [(kk, pp) for kk, pp0 in mix.runs(ln) for pp in re.split("(" + NBSP + "+)", pp0) if pp]:
+                if part[0] == NBSP:
+                    x += mix.text_length(part, fontsize=size)
+                    continue
                 fn = fname
                 if k >= 0:
                     fb = mix.fallbacks[k]
@@ -2001,6 +2383,29 @@ def render_page(page, units: list[Unit], fonts, cfg: Config) -> dict:
             for x0, x1, y, th, col in _underline_spans(u, placed, size, mix):
                 page.draw_rect(fitz.Rect(x0, y, x1, y + th), color=None, fill=col, width=0, overlay=True)
                 stats["drawn"] += 1
+    for u, fname, size, lines in rot_plans:  # 회전 글자
+        mix = fonts_obj[fname]
+        color = fitz.sRGB_to_pdf(u.color) if hasattr(fitz, "sRGB_to_pdf") else (0, 0, 0)
+        up = u.dirn[1] < 0  # 위로 읽는 글자(rotate=90): 글자 윗부분이 왼쪽, 다음 줄은 오른쪽
+        L = u.rect.height
+        for k, ln in enumerate(lines):
+            tw = mix.text_length(ln, fontsize=size) if hasattr(mix, "text_length") else 0.0
+            off = (L - tw) / 2 if u.align == "center" and tw < L else 0.0
+            if up:
+                x, y, rot = u.rect.x0 + 0.8 * size + k * size * LINE_H, u.rect.y1 - off, 90
+            else:
+                x, y, rot = u.rect.x1 - 0.8 * size - k * size * LINE_H, u.rect.y0 + off, 270
+            for kk, part in mix.runs(ln):
+                fn = fname
+                if kk >= 0:
+                    fb = mix.fallbacks[kk]
+                    fn = fb["name"]
+                    if fn not in fb_used:
+                        insert_font(page, fn, fb)
+                        fb_used.add(fn)
+                page.insert_text(fitz.Point(x, y), part, fontname=fn, fontsize=size, color=color, rotate=rot)
+                adv = mix.font_of(kk).text_length(part, fontsize=size)
+                y = y - adv if up else y + adv
     return stats
 
 
@@ -2276,13 +2681,16 @@ def classify_unit(u: Unit, protector: Protector, overrides: dict[str, str]):
         return
     ptxt, tokens = protector.protect(u.text, tokenize_numbers=len(u.text) <= 80)
     u.ptxt, u.tokens = ptxt, tokens
+    if not u.scope_keep and u.size and u.size < 3.0 and not u.ocr:
+        # 그림 속 아주 작은 글자(명판·키 라벨, 0.9~2pt): 번역하면 최소 글자 크기 때문에 원본보다 커져 그림을 덮는다
+        u.scope_keep = f"그림 속 아주 작은 글자({u.size:.1f}pt) → 원문 유지"
     if u.scope_keep:
         u.status = "SCOPE_KEEP"
     elif u.symbol or not needs_translation(ptxt):
         u.status = "KEEP"
-    elif u.rotated:
-        u.status = "ROTATED_SKIPPED"
-        u.notes.append("회전 텍스트: 번역하지 않음(수동 처리 필요)")
+    elif u.rotated and not (abs(u.dirn[0]) < 0.01 and abs(abs(u.dirn[1]) - 1.0) < 0.01):
+        u.status = "ROTATED_SKIPPED"  # 90° 가 아닌 비스듬한 글자: 원본 그대로
+        u.notes.append("비스듬한 회전 텍스트: 번역하지 않음(수동 처리 필요)")
     else:
         u.status = "PENDING"
 

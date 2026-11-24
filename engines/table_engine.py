@@ -105,6 +105,9 @@ def continues(a: dict, b: dict, hedges=None) -> bool:
         return False
     fw = b.get("_fw", 0.0)
     if fw * 1.15 + 0.1 * size <= avail:
+        # 문장 중간 아이콘('Press [아이콘] to select …')이 있는 줄은 아이콘 자리 때문에 빈자리 판단이 맞지 않는다
+        if "⟦I" in a["_text"] and not TERMINAL_RE.search(a["_text"]):
+            return True
         if not (soft and (filled or avail < 2.0 * fw)):
             return False
     return True
@@ -306,4 +309,8 @@ def mark_keep_columns(units: list[Unit]):
     keep_cols = {k for k, t in headers.items() if KEEP_COL_RE.match(t)}
     for u in units:
         if u.tkey and u.tkey[1] > 0 and (u.tkey[0], u.tkey[2]) in keep_cols:
+            # 값/번호 열이라도 칸 안에 설명 문장이 있으면(합친 칸의 주석 등) 번역한다
+            # 예) 'The Remote Mount Feedback Unit kit (kit 10) is not orderable by part number …'
+            if len(re.findall(r"\b[a-z]{2,}\b", u.text)) >= 4:
+                continue
             u.scope_keep = f"표 '{headers[(u.tkey[0], u.tkey[2])]}' 열 원문유지"

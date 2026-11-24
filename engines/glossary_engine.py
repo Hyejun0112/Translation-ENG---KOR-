@@ -39,6 +39,7 @@ _UNIT_RX = (
 
 
 DEFAULT_KEEP_PATTERNS = [
+    r"⟦I\d+⟧",  # 문장 속 아이콘 자리 (번역문과 함께 옮겨 다시 그림)
     r"https?://\S+",
     r"\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b",
     # 규격/표준 번호: ASME B31.1, API 610, ISO 9001, EN 10204 ...
@@ -304,6 +305,7 @@ _UNIT_JONG = {"kg": (True, False), "mm": (False, False), "cm": (False, False), "
               "%": (False, False), "℃": (False, False), "°C": (False, False), "mmH2O": (False, False),
               "Nm": (False, False), "lb.ft": (False, False), "lbf": (False, False), "ft": (False, False),
               "lb": (False, False), "lbs": (False, False), "gpm": (True, False), "scfm": (True, False),
+              "l/min": (True, False), "L/min": (True, False), "kg/h": (True, False), "m/s": (False, False),
               "in": (False, False), "L/hr": (False, False), "l/hr": (False, False), "L/h": (False, False),
               "m3/h": (False, False), "°F": (False, False), "rpm.": (True, False)}
 # 기호: 도(°), 제곱/세제곱 미터(²³ → '…미터'), 아래첨자 숫자(O₂ '오투', H₂O)
@@ -327,6 +329,8 @@ def _jong_of(prev: str):
     if i < 0:
         return None
     head = prev[:i + 1]
+    if head.endswith("⟧"):  # 문장 속 아이콘(키 모양) 뒤: '키'처럼 받침 없이 읽는다 → '를/는/가'
+        return (False, False)
     low = head.lower()
     for dom, j in _DOMAIN_JONG.items():  # 이메일/URL 뒤
         if low.endswith(dom):
@@ -348,7 +352,12 @@ def _jong_of(prev: str):
         if c.isupper():
             return _LETTER_JONG.get(c, (False, False))
         # 소문자: 단위(mm, kg, bar …)는 읽는 법이 갈려 판단하지 않는다. 단, 앞이 숫자+Vac/Vdc 같은 끝이 c/d/e/a 등이면 받침 없음
-        return (False, False) if c in "acdefghijkopqstuvwxyz" else None
+        # 외래어 표기 기준: 끝소리 n·m·ng 은 받침(에머슨을), l 은 ㄹ받침(…컬을/…로), 나머지는 '으' 로 끝나 받침 없음(로토크를)
+        if c in "mn":
+            return (True, False)
+        if c == "l":
+            return (True, True)
+        return (False, False)
     return None
 
 
