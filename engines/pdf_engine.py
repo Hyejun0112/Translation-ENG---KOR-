@@ -217,6 +217,14 @@ def _is_icon_char(c: str) -> bool:
 
 
 WIDE_SPACE_RE = re.compile(r"(?<=\S) {3,}(?=\S)")
+
+
+def _base_jump(c1: dict, c2: dict, size: float) -> bool:
+    """두 글자의 기준선(origin y)이 글자 크기의 25% 넘게 다른가 (한 글자 조각 안에서 높이를 바꿔 찍은 수식)"""
+    try:
+        return abs(c1["origin"][1] - c2["origin"][1]) > 0.25 * max(size, 1.0)
+    except (KeyError, IndexError, TypeError):
+        return False
 CTRL_LEAD_RE = re.compile(r"[\x00-\x08\x0b-\x1f]+")
 
 
@@ -231,6 +239,13 @@ def split_icon_spans(page, d: dict) -> None:
     for b in blocks:  # 본문 글꼴의 사용자 정의 영역 하이픈(U+E02D)은 아이콘이 아니다 → '-' (글자 수 그대로)
         for ln in b["lines"]:
             for sp in ln["spans"]:
+                t0 = sp["text"]
+                if (t0 and all("\x01" <= c <= "\x1f" and c not in "\t\n\r" for c in t0)
+                        and sp["bbox"][2] - sp["bbox"][0] > 0.5 and (sp.get("font") or "").lower() not in ("", "helvetica")):
+                    # 기호 글꼴의 글자가 제어 문자 번호로 찍힌 것(InterleafSymbols '\x05' = ©): 보이는 기호다.
+                    # 글자로는 쓸 수 없으므로 아이콘으로 바꿔 원본 그대로 둔다 (안 그러면 줄과 함께 지워져 '©' 가 사라짐)
+                    sp["text"] = "\ue000" * len(t0)
+                    continue
                 fl = (sp.get("font") or "").lower()
                 if "\ue02d" in sp["text"] and not any(k in fl for k in ("symbol", "ding", "wing", "icon")):
                     # 줄 끝에서만 보이는 '선택 하이픈': 줄 끝이면 '-', 줄 중간(뒤에 공백)이면 공백 (원본에도 안 보임)
@@ -271,6 +286,8 @@ def split_icon_spans(page, d: dict) -> None:
                         gx0, gx1 = cs[m.start() - 1]["bbox"][2], cs[m.end()]["bbox"][0]
                         if gx1 - gx0 >= 4.0 * sp["size"]:
                             return True
+                        if _base_jump(cs[m.start() - 1], cs[m.end()], sp["size"]):
+                            return True  # 빈칸 양쪽의 기준선이 다르다: 분수식('6 x rpm' 위 / '+' 가운데 / '= …')
                         if gx1 - gx0 < 1.0 * sp["size"]:
                             return False
                         y0, y1 = sp["bbox"][1], sp["bbox"][3]
@@ -284,8 +301,15 @@ def split_icon_spans(page, d: dict) -> None:
                     for m in cut + [None]:
                         a, e = pos, (m.start() if m else len(t))
                         if t[a:e].strip():
-                            new.append(dict(sp, text=t[a:e], bbox=(cs[a]["bbox"][0], sp["bbox"][1],
-                                                                     cs[e - 1]["bbox"][2], sp["bbox"][3])))
+                            piece = dict(sp, text=t[a:e], bbox=(cs[a]["bbox"][0], sp["bbox"][1],
+                                                                cs[e - 1]["bbox"][2], sp["bbox"][3]))
+                            if any(_base_jump(cs[0], c, sp["size"]) for c in cs[a:e]) or _base_jump(cs[0], cs[a], sp["size"]):
+                                # 조각마다 기준선이 다르면 그 조각 글자의 실제 높이·기준선을 쓴다 (분수식의 분자/연산자 자리)
+                                ink = [c for c in cs[a:e] if c["c"].strip()] or cs[a:e]
+                                piece["bbox"] = (cs[a]["bbox"][0], min(c["bbox"][1] for c in ink),
+                                                 cs[e - 1]["bbox"][2], max(c["bbox"][3] for c in ink))
+                                piece["origin"] = tuple(ink[0]["origin"])
+                            new.append(piece)
                         pos = m.end() if m else len(t)
                     continue
                 pos = 0
@@ -891,6 +915,28 @@ def mark_centered_lines(units: list[Unit], vedges: list, page_rect) -> None:
         u.align = "center"
 
 
+def mark_right_aligned_lines(units: list[Unit], page_rect) -> None:
+    """오른쪽에 붙여 쓴 머리글('Quick Start Guide' 위 / 'D103556X012' 아래처럼 오른쪽 끝이 같은 두 줄)의 한 줄짜리 글은
+    오른쪽 정렬로 표시한다 → 번역문이 짧아져도 오른쪽 끝이 원본처럼 맞는다 (왼쪽에서 시작하면 머리글이 가운데로 떠 보임).
+    페이지 오른쪽 절반에서 시작하고, 바로 위/아래 줄과 오른쪽 끝은 같고 왼쪽 시작은 다를 때만."""
+    W = page_rect.width
+    for u in units:
+        if (u.cell is not None or u.align != "left" or len(u.lines) != 1 or u.bullet or u.rotated or u.symbol
+                or not u.size or u.rect.x0 < page_rect.x0 + 0.45 * W):
+            continue
+        if any(o is not u and abs(o.rect.x0 - u.rect.x0) <= 2.0 for o in units):
+            continue  # 같은 왼쪽 시작점의 글이 있으면 왼쪽 정렬된 목록/표
+        if any(o is not u and o.rect.y1 > u.rect.y0 + 1 and o.rect.y0 < u.rect.y1 - 1 and o.rect.x0 >= u.rect.x1 - 1
+               for o in units):
+            continue  # 같은 높이 오른쪽에 다른 글이 있다 (표의 행)
+        near = 2.5 * u.size
+        if any(o is not u and abs(o.rect.x1 - u.rect.x1) <= 1.5 and abs(o.rect.x0 - u.rect.x0) > 3.0
+               and (0 <= o.rect.y0 - u.rect.y1 < near or 0 <= u.rect.y0 - o.rect.y1 < near
+                    or (o.rect.y0 > u.rect.y0 and o.rect.y0 - u.rect.y0 < near))
+               for o in units):
+            u.align = "right"
+
+
 def _seg_style(sg: dict) -> tuple:
     w = Counter()
     for sp in sg["spans"]:
@@ -1166,6 +1212,7 @@ def extract_units(page, table_cells: Optional[list] = None) -> list[Unit]:
                         u.align = "left"
             add(u, bool(u is not None and u.tab))
     mark_centered_lines(units, vedges, page.rect)
+    mark_right_aligned_lines(units, page.rect)
     mark_blocked_first_lines(page, units)
     mark_inline_icons(page, units)
     mark_keep_columns(units)
@@ -2294,14 +2341,41 @@ def _render_page(page, units: list[Unit], fonts, cfg: Config) -> dict:
         page_words = [fitz.Rect(w[:4]) for w in page.get_text("words")] if any(not u.ocr for u in todo) else []
     except Exception:  # noqa: BLE001
         page_words = []
+    vclips: dict[int, list] = {}  # 문구별 줄마다 (위 한계, 아래 한계): 2차 지우기도 같은 한계를 지킨다
     for u in todo:
         if not u.ocr:
             # 문구 전체 상자가 아니라 '원문 줄마다, 글자가 실제로 찍힌 영역'만 지운다
             # → 상자 안에 걸친 다른 글자(번호 '2.', 수식 기호, 이웃 줄)를 지우지 않음
             src_lines = u.lines or [(u.rect.x0, u.rect.y0, u.rect.x1, u.rect.y1, u.origin_y, u.size)]
+            own = [fitz.Rect(l[:4]) for l in src_lines]
+            vc = vclips.setdefault(id(u), [])
             for ln in src_lines:
                 ink = _line_ink(ln) if (u.size and not u.rotated) else fitz.Rect(ln[:4])
                 r = fitz.Rect(ink.x0 + 0.3, ink.y0 + 0.2, ink.x1 - 0.3, max(ink.y1 - 0.2, ink.y0 + 0.6))
+                top, bot = -1e9, 1e9
+                if not u.rotated and u.source != "native-ocr":
+                    # 위·아래 행의 다른 글자가 이 줄의 지우기 상자에 걸치면(분수의 분모 '63,000', 첨자 줄, 표의 다음 행)
+                    # 그 글자 쪽으로 상자를 줄여 함께 지워지지 않게 한다. 이 문구의 다른 줄에 속한 글자는 어차피 지우므로 제외.
+                    h0 = r.height
+                    for wr in page_words:
+                        if not wr.intersects(r) or wr.height <= 0:
+                            continue
+                        lr = fitz.Rect(ln[:4])
+                        if min(wr.y1, lr.y1) - max(wr.y0, lr.y0) >= 0.5 * min(wr.height, lr.height):
+                            continue  # 같은 행의 글자 (아래에서 좌우로 피한다)
+                        if any(min(wr.y1, o.y1) - max(wr.y0, o.y0) >= 0.5 * min(wr.height, o.height)
+                               and min(wr.x1, o.x1) - max(wr.x0, o.x0) > 0.5 * wr.width for o in own):
+                            continue  # 이 문구의 다른 줄 글자
+                        if (wr.y0 + wr.y1) / 2 > (r.y0 + r.y1) / 2:
+                            nb = min(bot, wr.y0 + 0.5)
+                            if nb - max(r.y0, top) >= 0.45 * h0:
+                                bot = nb
+                        else:
+                            nt = max(top, wr.y1 - 0.5)
+                            if min(r.y1, bot) - nt >= 0.45 * h0:
+                                top = nt
+                    r.y0, r.y1 = max(r.y0, top), min(r.y1, bot)
+                vc.append((top, bot))
                 if not u.rotated and u.source != "native-ocr":  # 글자깨짐 쪽은 글자 상자를 믿을 수 없음
                     # 줄 끝에 살짝 걸친 이웃 글자(세로 분수 '1/10', 기호)는 피한다: 폭의 절반 이상이 이 줄 밖에 있는 낱말
                     lr = fitz.Rect(ln[:4])
@@ -2338,8 +2412,14 @@ def _render_page(page, units: list[Unit], fonts, cfg: Config) -> dict:
             left = {x for w in page.get_text("words", clip=u.rect + (-0.5, -0.5, 0.5, 0.5))
                     for x in re.findall(r"[A-Za-z]{3,}", w[4])}
             if want & left:
-                for ln in (u.lines or [(u.rect.x0, u.rect.y0, u.rect.x1, u.rect.y1, u.origin_y, u.size)]):
-                    page.add_redact_annot(fitz.Rect(ln[:4]), fill=False)
+                vc = vclips.get(id(u), [])
+                for k, ln in enumerate(u.lines or [(u.rect.x0, u.rect.y0, u.rect.x1, u.rect.y1, u.origin_y, u.size)]):
+                    r = fitz.Rect(ln[:4])
+                    if k < len(vc):  # 1차 때 피한 위·아래 행 글자는 2차에도 피한다
+                        r.y0, r.y1 = max(r.y0, vc[k][0]), min(r.y1, vc[k][1])
+                    if r.is_empty:
+                        continue
+                    page.add_redact_annot(r, fill=False)
                     again += 1
         if again:
             apply_redactions(page, False)

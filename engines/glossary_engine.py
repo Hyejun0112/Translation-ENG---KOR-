@@ -41,6 +41,9 @@ _UNIT_RX = (
 DEFAULT_KEEP_PATTERNS = [
     r"⟦I\d+⟧",  # 문장 속 아이콘 자리 (번역문과 함께 옮겨 다시 그림)
     r"https?://\S+",
+    # 파일 이름(mda4201.pdf, BK212_manual.docx)과 밑줄로 이은 식별자(bk212_steamtrap_manual): 번역하면 찾을 수 없게 된다
+    r"(?<![\w.])[\w\-.]+\.(?:pdf|PDF|docx?|xlsx?|dwg|dxf|zip|txt|csv|xml|stp|step|igs|eds|EDS|gsd|GSD|gsdml|csp|cfg|ini|hex|bin|exe|msi|jpg|png|tif)(?![\w])",
+    r"(?<![\w-])[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*(?:_[A-Za-z0-9]+)+(?:-[A-Za-z0-9_]+)*(?![\w])",
     r"\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b",
     # 규격/표준 번호: ASME B31.1, API 610, ISO 9001, EN 10204 ...
     r"\b(?:ASME|ASTM|ANSI|API|ISO|IEC|IEEE|NFPA|AWS|NEMA|JIS|DIN|KEPIC|KS|EN|BS|UL|IP)"
@@ -50,6 +53,11 @@ DEFAULT_KEEP_PATTERNS = [
     r"\bRev(?:ision)?\.?\s?[A-Z0-9]{1,3}\b",
     # Tag No. / 모델명 / 부품번호 / 도면번호 (영문 대문자+숫자 혼합)
     r"\b(?=[A-Z0-9\-_/.]*\d)(?=[A-Z0-9\-_/.]*[A-Z])[A-Z0-9][A-Z0-9\-_/.]*[A-Z0-9]\b",
+    # 모델명 끝에 소문자 형식 기호가 붙은 것 (DVC6200f, DVC6200p, DVC6200SIS 의 변형): 통째로 보호
+    r"\b[A-Z]{1,6}\d{2,}[a-z]{1,2}\b",
+    # 대소문자가 섞인 재질/규격/암호 코드 (CK3MCuN, AlSi10Mg, IK545-Split, Basic128Rsa15): 숫자 포함 + 대문자 2개 이상.
+    # 'Weight1', 'Class150' 처럼 낱말 끝에 각주 번호가 붙은 것은 대문자가 하나라서 제외 (낱말은 번역)
+    r"(?<![\w-])(?=[A-Za-z0-9]*\d)(?=(?:[a-z0-9]*[A-Z]){2})[A-Za-z][A-Za-z0-9]*\d[A-Za-z0-9]*(?:-[A-Za-z0-9]+)*(?![\w-])",
     # 수치 + 단위
     _UNIT_RX,
     # 숫자에 바로 붙은 단위/기호 (14.0Kgf/cm, 100L/hr, 1.27kW, 80Nm, 60lb.ft): 소수점이 갈라지지 않게 한 덩어리로 보호
@@ -58,7 +66,8 @@ DEFAULT_KEEP_PATTERNS = [
     # 숫자 없이 홀로 쓴 복합 단위 (표 머리글 'kgf/cm2', '(MPa)', 'm3/h', 'N/mm2'): 영어 낱말이 아니므로 그대로 둔다
     r"(?<![\w/])(?:[Kk][Gg][Ff]?/[Cc][Mm][²2]?(?:[ga]|\s?\([ga]\))?|N/mm[²2]?|N?m[³3]/(?:h|hr|min|s)|kg/(?:h|hr|s|m[³3])"
     r"|[lL]/(?:min|hr|h|s)|(?:mm|in|m)H[2₂]O|mmHg|ft[²³23](?:/(?:h|s|min))?|(?:in|mm|cm|dm|m)[²³23]"
-    r"|kcal/(?:kg|Nm[³3]|h)|kPa|MPa|kVA|kW|rpm|psi[ga]?|bar[ga]|kN|MN|kNm|Nm|lbf(?:\.ft|·ft)?|lb\.?ft|ft\.?lbf?)(?![\w/])",
+    r"|kcal/(?:kg|Nm[³3]|h)|kPa|MPa|kVA|kW|rpm|psi[ga]?|bar[ga]|kN|MN|kNm|Nm|lbf(?:\.ft|·ft)?|lb\.?ft|ft\.?lbf?"
+    r"|gpm|GPM|gph|GPH|[sSaA]?[cC][fF][mM]|gal/(?:rev|min|h)|liters?/(?:rev|min|h)|l/rev|cc/rev)(?![\w/])",
     # 괄호/대괄호 안에 홀로 쓴 단위 (표 머리글 '[mm]', '[in]', '[dm³/min]', '(°C)', '[%]'): 그대로 둔다
     r"[\[(](?:[kMmcµμdn]?(?:m|g|l|L|s|N|W|V|A|Pa|J|Hz|bar)|in|ft|lb|lbf|psi[ga]?|°\s?[CF]|[℃℉%]|min|h|rpm|AWG)"
     r"(?:[²³23])?(?:/(?:min|s|h|hr|m[²³23]?|kg))?[\])]",
@@ -90,7 +99,11 @@ BULLET_RE = re.compile(
 )
 
 
-LIGATURES = {"ﬁ": "fi", "ﬂ": "fl", "ﬀ": "ff", "ﬃ": "ffi", "ﬄ": "ffl", "\u00ad": ""}
+LIGATURES = {"ﬁ": "fi", "ﬂ": "fl", "ﬀ": "ff", "ﬃ": "ffi", "ﬄ": "ffl"}
+# 줄 중간의 U+00AD: PDF 에 실제로 찍힌 글자이므로 글꼴이 그린 '보이는 하이픈'이다
+# (WinAnsi 0xAD = 하이픈 모양. 예: 모델 코드 'MTV-A5-AAA-A11-DN100-D20-B19' 가 전부 U+00AD 로 저장됨).
+# 지우면 'MTVA5AAAA11DN100D20B19' 처럼 코드가 바뀐다. 줄 끝의 U+00AD(낱말 끊김)는 join_hyphenated 에서 붙인다.
+SOFT_HYPHEN_MID_RE = re.compile("\u00ad(?=[^\\s\u00ad])")
 
 
 def optional_path(path: Optional[str], what: str) -> Optional[str]:
@@ -400,6 +413,7 @@ CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ufffe\uffff]")
 
 def clean_text(s: str) -> str:
     s = CONTROL_RE.sub(" ", s)  # PDF 글꼴에 섞인 제어문자 (엑셀 저장 오류·번역 요청 오류의 원인)
+    s = SOFT_HYPHEN_MID_RE.sub("-", s).replace("\u00ad", "")
     for a, b in LIGATURES.items():
         s = s.replace(a, b)
     return re.sub(r"\s+", " ", s).strip()

@@ -33,13 +33,22 @@ STANDARD_RE = re.compile(r"^(?:ISO|IEC|EN|DIN|API|ASME|ANSI|ASTM|IEEE|NFPA|BS|UL
 
 
 def norm(s: str) -> str:
+    s = re.sub("\u00ad(?=[^\\s\u00ad])", "-", s).replace("\u00ad", "")  # 줄 중간 U+00AD 는 보이는 하이픈
     return s.translate(SUPER).replace("−", "-").replace("–", "-").replace("—", "-")
+
+
+# 숫자 + 영어 낱말 꼬리('10-mm', '4-pole', '3-core', '7th', '1/6th', '10mm'): 한국어로는 '10mm', '4극', '3심',
+# '7번째' 처럼 꼬리가 바뀌거나 띄어 쓰이는 것이 정상 → 숫자 부분만 비교 (Tag·모델명처럼 영문이 앞에 오는 것은 그대로)
+NUM_TAIL_RE = re.compile(r"^(\d[\d.,/]*)-?[a-z]{1,8}$")
 
 
 def ids(text: str) -> Counter:
     out = Counter()
     for t in ID_RE.findall(norm(text)):
         t = t.strip(".-/%").lower()
+        m = NUM_TAIL_RE.match(t)
+        if m:
+            t = m.group(1).strip(".,/")
         if t:
             out[t] += 1
     return out
