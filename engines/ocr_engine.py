@@ -39,7 +39,7 @@ try:
 except ImportError:  # pragma: no cover
     pytesseract = None  # type: ignore
 
-OCR_VERSION = "21"  # OCR 로직이 바뀌면 올려서 캐시를 무효화
+OCR_VERSION = "22"  # OCR 로직이 바뀌면 올려서 캐시를 무효화
 
 DEFAULT_BULLET_RE = re.compile(
     r"^\s*(?:[•●▪■◦○‣·*\-–—]|\(?\d{1,3}[.)]|\(?[a-zA-Z][.)]|\d+(?:\.\d+)+\.?)\s+"
@@ -421,14 +421,23 @@ def find_underline(gray: "np.ndarray", box: tuple, h: float) -> Optional[tuple]:
 def ink_band_height(gray: "np.ndarray", box: tuple) -> tuple[float, int]:
     """줄 상자 안에서 글자가 실제로 차지하는 가로 띠의 높이(중앙값)와 띠 개수.
     Tesseract 가 위아래 두 행을 한 줄로 묶으면 상자 높이가 실제 글자의 2~3배가 된다 → 글자 크기 과대 추정 방지."""
+    bands = ink_bands(gray, box)
+    if not bands:
+        return 0.0, 0
+    return float(median([b - a for a, b in bands])), len(bands)
+
+
+def ink_bands(gray: "np.ndarray", box: tuple) -> list[tuple[int, int]]:
+    """줄 상자 안의 글자 행(가로 잉크 띠) 목록 [(y0, y1), ...] (이미지 좌표, y1 은 미포함).
+    i 의 점·악센트·밑줄처럼 낮은 띠는 행으로 치지 않는다."""
     H, W = gray.shape[:2]
     x0, y0, x1, y1 = [int(round(v)) for v in box]
     x0, y0, x1, y1 = max(0, x0), max(0, y0), min(W, x1), min(H, y1)
     if x1 - x0 < 4 or y1 - y0 < 6:
-        return 0.0, 0
+        return []
     crop = gray[y0:y1, x0:x1]
     if crop.std() < 6:
-        return 0.0, 0
+        return []
     _, mask = cv2.threshold(crop, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     dark = mask > 0
     if dark.mean() > 0.5:
@@ -442,7 +451,7 @@ def ink_band_height(gray: "np.ndarray", box: tuple) -> tuple[float, int]:
             else:
                 bands.append([i, i])
     if not bands:
-        return 0.0, 0
+        return []
     tall = max(b[1] - b[0] + 1 for b in bands)
     merged: list[list[int]] = []
     for b in bands:  # i 의 점, 악센트처럼 가까운 띠는 합친다
@@ -452,10 +461,7 @@ def ink_band_height(gray: "np.ndarray", box: tuple) -> tuple[float, int]:
             merged.append(list(b))
     # i 점·악센트·밑줄처럼 낮은 띠(가장 높은 띠의 35% 미만)는 글자 행이 아니다 → 행 수/높이 계산에서 뺀다
     tall = max(b[1] - b[0] + 1 for b in merged)
-    hs = [b[1] - b[0] + 1 for b in merged if b[1] - b[0] + 1 >= max(4, 0.35 * tall)]
-    if not hs:
-        return 0.0, 0
-    return float(median(hs)), len(hs)
+    return [(y0 + b[0], y0 + b[1] + 1) for b in merged if b[1] - b[0] + 1 >= max(4, 0.35 * tall)]
 
 
 # ----------------------------------------------------------------------------
@@ -783,15 +789,26 @@ class OcrEngine:
     def _retry_line(self, gray, ln: Line) -> Line:
         """신뢰도 낮은 줄만 잘라서 이진화/반전/확대 후 psm 7로 재인식."""
         H, W = gray.shape
-        pad = int(max(4, 0.35 * ln.h))
-        x0, y0 = max(0, int(ln.x0) - pad), max(0, int(ln.y0) - pad)
-        x1, y1 = min(W, int(ln.x1) + pad), min(H, int(ln.y1) + pad)
+        ly0, ly1 = ln.y0, ln.y1
+        bands = ink_bands(gray, (ln.x0, ln.y0, ln.x1, ln.y1))
+        if len(bands) >= 2:
+            # 줄 상자에 위아래 두 행이 걸렸다(표 머리글 'Actuator' / 'size' 를 한 줄로 묶음).
+            # 상자 전체를 psm 7 로 다시 읽으면 한 행만 읽고 상자는 두 행 높이가 돼 아래 행 글자와 겹친다
+            # → 이 줄의 가장 긴 낱말이 있는 행만 다시 읽는다 (다른 행은 따로 인식된 블록이 맡는다)
+            main = max(ln.words, key=lambda w: len(w.text))
+            a, b = min(bands, key=lambda ab: 0 if ab[0] <= main.cy <= ab[1]
+                       else min(abs(main.cy - ab[0]), abs(main.cy - ab[1])))
+            ly0, ly1 = float(a), float(b)
+        lh = max(1.0, ly1 - ly0)
+        pad = int(max(4, 0.35 * lh))
+        x0, y0 = max(0, int(ln.x0) - pad), max(0, int(ly0) - pad)
+        x1, y1 = min(W, int(ln.x1) + pad), min(H, int(ly1) + pad)
         crop = gray[y0:y1, x0:x1]
         if crop.size == 0:
             return ln
         f = 1.0
-        if ln.h < 28:
-            f = min(3.0, 32.0 / max(ln.h, 1))
+        if lh < 28:
+            f = min(3.0, 32.0 / lh)
             crop = cv2.resize(crop, None, fx=f, fy=f, interpolation=cv2.INTER_CUBIC)
         _, bw = cv2.threshold(crop, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         if (bw < 128).mean() > 0.5:
@@ -807,9 +824,13 @@ class OcrEngine:
                          y0 + (w.y1 - 10) / f, w.text, w.conf) for w in ws])
         # 잘라낸 범위에 이웃 줄(아래 그림 라벨 등)이 걸려 그 글자를 읽은 경우는 버린다
         # (예: 그림 조각 'AL' 을 다시 읽어 아래 'Work station' 까지 합친 'a statiol' → 그림 전체를 덮는 상자)
-        tol = 0.1 * ln.h
-        if any(not (ln.y0 - tol <= w.cy <= ln.y1 + tol) for w in new.words):
+        tol = 0.1 * lh
+        if any(not (ly0 - tol <= w.cy <= ly1 + tol) for w in new.words):
             return ln  # 낱말 중심이 원래 줄 높이 밖(이웃 줄)에 있다
+        if len(bands) >= 2:  # 다시 읽은 행 높이로 상자를 맞춘다
+            pad_y = 0.15 * lh
+            new = Line([Word(w.x0, max(w.y0, ly0 - pad_y), w.x1, min(w.y1, ly1 + pad_y), w.text, w.conf)
+                        for w in new.words])
         return new if new.conf > ln.conf + 3 else ln
 
     def _ocr_words(self, gray, origin, scale) -> list[OcrBlock]:

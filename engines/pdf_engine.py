@@ -1331,6 +1331,37 @@ def assign_ocr_words(units: list[Unit], words: list) -> None:
             u.notes.append(f"OCR_LOW_CONF({u.conf:.0f}) 원문 확인")
 
 
+def mark_ocr_logos(units: list[Unit], page_rect) -> None:
+    """스캔 쪽의 회사 로고 글자와 로고 바로 옆 슬로건은 원문 유지.
+    로고: 쪽 위 18% 또는 아래 12% 안, 1~2낱말, 그 쪽 OCR 글자 크기 중앙값의 2배 이상인 블록이
+    서로 상자가 겹치게 쌓여 있다 (예: 'Minebea' 와 'intec' 이 한 덩어리 로고) → 번역하면 서로 겹치고 로고가 망가진다.
+    큰 쪽 제목('Standard specifications')은 홀로 있으므로 해당하지 않는다."""
+    ocr = [u for u in units if u.source == "ocr-page" and u.size]
+    if len(ocr) < 3:
+        return
+    sizes = sorted(u.size for u in ocr)
+    med = sizes[len(sizes) // 2]
+    H = page_rect.height
+    cand = []
+    for u in ocr:
+        words = re.findall(r"[A-Za-z]{2,}", u.text)
+        edge = u.rect.y1 <= page_rect.y0 + 0.18 * H or u.rect.y0 >= page_rect.y1 - 0.12 * H
+        if edge and 1 <= len(words) <= 2 and u.size >= 2.0 * med and len(u.text) <= 24:
+            cand.append(u)
+    logos = [u for u in cand if any(v is not u and (u.rect & v.rect).height > 0.1 * min(u.size, v.size)
+                                    and (u.rect & v.rect).width > 0 for v in cand)]
+    for u in logos:
+        u.scope_keep = "로고 글자(스캔) → 원문 유지"
+    for u in ocr:  # 로고에 붙은 짧은 슬로건 ('The true measure')
+        if u in logos or u.scope_keep:
+            continue
+        for lg in logos:
+            near = lg.rect + (-0.5 * lg.size, -0.5 * lg.size, 0.5 * lg.size, 0.5 * lg.size)
+            if near.intersects(u.rect) and len(re.findall(r"[A-Za-z]{2,}", u.text)) <= 4:
+                u.scope_keep = "로고 옆 슬로건(스캔) → 원문 유지"
+                break
+
+
 def block_to_unit(pno: int, b) -> Unit:
     u = Unit(page=pno, idx=0, rect=fitz.Rect(b.rect), text=clean_text(b.text), size=b.size,
              color=0, bold=b.bold, origin_y=b.origin_y, align=b.align, ocr=True,
@@ -2544,6 +2575,8 @@ def prepare_units(doc, cfg: Config, protector: Protector, overrides: dict[str, s
                 if b.cell is None and b.conf < 90 and len(re.sub(r"[^A-Za-z]", "", b.text)) < 3:
                     continue  # 표 밖에 홀로 있는 한두 글자 조각
                 per_page.setdefault(pno, []).append(block_to_unit(pno, b))
+    for pno in pages:
+        mark_ocr_logos(per_page.get(pno, []), doc[pno].rect)
     all_units: list[Unit] = []
     for pno in pages:
         us = [u for u in per_page.get(pno, []) if u.text]

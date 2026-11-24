@@ -32,11 +32,28 @@ def _text_mask(pa, pb, dpi: int = 60) -> set:
     k = dpi / 72.0
     rects = []
     for page in (pa, pb):
+        boxes = []
         for bl in page.get_text("dict")["blocks"]:
             for ln in bl.get("lines", []) if bl.get("type") == 0 else []:
-                x0, y0, x1, y1 = ln["bbox"]
-                h = max(1.0, y1 - y0)
-                rects.append((x0 - 1.5, y0 - 0.2 * h, x1 + 1.5, y1 + 0.5 * h))
+                boxes.append(list(ln["bbox"]))
+        # 같은 행에서 가까운(간격 ≤ 3×줄 높이) 글자 조각은 하나로 본다:
+        # 줄 속 아이콘(⟦I⟧)은 번역문 안의 빈칸으로 자리를 옮겨 다시 그리므로, 원본·번역본 모두
+        # 글자 사이 틈의 그림 차이는 아이콘 이동이지 그림 손상이 아니다
+        boxes.sort(key=lambda b: (round((b[1] + b[3]) / 2), b[0]))
+        merged: list[list[float]] = []
+        for b in boxes:
+            h = max(1.0, b[3] - b[1])
+            for m in merged:
+                mh = max(1.0, m[3] - m[1])
+                ov = min(m[3], b[3]) - max(m[1], b[1])
+                if ov >= 0.5 * min(h, mh) and -3 * max(h, mh) <= b[0] - m[2] <= 3 * max(h, mh) and b[0] >= m[0]:
+                    m[2] = max(m[2], b[2]); m[1] = min(m[1], b[1]); m[3] = max(m[3], b[3])
+                    break
+            else:
+                merged.append(list(b))
+        for x0, y0, x1, y1 in merged:
+            h = max(1.0, y1 - y0)
+            rects.append((x0 - 1.5, y0 - 0.2 * h, x1 + 1.5, y1 + 0.5 * h))
     try:
         old = {tuple(round(v) for v in d["rect"]) for d in pa.get_drawings()}
         for d in pb.get_drawings():
