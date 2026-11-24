@@ -34,6 +34,7 @@ STANDARD_RE = re.compile(r"^(?:ISO|IEC|EN|DIN|API|ASME|ANSI|ASTM|IEEE|NFPA|BS|UL
 
 def norm(s: str) -> str:
     s = re.sub("\u00ad(?=[^\\s\u00ad])", "-", s).replace("\u00ad", "")  # 줄 중간 U+00AD 는 보이는 하이픈
+    s = re.sub(r"(?:\s?[.·…]){4,}\s?", " ", s)  # 목차 점선(제목 ....... 쪽번호)은 구분 기호일 뿐
     return s.translate(SUPER).replace("−", "-").replace("–", "-").replace("—", "-")
 
 
