@@ -561,6 +561,20 @@ def list_input_pdfs() -> list[Path]:
     return out
 
 
+def collect_pdfs(paths: list[str]) -> list[Path]:
+    """명령줄로 받은 PDF/폴더(하위 폴더 포함)의 PDF 목록 (복사하지 않음). 번역 결과물(_KR_O&M)은 뺀다."""
+    out: list[Path] = []
+    for a in paths:
+        p = Path(a.strip('"'))
+        if not p.exists():
+            print(f"! 없는 경로: {p}")
+            continue
+        for f in [p] if p.is_file() else sorted(x for x in p.rglob("*") if x.is_file()):
+            if f.suffix.lower() == ".pdf" and not f.stem.endswith(config.OUTPUT_SUFFIX) and f not in out:
+                out.append(f)
+    return out
+
+
 def import_dropped(paths: list[str]) -> list[Path]:
     """명령줄로 받은 PDF/폴더를 input\\pdf 로 복사."""
     copied = []
@@ -728,32 +742,88 @@ class Runner:
                 open_folder(dst)
 
     def estimate(self, files: Optional[list[Path]] = None):
-        tot_files = tot_chars = tot_items = 0
+        """번역 없이 비용만 추정 (API 사용 안 함). 파일별 예상 비용과 전체 합계(파일끼리 겹치는 문구는 한 번만)를
+        보여 주고, logs 폴더에 CSV 로도 남긴다 (여러 문서 비용을 한 번에 정리·보고할 때)."""
+        files = files or list_input_pdfs()
+        model = self.cfg.model
+        pin, pout = MODEL_PRICES.get(model, next(iter(MODEL_PRICES.values())))
+
+        def tokens(chars: int, n: int) -> tuple[int, int]:
+            if not n:
+                return 0, 0
+            return int(chars / 3.5 + n * 12 + 1100 * max(1, n // 40)), int(chars / 2.2)
+
+        def cost(chars: int, n: int, prices=(pin, pout)) -> float:
+            i, o = tokens(chars, n)
+            return (i * prices[0] + o * prices[1]) / 1e6
+
         uniq: dict[str, None] = {}
-        for src in files or list_input_pdfs():
-            doc = fitz.open(src)
+        rows = []
+        tot_items = tot_pages = tot_text_pages = tot_scan = 0
+        for k, src in enumerate(files, 1):
+            print(f"[{k}/{len(files)}] {src.name} 분석 중…", flush=True)
+            try:
+                doc = fitz.open(src)
+            except Exception as e:  # noqa: BLE001
+                print(f"  ! 열 수 없음: {e}")
+                rows.append([src.name, 0, 0, 0, 0, 0, 0.0, 0.0, f"열 수 없음: {e}"])
+                continue
             self.cfg.pages = parse_pages(self.args.pages, len(doc)) if self.args.pages else None
             self.cfg.ocr_mode = "off"
             detach_annotations(doc)
             units, classes, _, scopes = prepare_units(doc, self.cfg, self.protector, {}, None, None, "")
             pend = [u for u in units if u.status == "PENDING" and tm_get(self.cache, u.text) is None]
-            for u in pend:
-                uniq[u.ptxt] = None
+            mine = {u.ptxt: None for u in pend}
+            new = [t for t in mine if t not in uniq]
+            for t in new:
+                uniq[t] = None
+            n_pages = len(self.cfg.pages) if self.cfg.pages else len(doc)
             n_scope = sum(1 for ok, _ in scopes.values() if not ok)
-            print(f"{src.name}: {len(doc)}p [{describe_classes(classes)}], 원문유지 페이지 {n_scope}, "
-                  f"번역 필요 {len(pend)}블록")
-            tot_files += 1
+            n_scan = sum(1 for c in classes.values() if c in ("scanned", "garbled", "forced"))
+            text_pages = len({u.page for u in pend})
+            c_alone = cost(sum(len(t) for t in mine), len(mine))
+            c_add = cost(sum(len(t) for t in new), len(new))
+            print(f"  {n_pages}p [{describe_classes(classes)}], 원문유지 페이지 {n_scope}, 번역 필요 {len(pend)}블록 "
+                  f"→ 단독 약 ${c_alone:,.2f} (앞 파일과 겹치는 문구 빼면 ${c_add:,.2f})"
+                  + (f", 스캔 {n_scan}쪽은 추정 제외" if n_scan else ""))
+            rows.append([src.name, n_pages, n_scope, n_scan, len(pend), sum(len(t) for t in mine),
+                         round(c_alone, 2), round(c_add, 2), ""])
             tot_items += len(pend)
+            tot_pages += n_pages
+            tot_text_pages += text_pages
+            tot_scan += n_scan
             doc.close()
+
         tot_chars = sum(len(t) for t in uniq)
-        in_tok = int(tot_chars / 3.5 + len(uniq) * 12 + 1100 * max(1, len(uniq) // 40)) if uniq else 0
-        out_tok = int(tot_chars / 2.2)
-        print(f"\n파일 {tot_files}개 | 번역 문구 {tot_items}개 (중복 제거 {len(uniq)}개, {tot_chars:,}자)")
-        print(f"예상 API 사용량: 입력 약 {in_tok:,} 토큰 / 출력 약 {out_tok:,} 토큰 "
-              f"(스캔 페이지 OCR 분량은 제외)")
-        for m, (pin, pout) in MODEL_PRICES.items():  # 시스템 프롬프트는 캐시되므로 입력 비용은 이보다 적게 나온다
-            print(f"  {m:<20} 예상 비용 약 ${(in_tok * pin + out_tok * pout) / 1e6:,.2f}"
-                  + ("  ← 현재 선택" if m == self.cfg.model else ""))
+        in_tok, out_tok = tokens(tot_chars, len(uniq))
+        print(f"\n파일 {len(rows)}개, {tot_pages:,}쪽 | 번역 문구 {tot_items:,}개 (중복 제거 {len(uniq):,}개, {tot_chars:,}자)")
+        print(f"예상 API 사용량: 입력 약 {in_tok:,} 토큰 / 출력 약 {out_tok:,} 토큰 (스캔 페이지 OCR 분량은 제외)")
+        for m, pr in MODEL_PRICES.items():  # 시스템 프롬프트는 캐시되므로 입력 비용은 이보다 적게 나온다
+            print(f"  {m:<20} 예상 비용 약 ${cost(tot_chars, len(uniq), pr):,.2f}" + ("  ← 현재 선택" if m == model else ""))
+        scan_extra = 0.0
+        if tot_scan:
+            # 스캔 쪽은 OCR 전에는 글자 수를 알 수 없다 → 글자층 있는 번역 쪽의 쪽당 평균 글자 수로 대략 환산
+            per_page = tot_chars / tot_text_pages if tot_text_pages else 1200.0
+            n_scan_txt = max(1, int(len(uniq) / max(1, tot_text_pages) * tot_scan)) if tot_text_pages else tot_scan * 15
+            scan_extra = cost(int(per_page * tot_scan), n_scan_txt)
+            print(f"  ※ 스캔 페이지 {tot_scan:,}쪽: OCR 후 번역하면 대략 +${scan_extra:,.2f} ({model} 기준, "
+                  f"쪽당 {per_page:,.0f}자로 가정 · 도면/데이터시트 스캔이면 원문 유지되어 이보다 적음)")
+        try:
+            import csv
+            out = config.LOG_DIR / f"비용추정_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+            with open(out, "w", newline="", encoding="utf-8-sig") as f:  # utf-8-sig: Excel 에서 한글 바로 보임
+                w = csv.writer(f)
+                w.writerow(["파일", "쪽수", "원문유지 쪽", "스캔 쪽(추정 제외)", "번역 블록", "번역 글자 수",
+                            f"단독 예상 비용 USD ({model})", "겹침 제외 추가 비용 USD", "비고"])
+                w.writerows(rows)
+                w.writerow([])
+                w.writerow(["합계 (겹치는 문구는 한 번만)", tot_pages, "", tot_scan, tot_items, tot_chars,
+                            round(cost(tot_chars, len(uniq)), 2), "", "스캔 쪽 제외"])
+                if tot_scan:
+                    w.writerow(["스캔 쪽 OCR 번역 시 대략 추가", "", "", tot_scan, "", "", round(scan_extra, 2), "", "대략값"])
+            print(f"\n파일별 비용표 저장: {out}")
+        except Exception as e:  # noqa: BLE001
+            print(f"! 비용표 저장 실패: {e}")
 
 
 def doc_context(doc, src: Path) -> str:
@@ -822,10 +892,10 @@ def main(argv=None) -> int:
         return 0
 
     runner = Runner(args)
-    dropped = import_dropped(args.paths) if args.paths else []
-    if args.estimate:
-        runner.estimate(dropped or None)
+    if args.estimate:  # 비용 추정은 원본을 input\\pdf 로 복사하지 않고 그 자리에서 읽는다 (대용량 여러 개도 디스크 부담 없음)
+        runner.estimate(collect_pdfs(args.paths) if args.paths else None)
         return 0
+    dropped = import_dropped(args.paths) if args.paths else []
     if args.debug_layout:
         runner.debug_layout(dropped or None)
         return 0
